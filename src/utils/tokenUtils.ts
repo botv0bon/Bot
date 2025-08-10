@@ -254,6 +254,36 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
     if ((allTokens[addr].marketCap === undefined || EMPTY_VALUES.includes(allTokens[addr].marketCap)) && pair.marketCap) {
       allTokens[addr].marketCap = pair.marketCap;
     }
+
+    // ====== استخراج الحقول الزمنية ======
+    // الأولوية: pair.pairCreatedAt > pair.createdAt > pair.baseToken.createdAt > profile.createdAt > profile.genesis_date
+    let createdTs =
+      pair.pairCreatedAt ||
+      pair.createdAt ||
+      (pair.baseToken && pair.baseToken.createdAt) ||
+      (allTokens[addr].createdAt) ||
+      (allTokens[addr].genesis_date);
+
+    // إذا كان نص تاريخ، حوّله إلى timestamp
+    if (typeof createdTs === 'string' && !isNaN(Date.parse(createdTs))) {
+      createdTs = Date.parse(createdTs);
+    }
+    // إذا كان بالثواني وليس ملي ثانية
+    if (typeof createdTs === 'number' && createdTs < 1e12 && createdTs > 1e9) {
+      createdTs = createdTs * 1000;
+    }
+    // إذا كان بالسنوات (مثلاً genesis_date)
+    if (typeof createdTs === 'string' && /^\d{4}-\d{2}-\d{2}/.test(createdTs)) {
+      createdTs = Date.parse(createdTs);
+    }
+    // حساب العمر بالدقائق
+    let ageMinutes = undefined;
+    if (typeof createdTs === 'number' && createdTs > 0) {
+      ageMinutes = Math.floor((Date.now() - createdTs) / 60000);
+    }
+    allTokens[addr].pairCreatedAt = pair.pairCreatedAt || null;
+    allTokens[addr].poolOpenTime = createdTs || null;
+    allTokens[addr].ageMinutes = ageMinutes;
   }
 
   // 4. If not enough data, use CoinGecko fallback (same logic as before)
@@ -292,6 +322,9 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
             address: t.platforms.solana,
             pairAddress: t.platforms.solana,
             url: data.links?.blockchain_site?.[0] || '',
+            // الحقول الزمنية من CoinGecko
+            poolOpenTime: data.genesis_date ? Date.parse(data.genesis_date) : null,
+            ageMinutes: data.genesis_date ? Math.floor((Date.now() - Date.parse(data.genesis_date)) / 60000) : null,
           };
         } catch (err) {
           return null;
@@ -373,7 +406,7 @@ function getTokenStats(token: any) {
   let age = getField(token, 'age', 'createdAt');
   // حذف سطر الهولدرز نهائياً
   let ageDisplay: string = 'Not available';
-  let ageMs = undefined;
+  let ageMs: number | undefined = undefined;
   if (typeof age === 'string') age = Number(age);
   if (typeof age === 'number' && !isNaN(age)) {
     if (age > 1e12) ageMs = Date.now() - age; // ms timestamp
