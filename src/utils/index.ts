@@ -1,5 +1,5 @@
 import { BIRDEYE_API_URL, REQUEST_HEADER } from "../config";
-import redisClient from "../services/redis";
+// import redisClient from "../services/redis";
 
 export function isValidWalletAddress(address: string): boolean {
   if (!address) return false;
@@ -72,19 +72,17 @@ export function formatPrice(price: number) {
   return price.toFixed(2);
 }
 
-export const getPrice = async (mint: string) => {
-  const key = `${mint}_price`;
-  const data = await redisClient.get(key);
-  if (data) {
-    return Number(data);
-  }
+export const getPrice = async (mint: string): Promise<number> => {
   const options = { method: 'GET', headers: REQUEST_HEADER };
-  const response = await fetch(`https://public-api.birdeye.so/defi/price?address=${mint}`, options)
-  const res = await response.json();
-  const price = res.data.value;
-  await redisClient.set(key, price);
-  await redisClient.expire(key, 5); // 5 seconds
-  return Number(price);
+  try {
+    const response = await fetch(`https://public-api.birdeye.so/defi/price?address=${mint}`, options);
+    const res = await response.json();
+    const price = res?.data?.value;
+    return typeof price === 'number' ? price : Number(price) || 0;
+  } catch (err) {
+    console.error('getPrice error:', err);
+    return 0;
+  }
 };
 
 export const copytoclipboard = (

@@ -17,22 +17,37 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
     return;
   }
 
-  for (const token of filteredTokens) {
-    try {
-      // Prevent duplicate trades for same token (optional: add your own logic)
-      // Example: if (user.sentHashes?.has(token.mint)) continue;
+  // Limit trades to maxTrades if set
+  const maxTrades = user.strategy.maxTrades && user.strategy.maxTrades > 0 ? user.strategy.maxTrades : filteredTokens.length;
+  const tokensToTrade = filteredTokens.slice(0, maxTrades);
 
-      // Execute auto buy/sell
-      let result;
-      if (mode === 'buy') {
-        result = await unifiedBuy(token.mint, user.strategy.buyAmount || 0.1, user.secret);
-      } else {
-        result = await unifiedSell(token.mint, user.strategy.sellAmount || 0.1, user.secret);
+  // Use getField for robust address extraction
+  const { getField } = require('./utils/tokenUtils');
+
+  for (const token of tokensToTrade) {
+    try {
+      // Get token address (mint/address/tokenAddress/pairAddress)
+      const tokenAddress = getField(token, 'mint', 'address', 'tokenAddress', 'pairAddress');
+      if (!tokenAddress) {
+        console.warn(`[autoExecute] No valid address for token`, token);
+        continue;
       }
-      console.log(`[autoExecute] ${mode} for user ${user.id || user.username} on token ${token.mint}:`, result);
+
+      let result;
+      const buyAmount = user.strategy.buyAmount || 0.01;
+      if (mode === 'buy') {
+        result = await unifiedBuy(tokenAddress, buyAmount, user.secret);
+      } else {
+        // Calculate sell amount based on percent and balance if available
+        let balance = token.balance || buyAmount || 0.01;
+        let sellPercent = user.strategy.sellPercent1 || 100;
+        let sellAmount = (balance * sellPercent) / 100;
+        result = await unifiedSell(tokenAddress, sellAmount, user.secret);
+      }
+      console.log(`[autoExecute] ${mode} for user ${user.id || user.username} on token ${tokenAddress}:`, result);
       // Optionally: log, notify user, update history, etc.
     } catch (err) {
-      console.error(`[autoExecute] Failed to ${mode} token ${token.mint} for user ${user.id || user.username}:`, err);
+      console.error(`[autoExecute] Failed to ${mode} token for user ${user.id || user.username}:`, err);
     }
   }
 }

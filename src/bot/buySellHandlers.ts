@@ -1,5 +1,5 @@
 import { unifiedBuy, unifiedSell } from '../tradeSources';
-import { saveUsers } from './helpers';
+import { saveUsers, hasPendingBuy } from './helpers';
 
 export function registerBuySellHandlers(bot: any, users: Record<string, any>, boughtTokens: Record<string, Set<string>>) {
   bot.action(/buy_(.+)/, async (ctx: any) => {
@@ -8,6 +8,11 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
     const tokenAddress = ctx.match[1];
     if (!user || !user.secret || !user.strategy || !user.strategy.enabled) {
       await ctx.reply('❌ لا يوجد استراتيجية أو محفظة مفعلة.');
+      return;
+    }
+    // تحقق من وجود شراء سابق غير مباع
+    if (hasPendingBuy(userId, tokenAddress)) {
+      await ctx.reply('⚠️ لا يمكنك شراء نفس العملة مرتين قبل بيعها.');
       return;
     }
     await ctx.reply('⏳ جاري تنفيذ عملية الشراء، يرجى الانتظار...', { parse_mode: 'HTML' });

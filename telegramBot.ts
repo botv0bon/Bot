@@ -35,6 +35,7 @@ const restoreStates: Record<string, boolean> = {};
 bot.command('auto_execute', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
+  console.log(`[auto_execute] User: ${userId}`);
   if (!user || !user.strategy || !user.strategy.enabled) {
     await ctx.reply('You must set a strategy first using /strategy');
     return;
@@ -68,6 +69,7 @@ bot.start(async (ctx) => {
 bot.hears('💼 Wallet', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
+  console.log(`[💼 Wallet] User: ${userId}`);
   if (user && hasWallet(user)) {
     const { getSolBalance } = await import('./src/getSolBalance');
     let balance = 0;
@@ -91,6 +93,7 @@ bot.hears('💼 Wallet', async (ctx) => {
 });
 
 bot.action('show_secret', async (ctx) => {
+  console.log(`[show_secret] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (user && hasWallet(user)) {
@@ -101,6 +104,7 @@ bot.action('show_secret', async (ctx) => {
 });
 
 bot.hears('⚙️ Strategy', async (ctx) => {
+  console.log(`[⚙️ Strategy] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   userStrategyStates[userId] = { step: 0, values: {} };
   await ctx.reply('🚦 Strategy Setup:\nPlease enter the required value for each field. Send "skip" to skip any optional field.');
@@ -109,16 +113,19 @@ bot.hears('⚙️ Strategy', async (ctx) => {
 });
 
 bot.hears('📊 Show Tokens', async (ctx) => {
+  console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
   ctx.reply('To view tokens matching your strategy, use the /show_token command.');
 });
 
 bot.hears('🤝 Invite Friends', async (ctx) => {
+  console.log(`[🤝 Invite Friends] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const inviteLink = `https://t.me/${ctx.me}?start=${userId}`;
   await ctx.reply(`🤝 Share this link to invite your friends:\n${inviteLink}`);
 });
 
 bot.command('notify_tokens', async (ctx) => {
+  console.log(`[notify_tokens] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (!user || !user.strategy || !user.strategy.enabled) {
@@ -145,6 +152,7 @@ bot.action(/buy_(.+)/, async (ctx: any) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   const tokenAddress = ctx.match[1];
+  console.log(`[buy] User: ${userId}, Token: ${tokenAddress}`);
   if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
     await ctx.reply('❌ No active strategy or wallet found.');
     return;
@@ -153,10 +161,10 @@ bot.action(/buy_(.+)/, async (ctx: any) => {
     const amount = user.strategy.buyAmount || 0.01;
     await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
     const result = await unifiedBuy(tokenAddress, amount, user.secret);
-    if (result && result.buyResult && result.buyResult.tx) {
+    if (result && result.tx) {
       if (!boughtTokens[userId]) boughtTokens[userId] = new Set();
       boughtTokens[userId].add(tokenAddress);
-      const entry = `ManualBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.buyResult.tx}`;
+      const entry = `ManualBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.tx}`;
       user.history = user.history || [];
       user.history.push(entry);
       limitHistory(user);
@@ -186,6 +194,7 @@ bot.action(/sell_(.+)/, async (ctx: any) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   const tokenAddress = ctx.match[1];
+  console.log(`[sell] User: ${userId}, Token: ${tokenAddress}`);
   if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
     await ctx.reply('❌ No active strategy or wallet found.');
     return;
@@ -214,6 +223,7 @@ bot.action(/sell_(.+)/, async (ctx: any) => {
 
 
 bot.command('wallet', async (ctx) => {
+  console.log(`[wallet] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (user && hasWallet(user)) {
@@ -225,6 +235,7 @@ bot.command('wallet', async (ctx) => {
 
 
 bot.command(['create_wallet', 'restore_wallet'], async (ctx) => {
+  console.log(`[${ctx.message.text.startsWith('/restore_wallet') ? 'restore_wallet' : 'create_wallet'}] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   let user = users[userId];
   if (!user) {
@@ -257,6 +268,7 @@ bot.command(['create_wallet', 'restore_wallet'], async (ctx) => {
 
 
 async function notifyAutoSell(user: any, sellOrder: any) {
+  console.log(`[notifyAutoSell] User: ${user?.id || user?.userId || user?.telegramId}, Token: ${sellOrder.token}, Amount: ${sellOrder.amount}, Status: ${sellOrder.status}`);
   try {
     const chatId = user.id || user.userId || user.telegramId;
     let msg = `✅ Auto-sell order executed:\n`;
@@ -268,6 +280,7 @@ async function notifyAutoSell(user: any, sellOrder: any) {
 }
 
 setInterval(async () => {
+  console.log(`[monitorAndAutoSellTrades] Interval triggered`);
   if (!globalTokenCache || !Array.isArray(globalTokenCache)) return;
   if (!users || typeof users !== 'object') return;
   const tokens = globalTokenCache;
@@ -292,6 +305,7 @@ setInterval(async () => {
 
 // ========== Interactive wallet buttons ==========
 bot.action('create_wallet', async (ctx) => {
+  console.log(`[create_wallet] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   let user = users[userId];
   if (!user) {
@@ -312,12 +326,14 @@ bot.action('create_wallet', async (ctx) => {
 });
 
 bot.action('restore_wallet', async (ctx) => {
+  console.log(`[restore_wallet] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   restoreStates[userId] = true;
   await ctx.reply('🔑 Please send your wallet private key in a private message now:');
 });
 
 bot.on('text', async (ctx, next) => {
+  console.log(`[text] User: ${String(ctx.from?.id)}, Message: ${ctx.message.text}`);
   const userId = String(ctx.from?.id);
   if (restoreStates[userId]) {
     const secret = ctx.message.text.trim();
@@ -422,6 +438,7 @@ bot.on('text', async (ctx, next) => {
       });
 
       bot.command('show_token', async (ctx) => {
+  console.log(`[show_token] User: ${String(ctx.from?.id)}`);
         const userId = String(ctx.from?.id);
         const user = users[userId];
         if (!user || !user.strategy || !user.strategy.enabled) {
@@ -435,19 +452,111 @@ bot.on('text', async (ctx, next) => {
         }
         const filteredTokens = filterTokensByStrategy(globalTokenCache, user.strategy);
         const maxTrades = user.strategy.maxTrades && user.strategy.maxTrades > 0 ? user.strategy.maxTrades : 5;
-        const tokensToShow = filteredTokens.slice(0, maxTrades);
-        if (!tokensToShow.length) {
+        const tokensToTrade = filteredTokens.slice(0, maxTrades);
+        if (!tokensToTrade.length) {
           await ctx.reply('No tokens currently match your strategy.');
           return;
         }
-        await ctx.reply(`🔎 Found <b>${tokensToShow.length}</b> tokens matching your strategy${filteredTokens.length > maxTrades ? ` (showing first ${maxTrades})` : ''}:`, { parse_mode: 'HTML' });
-        for (const token of tokensToShow) {
-          const { msg, inlineKeyboard } = buildTokenMessage(token, ctx.botInfo?.username || '', token.address, userId);
-          await ctx.reply(msg, {
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: inlineKeyboard }
-          });
+        await ctx.reply(`🔎 Found <b>${tokensToTrade.length}</b> tokens matching your strategy${filteredTokens.length > maxTrades ? ` (showing first ${maxTrades})` : ''}.\nExecuting auto-buy and auto-sell setup...`, { parse_mode: 'HTML' });
+
+        let buyResults: string[] = [];
+        let successCount = 0, failCount = 0;
+        for (const token of tokensToTrade) {
+          const tokenAddress = token.tokenAddress || token.address || token.mint || token.pairAddress;
+          const buyAmount = user.strategy.buyAmount || 0.01;
+          const name = token.name || token.symbol || tokenAddress;
+          const price = token.priceUsd || token.price || '-';
+          const dexUrl = token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : '');
+          console.log(`[show_token] Attempting buy: User: ${userId}, Token: ${tokenAddress}, Amount: ${buyAmount}`);
+          try {
+            const buyResult = await unifiedBuy(tokenAddress, buyAmount, user.secret);
+            console.log(`[show_token] Buy result:`, buyResult);
+            if (buyResult && buyResult.tx) {
+              successCount++;
+              // سجل العملية في التاريخ
+              const entry = `AutoShowTokenBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Source: unifiedBuy | Tx: ${buyResult.tx}`;
+              user.history = user.history || [];
+              user.history.push(entry);
+              limitHistory(user);
+              saveUsers(users);
+              // سجل أمر بيع تلقائي
+              const targetPercent = user.strategy.targetPercent || 10;
+              registerBuyWithTarget(user, { address: tokenAddress, price }, buyResult, targetPercent);
+              buyResults.push(`🟢 <b>${name}</b> (<code>${tokenAddress}</code>)\nPrice: <b>${price}</b> USD\nAmount: <b>${buyAmount}</b> SOL\nTx: <a href='https://solscan.io/tx/${buyResult.tx}'>${buyResult.tx}</a>\n<a href='${dexUrl}'>DexScreener</a> | <a href='https://solscan.io/token/${tokenAddress}'>Solscan</a>\n------------------------------`);
+            } else {
+              failCount++;
+              console.log(`[show_token] Buy failed for token: ${tokenAddress}`);
+              buyResults.push(`🔴 <b>${name}</b> (<code>${tokenAddress}</code>)\n❌ Failed to buy.`);
+            }
+          } catch (e) {
+            failCount++;
+            console.log(`[show_token] Error during buy for token: ${tokenAddress}`, e);
+            buyResults.push(`🔴 <b>${name}</b> (<code>${tokenAddress}</code>)\n❌ Error: ${getErrorMessage(e)}`);
+          }
         }
+        let summary = `<b>Auto Buy Summary</b>\n------------------------------\n✅ Success: <b>${successCount}</b>\n❌ Failed: <b>${failCount}</b>\n------------------------------`;
+  await ctx.reply(summary + '\n' + buyResults.join('\n'), { parse_mode: 'HTML' });
+// Handle Buy/Sell actions from show_token
+bot.action(/showtoken_buy_(.+)/, async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId];
+  const tokenAddress = ctx.match[1];
+  console.log(`[showtoken_buy] User: ${userId}, Token: ${tokenAddress}`);
+  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
+    await ctx.reply('❌ No active strategy or wallet found.');
+    return;
+  }
+  try {
+    const amount = user.strategy.buyAmount || 0.01;
+    await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
+    const result = await unifiedBuy(tokenAddress, amount, user.secret);
+    if (result && result.tx) {
+      const entry = `ShowTokenBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.tx}`;
+      user.history = user.history || [];
+      user.history.push(entry);
+      limitHistory(user);
+      saveUsers(users);
+      await ctx.reply(`Token bought successfully! Tx: ${result.tx}`);
+    } else {
+      await ctx.reply('Buy failed: Transaction was not completed.');
+    }
+  } catch (e) {
+    await ctx.reply('❌ Error during buy: ' + getErrorMessage(e));
+    console.error('showtoken buy error:', e);
+  }
+});
+
+bot.action(/showtoken_sell_(.+)/, async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId];
+  const tokenAddress = ctx.match[1];
+  console.log(`[showtoken_sell] User: ${userId}, Token: ${tokenAddress}`);
+  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
+    await ctx.reply('❌ No active strategy or wallet found.');
+    return;
+  }
+  try {
+    const sellPercent = user.strategy.sellPercent1 || 100;
+    // For demo, assume full balance = buyAmount
+    const balance = user.strategy.buyAmount || 0.01;
+    const amount = (balance * sellPercent) / 100;
+    await ctx.reply(`🔻 Selling token: <code>${tokenAddress}</code> with <b>${sellPercent}%</b> of your balance (${balance}) ...`, { parse_mode: 'HTML' });
+    const result = await unifiedSell(tokenAddress, amount, user.secret);
+    if (result && result.tx) {
+      const entry = `ShowTokenSell: ${tokenAddress} | Amount: ${amount} | Source: unifiedSell | Tx: ${result.tx}`;
+      user.history = user.history || [];
+      user.history.push(entry);
+      limitHistory(user);
+      saveUsers(users);
+      await ctx.reply(`Token sold successfully! Tx: ${result.tx}`);
+    } else {
+      await ctx.reply('Sell failed: Transaction was not completed.');
+    }
+  } catch (e) {
+    await ctx.reply('❌ Error during sell: ' + getErrorMessage(e));
+    console.error('showtoken sell error:', e);
+  }
+});
       });
 
 
