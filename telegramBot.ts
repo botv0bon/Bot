@@ -285,9 +285,12 @@ setInterval(async () => {
   if (!users || typeof users !== 'object') return;
   const tokens = globalTokenCache;
   for (const userId in users) {
+    if (!userId || userId === 'undefined') {
+      console.warn('[monitorAndAutoSellTrades] Invalid userId, skipping.');
+      continue;
+    }
     const user = users[userId];
     await monitorAndAutoSellTrades(user, tokens);
-   
     const sentTokensDir = process.cwd() + '/sent_tokens';
     const userFile = `${sentTokensDir}/${userId}.json`;
     if (!require('fs').existsSync(userFile)) continue;
@@ -296,7 +299,7 @@ setInterval(async () => {
     const executed = userTrades.filter((t: any) => t.mode === 'sell' && t.status === 'success' && t.auto && !t.notified);
     for (const sellOrder of executed) {
       await notifyAutoSell(user, sellOrder);
-  (sellOrder as any).notified = true;
+      (sellOrder as any).notified = true;
     }
     require('fs').writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
   }

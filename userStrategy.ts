@@ -16,6 +16,10 @@ import path from 'path';
  * Record a buy or sell operation in the user's file inside sent_tokens
  */
 export function recordUserTrade(userId: string, trade: any) {
+  if (!userId || userId === 'undefined') {
+    console.warn('[recordUserTrade] Invalid userId, skipping trade record.');
+    return;
+  }
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   if (!fs.existsSync(sentTokensDir)) fs.mkdirSync(sentTokensDir);
   const userFile = path.join(sentTokensDir, `${userId}.json`);

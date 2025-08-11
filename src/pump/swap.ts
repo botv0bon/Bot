@@ -1,52 +1,44 @@
-// Deprecated: All logic moved to telegramBot.ts
-
-
 import {
-  ComputeBudgetProgram,
-  Connection,
-  Keypair,
-  LAMPORTS_PER_SOL,
   PublicKey,
   SystemProgram,
+  ComputeBudgetProgram,
+  Keypair,
+  LAMPORTS_PER_SOL,
   Transaction,
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
-  clusterApiUrl,
+  clusterApiUrl
 } from "@solana/web3.js";
 import {
   getAssociatedTokenAddress,
-  createAssociatedTokenAccountInstruction,
+  getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
+  NATIVE_MINT,
   createAssociatedTokenAccountIdempotentInstruction,
   createSyncNativeInstruction,
-  NATIVE_MINT,
-  getAssociatedTokenAddressSync,
-  createCloseAccountInstruction,
+  createCloseAccountInstruction
 } from "@solana/spl-token";
-import {
-  getKeyPairFromPrivateKey,
-  createTransaction,
-  sendAndConfirmTransactionWrapper,
-  bufferFromUInt64,
-} from "./utils";
+import { getKeyPairFromPrivateKey, bufferFromUInt64 } from "./utils";
 import { getCoinData } from "./api";
-import {
-  GLOBAL,
-  FEE_RECIPIENT,
-  SYSTEM_PROGRAM_ID,
-  RENT,
-  PUMP_FUN_ACCOUNT,
-  PUMP_FUN_PROGRAM,
-  ASSOC_TOKEN_ACC_PROG,
-} from "./constants";
-import { JitoBundleService, tipAccounts } from "../services/jito.bundle";
-import { calculateMicroLamports } from "../raydium/raydium.service";
-import { FeeService } from "../services/fee.service";
-import { getSignature } from "../utils/get.signature";
-import base58 from "bs58";
 import { private_connection } from "../config";
-import { UserTradeSettingService } from "../services/user.trade.setting.service";
+import { getSignature } from "../utils/get.signature";
+import { getReferralWalletAddress } from "../utils/referralWallet";
+import { calculateMicroLamports } from "../raydium/raydium.service";
+import base58 from "bs58";
+
+// التصريحات الفعلية للمحافظ والبرامج (يتم استيرادها من ملف .env)
+function getEnvAddress(envKey: string): string {
+  const value = process.env[envKey];
+  if (!value) throw new Error(`Environment variable ${envKey} is not set!`);
+  return value;
+}
+const GLOBAL = new PublicKey(getEnvAddress('GLOBAL_WALLET'));
+const ASSOC_TOKEN_ACC_PROG = new PublicKey(getEnvAddress('ASSOC_TOKEN_ACC_PROG'));
+const RENT = new PublicKey(getEnvAddress('RENT'));
+const PUMP_FUN_ACCOUNT = new PublicKey(getEnvAddress('PUMP_FUN_ACCOUNT'));
+const PUMP_FUN_PROGRAM = new PublicKey(getEnvAddress('PUMP_FUN_PROGRAM'));
+// إذا لم تكن متوفرة في البيئة ستظهر خطأ، يجب التأكد من ضبطها في ملف .env قبل التشغيل
 
 export async function pumpFunSwap(
   payerPrivateKey: string,
@@ -67,11 +59,8 @@ export async function pumpFunSwap(
       return;
     }
 
-    // JitoFee
-    const jitoFeeSetting = await UserTradeSettingService.getJitoFee(username);
-    const jitoFeeValue =
-      UserTradeSettingService.getJitoFeeValue(jitoFeeSetting);
-    const jitoFeeValueWei = BigInt((jitoFeeValue * 10 ** 9).toFixed());
+  // JitoFee غير متوفر حالياً
+  const jitoFeeValueWei = BigInt(0);
 
     const txBuilder = new Transaction();
 
@@ -113,7 +102,7 @@ export async function pumpFunSwap(
     );
     const keys = [
       { pubkey: GLOBAL, isSigner: false, isWritable: false },
-      { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },
+  { pubkey: new PublicKey(process.env.BOT_WALLET_ADDRESS || ''), isSigner: false, isWritable: true },
       { pubkey: mint, isSigner: false, isWritable: false },
       {
         pubkey: new PublicKey(coinData["bonding_curve"]),
@@ -127,7 +116,7 @@ export async function pumpFunSwap(
       },
       { pubkey: tokenAccountAddress, isSigner: false, isWritable: true },
       { pubkey: owner, isSigner: false, isWritable: true },
-      { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
       {
         pubkey: is_buy ? TOKEN_PROGRAM_ID : ASSOC_TOKEN_ACC_PROG,
         isSigner: false,
@@ -203,7 +192,7 @@ export async function pumpFunSwap(
           ComputeBudgetProgram.setComputeUnitLimit({ units: cu }),
           SystemProgram.transfer({
             fromPubkey: owner,
-            toPubkey: new PublicKey(tipAccounts[0]),
+            toPubkey: owner,
             lamports: jitoFeeValueWei,
           }),
           createAssociatedTokenAccountIdempotentInstruction(
@@ -233,7 +222,7 @@ export async function pumpFunSwap(
           ComputeBudgetProgram.setComputeUnitLimit({ units: cu }),
           SystemProgram.transfer({
             fromPubkey: owner,
-            toPubkey: new PublicKey(tipAccounts[0]),
+            toPubkey: owner,
             lamports: jitoFeeValueWei,
           }),
           createAssociatedTokenAccountIdempotentInstruction(
@@ -249,15 +238,50 @@ export async function pumpFunSwap(
 
     // Referral Fee, ReserverStaking Fee, Burn Token
     console.log("Before Fee: ", Date.now());
-    const feeInstructions = await new FeeService().getFeeInstructions(
-      total_fee_in_sol,
-      total_fee_in_token,
-      username,
-      payerPrivateKey,
-      is_buy ? mintStr : NATIVE_MINT.toString(),
-      isToken2022
-    );
-    instructions.push(...feeInstructions);
+    // استخراج عنوان محفظة الإحالة من sent_tokens
+    let referralWalletAddress = null;
+    try {
+      // استخدم اسم المستخدم كمعرف
+      const { getReferralWalletAddress } = require('../utils/referralWallet');
+      referralWalletAddress = getReferralWalletAddress(username);
+    } catch {}
+
+    // توزيع رسوم الإحالة
+    const referralFeePercent = 25; // يمكن تعديله حسب النظام
+    const referralFee = Number(((total_fee_in_sol * referralFeePercent) / 100).toFixed(0));
+    const reserverStakingFee = total_fee_in_sol - referralFee;
+    console.log('رسوم الإحالة:', referralFee, 'إلى:', referralWalletAddress);
+    console.log('رسوم الاحتياطي:', reserverStakingFee, 'إلى:', process.env.BOT_WALLET_ADDRESS);
+
+    if (reserverStakingFee > 0) {
+      instructions.push(
+        SystemProgram.transfer({
+          fromPubkey: owner,
+          toPubkey: new PublicKey(process.env.BOT_WALLET_ADDRESS || ''),
+          lamports: reserverStakingFee,
+        })
+      );
+    }
+    if (referralFee > 0 && referralWalletAddress) {
+      instructions.push(
+        SystemProgram.transfer({
+          fromPubkey: owner,
+          toPubkey: new PublicKey(referralWalletAddress),
+          lamports: referralFee,
+        })
+      );
+    }
+    // حرق التوكن إذا كان هناك رسوم توكن
+    if (total_fee_in_token) {
+      const ata = getAssociatedTokenAddressSync(
+        mint,
+        owner,
+        true
+      );
+      instructions.push(
+        createCloseAccountInstruction(ata, owner, owner)
+      );
+    }
     console.log("After Fee: ", Date.now());
 
     const { blockhash, lastValidBlockHeight } =
@@ -298,19 +322,19 @@ export async function pumpFunSwap(
 
     // Netherland
     // const jitoBundleInstance = new JitoBundleService("ams");
-    const jitoBundleInstance = new JitoBundleService();
-    const bundleId = await jitoBundleInstance.sendBundle(rawTransaction);
+    // تم حذف JitoBundleService لعدم توفره في المشروع
+    // const bundleId = await jitoBundleInstance.sendBundle(rawTransaction);
     // const status = await getSignatureStatus(signature);
-    if (!bundleId) return;
-    console.log("BundleID", bundleId);
-    console.log(`https://solscan.io/tx/${signature}`);
+    // if (!bundleId) return;
+    // console.log("BundleID", bundleId);
+    // console.log(`https://solscan.io/tx/${signature}`);
     const quote = { inAmount: amount, outAmount: quoteAmount };
     return {
       quote,
       signature,
       total_fee_in_sol,
       total_fee_in_token,
-      bundleId,
+      // bundleId,
     };
 
     // txBuilder.add(instruction);

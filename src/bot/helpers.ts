@@ -3,6 +3,10 @@ import path from 'path';
  * تحقق هل المستخدم اشترى العملة مسبقًا ولم يبعها بعد
  */
 export function hasPendingBuy(userId: string, tokenAddress: string): boolean {
+  if (!userId || userId === 'undefined') {
+    console.warn('[hasPendingBuy] Invalid userId, skipping check.');
+    return false;
+  }
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   if (!fs.existsSync(userFile)) return false;

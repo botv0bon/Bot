@@ -2,18 +2,56 @@
  * عند تسجيل صفقة شراء، احفظ سعر الدخول والهدف وأضف أمر بيع pending
  */
 export function registerBuyWithTarget(user: any, token: any, buyResult: any, targetPercent = 10) {
+  // تأكد من وجود معرف المستخدم داخل الكائن
   const userId = user.id || user.userId || user.telegramId;
+  if (!user.id && userId) user.id = userId;
+  // إذا لم يوجد معرف، استخدم معرف من السياق أو المفتاح
+  if (!user.id && typeof token === 'object' && token.userId) user.id = token.userId;
+  // إذا لم يوجد معرف، حاول جلبه من السياق الخارجي (مثلاً من ctx)
+  // إذا لم يوجد معرف بعد كل المحاولات، أوقف التنفيذ
+  if (!user.id || user.id === 'undefined') {
+    console.warn('[registerBuyWithTarget] Invalid userId, skipping trade record.');
+    return;
+  }
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   let userTrades: any[] = [];
   if (fs.existsSync(userFile)) {
     try { userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8')); } catch {}
   }
+  // تعريف نوع موحد للتداول
+  type TradeEntry = {
+    id: string;
+    mode: 'buy' | 'sell';
+    token: string;
+    amount: number;
+    tx?: string;
+    entryPrice?: number;
+    targetPercent?: number;
+    targetPrice?: number;
+    stopLossPercent?: number;
+    stopLossPrice?: number;
+    status: 'success' | 'fail' | 'pending';
+    linkedBuyTx?: string;
+    time: number;
+    stage?: number | string;
+    strategy?: any;
+    note?: string;
+    error?: string;
+    summary?: string;
+  };
+
+  // دالة توليد معرف فريد
+  function genId() {
+    return Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+  }
+
   const entryPrice = token.price || token.entryPrice || null;
   const amount = user.strategy.buyAmount || 0.01;
   const tx = buyResult?.tx;
   // سجل صفقة الشراء
-  userTrades.push({
+  const buyTrade: TradeEntry = {
+    id: genId(),
     mode: 'buy',
     token: token.address,
     amount,
@@ -21,7 +59,11 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
     entryPrice,
     time: Date.now(),
     status: tx ? 'success' : 'fail',
-  });
+    strategy: { ...user.strategy },
+    summary: `Buy ${token.address} | ${amount} SOL | ${tx ? 'Tx: ' + tx : 'No Tx'}`,
+  };
+  userTrades.push(buyTrade);
+
   // سجل أوامر البيع التلقائية (هدف1، هدف2، وقف خسارة)
   if (tx && entryPrice) {
     // هدف 1
@@ -29,6 +71,7 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
     const sellPercent1 = user.strategy.sellPercent1 || 50;
     const targetPrice1 = entryPrice * (1 + target1 / 100);
     userTrades.push({
+      id: genId(),
       mode: 'sell',
       token: token.address,
       amount: amount * (sellPercent1 / 100),
@@ -39,12 +82,15 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
       linkedBuyTx: tx,
       time: Date.now(),
       stage: 1,
+      strategy: { ...user.strategy },
+      summary: `AutoSell1 ${token.address} | ${sellPercent1}% | Target: ${targetPrice1}`,
     });
     // هدف 2
     const target2 = user.strategy.target2 || 20;
     const sellPercent2 = user.strategy.sellPercent2 || 50;
     const targetPrice2 = entryPrice * (1 + target2 / 100);
     userTrades.push({
+      id: genId(),
       mode: 'sell',
       token: token.address,
       amount: amount * (sellPercent2 / 100),
@@ -55,12 +101,15 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
       linkedBuyTx: tx,
       time: Date.now(),
       stage: 2,
+      strategy: { ...user.strategy },
+      summary: `AutoSell2 ${token.address} | ${sellPercent2}% | Target: ${targetPrice2}`,
     });
     // وقف الخسارة
     const stopLoss = user.strategy.stopLoss;
     if (stopLoss && stopLoss > 0) {
       const stopLossPrice = entryPrice * (1 - stopLoss / 100);
       userTrades.push({
+        id: genId(),
         mode: 'sell',
         token: token.address,
         amount: amount * ((100 - sellPercent1 - sellPercent2) / 100),
@@ -71,6 +120,8 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
         linkedBuyTx: tx,
         time: Date.now(),
         stage: 'stopLoss',
+        strategy: { ...user.strategy },
+        summary: `StopLoss ${token.address} | ${stopLoss}% | Price: ${stopLossPrice}`,
       });
     }
   }

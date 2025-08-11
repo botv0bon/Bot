@@ -65,7 +65,10 @@ export async function sendAndConfirmTransactionWrapper(
 }
 
 export function bufferFromUInt64(value: number | string) {
-  let buffer = Buffer.alloc(8);
-  buffer.writeBigUInt64LE(BigInt(value));
-  return buffer;
+  const arr = new Uint8Array(8);
+  let val = BigInt(value);
+  for (let i = 0; i < 8; i++) {
+    arr[i] = Number((val >> BigInt(8 * i)) & BigInt(0xff));
+  }
+  return arr;
 }

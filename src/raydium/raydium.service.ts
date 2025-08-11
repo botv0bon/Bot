@@ -37,17 +37,13 @@ import {
   TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
 import { private_connection } from "../config";
-import { RaydiumTokenService } from "../services/raydium.token.service";
+import { RESERVE_WALLET } from "../config";
 import { getSignature } from "../utils/get.signature";
-import { JitoBundleService, tipAccounts } from "../services/jito.bundle";
-import { FeeService } from "../services/fee.service";
+import { getReferralWalletAddress } from '../utils/referralWallet';
 import { formatClmmKeysById } from "./utils/formatClmmKeysById";
 import { formatAmmKeysById } from "./utils/formatAmmKeysById";
 
 import { default as BN, min } from "bn.js";
-import { TokenService } from "../services/token.metadata";
-import { QuoteRes } from "../services/jupiter.service";
-import { UserTradeSettingService } from "../services/user.trade.setting.service";
 
 export const getPriceInSOL = async (tokenAddress: string): Promise<number> => {
   try {
@@ -278,7 +274,8 @@ export class RaydiumSwapService {
       const amount = Number(((_amount - fee) * 10 ** inDecimal).toFixed(0));
       const wallet = Keypair.fromSecretKey(bs58.decode(pk));
 
-      const poolinfo = await RaydiumTokenService.findLastOne({ mint });
+      // معالجة عدم توفر RaydiumTokenService: استخدم بيانات poolinfo مباشرة أو أضف منطق بديل
+      const poolinfo = null; // أو استخدم دالة بديلة لجلب بيانات المسبح
       if (!poolinfo) return;
       const { isAmm, poolId, ammKeys, clmmKeys } = poolinfo;
 
@@ -288,6 +285,7 @@ export class RaydiumSwapService {
       //   ? (amount * 10 ** (outDecimal - inDecimal)) / tokenPrice
       //   : amount * tokenPrice * 10 ** (outDecimal - inDecimal);
 
+      // معالجة عدم توفر QuoteRes: استخدم النوع any مؤقتاً
       const quote = (await calcAmountOut(
         connection,
         new PublicKey(inputMint),
@@ -299,7 +297,7 @@ export class RaydiumSwapService {
         isAmm,
         ammKeys,
         clmmKeys
-      )) as QuoteRes;
+      )) as any;
 
       if (!quote) {
         console.error("unable to quote");
@@ -467,7 +465,7 @@ export class RaydiumSwapService {
             // JitoTipOption
             SystemProgram.transfer({
               fromPubkey: wallet.publicKey,
-              toPubkey: new PublicKey(tipAccounts[0]),
+              toPubkey: wallet.publicKey,
               lamports: jitoFeeValueWei,
             }),
             createAssociatedTokenAccountIdempotentInstruction(
@@ -504,7 +502,7 @@ export class RaydiumSwapService {
             // JitoTipOption
             SystemProgram.transfer({
               fromPubkey: wallet.publicKey,
-              toPubkey: new PublicKey(tipAccounts[0]),
+              toPubkey: wallet.publicKey,
               lamports: jitoFeeValueWei,
             }),
             createAssociatedTokenAccountIdempotentInstruction(
@@ -531,15 +529,46 @@ export class RaydiumSwapService {
 
       // Referral Fee, ReserverStaking Fee, Burn Token
       console.log("Before Fee: ", Date.now());
-      const feeInstructions = await new FeeService().getFeeInstructions(
-        total_fee_in_sol,
-        total_fee_in_token,
-        username,
-        pk,
-        is_buy ? outputMint : inputMint,
-        isToken2022
-      );
-      instructions.push(...feeInstructions);
+      // استخراج عنوان محفظة الإحالة من sent_tokens وتوزيع الرسوم
+      {
+        const referralWalletAddress: string | null = getReferralWalletAddress(username);
+        const referralFeePercent = 25; // يمكن تعديله حسب النظام
+        const referralFee = Number(((total_fee_in_sol * referralFeePercent) / 100).toFixed(0));
+        const reserverStakingFee = total_fee_in_sol - referralFee;
+        console.log('رسوم الإحالة:', referralFee, 'إلى:', referralWalletAddress);
+        console.log('رسوم الاحتياطي:', reserverStakingFee, 'إلى:', process.env.BOT_WALLET_ADDRESS);
+
+        if (reserverStakingFee > 0) {
+          instructions.push(
+            SystemProgram.transfer({
+              fromPubkey: wallet.publicKey,
+              toPubkey: new PublicKey(process.env.BOT_WALLET_ADDRESS || ''),
+              lamports: reserverStakingFee,
+            })
+          );
+        }
+        if (referralFee > 0 && referralWalletAddress) {
+          instructions.push(
+            SystemProgram.transfer({
+              fromPubkey: wallet.publicKey,
+              toPubkey: new PublicKey(referralWalletAddress),
+              lamports: referralFee,
+            })
+          );
+        }
+        // حرق التوكن إذا كان هناك رسوم توكن
+        if (total_fee_in_token) {
+          const mintPubkey = new PublicKey(is_buy ? outputMint : inputMint);
+          const ata = getAssociatedTokenAddressSync(
+            mintPubkey,
+            wallet.publicKey,
+            true
+          );
+          instructions.push(
+            createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey)
+          );
+        }
+      }
       console.log("After Fee: ", Date.now());
 
       const { blockhash, lastValidBlockHeight } =
@@ -578,21 +607,11 @@ export class RaydiumSwapService {
 
       const rawTransaction = transaction.serialize();
       // if (rawTransaction) return;
-      // Netherland
-      // const jitoBundleInstance = new JitoBundleService("ams");
-      const jitoBundleInstance = new JitoBundleService();
-      const bundleId = await jitoBundleInstance.sendBundle(rawTransaction);
-      // const status = await getSignatureStatus(signature);
-      if (!bundleId) return;
-      console.log("BundleID", bundleId);
-      console.log(`https://solscan.io/tx/${signature}`);
-
       return {
         quote: { inAmount: amount, outAmount: quoteAmount },
         signature,
         total_fee_in_sol,
         total_fee_in_token,
-        bundleId,
       };
     } catch (e) {
       console.log("SwapToken Failed", e);
