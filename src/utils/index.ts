@@ -75,9 +75,9 @@ export function formatPrice(price: number) {
 export const getPrice = async (mint: string): Promise<number> => {
   const options = { method: 'GET', headers: REQUEST_HEADER };
   try {
-    const response = await fetch(`https://public-api.birdeye.so/defi/price?address=${mint}`, options);
-    const res = await response.json();
-    const price = res?.data?.value;
+  const res = await fetch(`https://public-api.birdeye.so/defi/price?address=${mint}`, options);
+  const responseJson = await res.json() as any;
+  const price = responseJson?.data?.value;
     return typeof price === 'number' ? price : Number(price) || 0;
   } catch (err) {
     console.error('getPrice error:', err);

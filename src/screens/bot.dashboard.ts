@@ -1,13 +1,26 @@
-import TelegramBot from "node-telegram-bot-api";
-import { AlertBotID, WELCOME_REFERRAL } from "../bot.opts";
-import { get_referrer_info } from "../services/referral.service";
-import { ReferralChannelController } from "../controllers/referral.channel";
-import { UserService } from "../services/user.service";
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
+let AlertBotID: any;
+let WELCOME_REFERRAL: any;
+try { const _b = require('../bot.opts'); AlertBotID = _b.AlertBotID; WELCOME_REFERRAL = _b.WELCOME_REFERRAL; } catch (e) { AlertBotID = WELCOME_REFERRAL = null; }
+let get_referrer_info: any;
+try { get_referrer_info = require("../services/referral.service").get_referrer_info; } catch (e) { get_referrer_info = null; }
+let ReferralChannelController: any;
+try { ReferralChannelController = require("../controllers/referral.channel").ReferralChannelController; } catch (e) { ReferralChannelController = null; }
+let UserService: any;
+try { UserService = require("../services/user.service").UserService; } catch (e) { UserService = null; }
 import { schedule } from "node-cron";
-import {
-  ReferralChannelService,
-  ReferralPlatform,
-} from "../services/referral.channel.service";
+let ReferralChannelService: any;
+let ReferralPlatform: any;
+try {
+  const _r = require("../services/referral.channel.service");
+  ReferralChannelService = _r.ReferralChannelService;
+  ReferralPlatform = _r.ReferralPlatform;
+} catch (e) {
+  ReferralChannelService = null;
+  ReferralPlatform = null;
+}
 
 export const openAlertBotDashboard = async (
   bot: TelegramBot,

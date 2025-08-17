@@ -1,5 +1,11 @@
 // Dynamic, visual, English-only token filter demo for DexScreener Boosts API
-const fetch = require('node-fetch');
+let fetchFn = null;
+if (typeof globalThis.fetch === 'function') {
+  fetchFn = globalThis.fetch;
+} else {
+  const nf = require('node-fetch');
+  fetchFn = nf.default || nf;
+}
 
 const ENDPOINT = process.env.DEXSCREENER_API_ENDPOINT || 'https://api.dexscreener.com/token-boosts/latest/v1';
 
@@ -49,7 +55,7 @@ function printTokens(tokens) {
 async function main() {
   try {
     const criteria = await askCriteria();
-    const res = await fetch(ENDPOINT);
+  const res = await fetchFn(ENDPOINT);
     const data = await res.json();
     console.log('[DEBUG] Raw API response:', JSON.stringify(data, null, 2));
     // إذا كانت الاستجابة مصفوفة مباشرة (كما هو الحال مع Boosts API)، استخدمها كما هي

@@ -286,6 +286,40 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
     allTokens[addr].ageMinutes = ageMinutes;
   }
 
+  // --- Normalization pass: ensure each token has a stable address/name and a numeric ageMinutes (in minutes)
+  for (const addr of Object.keys(allTokens)) {
+    const t = allTokens[addr];
+    // Ensure canonical address field exists
+    if (!t.address) t.address = addr;
+    if (!t.tokenAddress) t.tokenAddress = addr;
+    if (!t.pairAddress) t.pairAddress = t.pairAddress || addr;
+
+    // Ensure name/symbol fallbacks
+    if (!t.name) t.name = (t.baseToken && t.baseToken.name) || t.tokenName || t.title || '';
+    if (!t.symbol) t.symbol = (t.baseToken && t.baseToken.symbol) || t.ticker || '';
+
+    // Normalize poolOpenTime to a millisecond timestamp when possible
+    let ct = t.poolOpenTime || t.createdAt || t.genesis_date || t.pairCreatedAt || null;
+    if (typeof ct === 'string' && /^\n+\d{4}-\d{2}-\d{2}/.test(ct)) {
+      ct = Date.parse(ct);
+    }
+    if (typeof ct === 'number' && ct > 0 && ct < 1e12 && ct > 1e9) {
+      // seconds -> ms
+      ct = ct * 1000;
+    }
+    // If ct now looks like ms timestamp, compute minutes
+    if (typeof ct === 'number' && ct > 1e12) {
+      t.poolOpenTime = ct;
+      t.ageMinutes = Math.floor((Date.now() - ct) / 60000);
+    } else if (typeof t.ageMinutes === 'number' && !isNaN(t.ageMinutes)) {
+      // already set (assume minutes)
+      t.ageMinutes = Math.floor(t.ageMinutes);
+    } else {
+      // give a safe undefined rather than various formats
+      t.ageMinutes = undefined;
+    }
+  }
+
   // 4. If not enough data, use CoinGecko fallback (same logic as before)
   let cgTokens: any[] = [];
   let coinGeckoFailed = false;

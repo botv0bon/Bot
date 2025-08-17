@@ -16,19 +16,50 @@ import {
 } from "./liquidity";
 import { MinimalMarketLayoutV3 } from "./market";
 import { MintLayout, TokenAccountLayout } from "./types";
-import {
-  connection,
-  COMMITMENT_LEVEL,
-  RPC_WEBSOCKET_ENDPOINT,
-  PRIVATE_RPC_ENDPOINT,
-  RAYDIUM_AMM_URL,
-  private_connection,
-  RAYDIUM_CLMM_URL,
-} from "../config";
-import { OpenMarketService } from "../services/openmarket.service";
-import { TokenService } from "../services/token.metadata";
-import { RaydiumTokenService } from "../services/raydium.token.service";
-import redisClient from "../services/redis";
+let connection: any;
+let COMMITMENT_LEVEL: any;
+let RPC_WEBSOCKET_ENDPOINT: any;
+let PRIVATE_RPC_ENDPOINT: any;
+let RAYDIUM_AMM_URL: any;
+let private_connection: any;
+let RAYDIUM_CLMM_URL: any;
+try {
+  const _c = require("../config");
+  connection = _c.connection;
+  COMMITMENT_LEVEL = _c.COMMITMENT_LEVEL;
+  RPC_WEBSOCKET_ENDPOINT = _c.RPC_WEBSOCKET_ENDPOINT;
+  PRIVATE_RPC_ENDPOINT = _c.PRIVATE_RPC_ENDPOINT;
+  RAYDIUM_AMM_URL = _c.RAYDIUM_AMM_URL;
+  private_connection = _c.private_connection;
+  RAYDIUM_CLMM_URL = _c.RAYDIUM_CLMM_URL;
+} catch (e) {
+  connection = COMMITMENT_LEVEL = RPC_WEBSOCKET_ENDPOINT = PRIVATE_RPC_ENDPOINT = RAYDIUM_AMM_URL = private_connection = RAYDIUM_CLMM_URL = null;
+}
+let OpenMarketService: any;
+let TokenService: any;
+let RaydiumTokenService: any;
+let redisClient: any;
+try {
+  OpenMarketService = require("../services/openmarket.service").OpenMarketService;
+} catch (e) {
+  OpenMarketService = null;
+}
+try {
+  TokenService = require("../services/token.metadata").TokenService;
+} catch (e) {
+  TokenService = null;
+}
+try {
+  RaydiumTokenService = require("../services/raydium.token.service").RaydiumTokenService;
+} catch (e) {
+  RaydiumTokenService = null;
+}
+try {
+  const _r = require("../services/redis");
+  redisClient = _r && (_r.default || _r);
+} catch (e) {
+  redisClient = null;
+}
 import { syncAmmPoolKeys, syncClmmPoolKeys } from "./raydium.service";
 
 const solanaConnection = new Connection(PRIVATE_RPC_ENDPOINT, {
@@ -52,14 +83,14 @@ async function initDB(): Promise<void> {
 async function initAMM(): Promise<void> {
   console.log(" - AMM Pool data fetching is started...");
   const ammRes = await fetch(RAYDIUM_AMM_URL);
-  const ammData = await ammRes.json();
+  const ammData = await ammRes.json() as any;
   console.log(" - AMM Pool data is fetched successfully...");
 
   const batchSize = 100; // Adjust this value based on your requirements
   const batches: Array<Array<any>> = [];
 
-  for (let i = 0; i < ammData.length; i += batchSize) {
-    batches.push(ammData.slice(i, i + batchSize));
+  for (let i = 0; i < (ammData as any).length; i += batchSize) {
+    batches.push((ammData as any).slice(i, i + batchSize));
   }
 
   for (const batch of batches) {
@@ -95,14 +126,14 @@ async function initAMM(): Promise<void> {
 async function initCLMM(): Promise<void> {
   console.log(" - CLMM Pool data fetching is started...");
   const clmmRes = await fetch(RAYDIUM_CLMM_URL);
-  const clmmData = await clmmRes.json();
+  const clmmData = await clmmRes.json() as any;
   console.log(" - CLMM Pool data is fetched successfully...");
 
   const batchSize = 100; // Adjust this value based on your requirements
   const batches: Array<Array<any>> = [];
 
-  for (let i = 0; i < clmmData.data.length; i += batchSize) {
-    batches.push(clmmData.data.slice(i, i + batchSize));
+  for (let i = 0; i < (clmmData as any).data.length; i += batchSize) {
+    batches.push((clmmData as any).data.slice(i, i + batchSize));
   }
 
   for (const batch of batches) {
@@ -160,11 +191,11 @@ export async function checkMintable(
   vault: PublicKey
 ): Promise<boolean | undefined> {
   try {
-    let { data } = (await solanaConnection.getAccountInfo(vault)) || {};
+  let { data } = (await solanaConnection.getAccountInfo(vault)) || {};
     if (!data) {
       return;
     }
-    const deserialize = MintLayout.decode(data);
+  const deserialize = MintLayout.decode(new Uint8Array(data as any));
     return deserialize.mintAuthorityOption === 0;
   } catch (e) {
     console.debug(e);

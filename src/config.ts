@@ -34,3 +34,4 @@ export const RESERVE_WALLET = process.env.RESERVE_WALLET || "1111111111111111111
 // اتصال خاص بالشبكة
 import { Connection } from "@solana/web3.js";
 export const private_connection = new Connection(MAINNET_RPC || "https://api.mainnet-beta.solana.com");
+export const connection = private_connection;

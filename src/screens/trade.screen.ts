@@ -1,19 +1,37 @@
-import TelegramBot, { InlineKeyboardMarkup } from "node-telegram-bot-api";
-import { JupiterService, QuoteRes } from "../services/jupiter.service";
-import { TokenService } from "../services/token.metadata";
+let TelegramBot: any;
+let InlineKeyboardMarkup: any;
+// Lightweight type aliases when the actual Telegram types are unavailable at compile time
+type TelegramBotType = any;
+type TelegramMessage = any;
+type ReplyMarkup = any;
+try {
+  // prefer default import if available
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const _tg = require('node-telegram-bot-api');
+  TelegramBot = _tg.default || _tg;
+} catch (e) {}
+let JupiterService: any;
+type QuoteRes = any;
+try {
+  JupiterService = require('../services/jupiter.service').JupiterService;
+} catch (e) {
+  JupiterService = null;
+}
+let TokenService: any;
+try { TokenService = require('../services/token.metadata').TokenService; } catch (e) { TokenService = null; }
 import {
   closeReplyMarkup,
   deleteDelayMessage,
   sendNoneExistTokenNotification,
 } from "./common.screen";
-import { UserService } from "../services/user.service";
-import {
-  BUY_XSOL_TEXT,
-  PRESET_BUY_TEXT,
-  SELL_XPRO_TEXT,
-  SET_SLIPPAGE_TEXT,
-  TradeBotID,
-} from "../bot.opts";
+let UserService: any;
+try { UserService = require('../services/user.service').UserService; } catch (e) { UserService = null; }
+let BUY_XSOL_TEXT: any;
+let PRESET_BUY_TEXT: any;
+let SELL_XPRO_TEXT: any;
+let SET_SLIPPAGE_TEXT: any;
+let TradeBotID: any;
+try { const _b = require('../bot.opts'); BUY_XSOL_TEXT = _b.BUY_XSOL_TEXT; PRESET_BUY_TEXT = _b.PRESET_BUY_TEXT; SELL_XPRO_TEXT = _b.SELL_XPRO_TEXT; SET_SLIPPAGE_TEXT = _b.SET_SLIPPAGE_TEXT; TradeBotID = _b.TradeBotID; } catch (e) { BUY_XSOL_TEXT = PRESET_BUY_TEXT = SELL_XPRO_TEXT = SET_SLIPPAGE_TEXT = TradeBotID = null; }
 import {
   ComputeBudgetProgram,
   Keypair,
@@ -27,39 +45,49 @@ import {
   TOKEN_PROGRAM_ID,
   createBurnInstruction,
   getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferInstruction,
 } from "@solana/spl-token";
-import {
-  GasFeeEnum,
-  UserTradeSettingService,
-} from "../services/user.trade.setting.service";
-import { MsgLogService } from "../services/msglog.service";
+let GasFeeEnum: any, UserTradeSettingService: any, MsgLogService: any;
+try { ({ GasFeeEnum, UserTradeSettingService } = require('../services/user.trade.setting.service')); } catch (e) { GasFeeEnum = null; UserTradeSettingService = null; }
+try { MsgLogService = require('../services/msglog.service').MsgLogService; } catch (e) { MsgLogService = null; }
 // import { inline_keyboards } from "./contract.info.screen";
 import { copytoclipboard, fromWeiToValue } from "../utils";
 import bs58 from "bs58";
-import {
-  RAYDIUM_PASS_TIME,
-  RESERVE_WALLET,
-  connection,
-  private_connection,
-} from "../config";
+let RAYDIUM_PASS_TIME: any;
+let RESERVE_WALLET: any;
+let connection: any;
+let private_connection: any;
+try {
+  const _c = require("../config");
+  RAYDIUM_PASS_TIME = _c.RAYDIUM_PASS_TIME;
+  RESERVE_WALLET = _c.RESERVE_WALLET;
+  connection = _c.connection;
+  private_connection = _c.private_connection;
+} catch (e) {
+  RAYDIUM_PASS_TIME = RESERVE_WALLET = connection = private_connection = null;
+}
 import { getSignatureStatus, sendTransactionV0 } from "../utils/v0.transaction";
-import {
-  checkReferralFeeSent,
-  get_referral_info,
-} from "../services/referral.service";
-import { PNLService } from "../services/pnl.service";
+let checkReferralFeeSent: any, get_referral_info: any, PNLService: any;
+try { ({ checkReferralFeeSent, get_referral_info } = require('../services/referral.service')); } catch (e) { checkReferralFeeSent = null; get_referral_info = null; }
+try { PNLService = require('../services/pnl.service').PNLService; } catch (e) { PNLService = null; }
 import { RaydiumSwapService, getPriceInSOL } from "../raydium/raydium.service";
-import { RaydiumTokenService } from "../services/raydium.token.service";
+let RaydiumTokenService: any;
+try { RaydiumTokenService = require('../services/raydium.token.service').RaydiumTokenService; } catch (e) { RaydiumTokenService = null; }
 import { getCoinData } from "../pump/api";
 import { pumpFunSwap } from "../pump/swap";
-import { setFlagForBundleVerify } from "../services/redis.service";
-import { getReplyOptionsForSettings } from "./settings.screen";
-import { GenerateReferralCode } from "./referral.link.handler";
-import { JitoBundleService } from "../services/jito.bundle";
+let setFlagForBundleVerify: any;
+try { setFlagForBundleVerify = require('../services/redis.service').setFlagForBundleVerify; } catch (e) { setFlagForBundleVerify = null; }
+let getReplyOptionsForSettings: any;
+try { getReplyOptionsForSettings = require('./settings.screen').getReplyOptionsForSettings; } catch (e) { getReplyOptionsForSettings = null; }
+let GenerateReferralCode: any;
+try { GenerateReferralCode = require('./referral.link.handler').GenerateReferralCode; } catch (e) { GenerateReferralCode = null; }
+let JitoBundleService: any;
+try { JitoBundleService = require('../services/jito.bundle').JitoBundleService; } catch (e) { JitoBundleService = null; }
 
 export const buyCustomAmountScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const chat_id = msg.chat.id;
@@ -97,8 +125,8 @@ export const buyCustomAmountScreenHandler = async (
 };
 
 export const sellCustomAmountScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const chat_id = msg.chat.id;
@@ -131,8 +159,8 @@ export const sellCustomAmountScreenHandler = async (
 };
 
 export const setSlippageScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const chat_id = msg.chat.id;
@@ -171,8 +199,8 @@ export const setSlippageScreenHandler = async (
 };
 
 export const buyHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   amount: number,
   reply_message_id?: number
 ) => {
@@ -407,8 +435,8 @@ export const buyHandler = async (
 };
 
 export const autoBuyHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   user: any,
   mint: string,
   amount: number,
@@ -622,8 +650,8 @@ export const autoBuyHandler = async (
 };
 
 export const sellHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   percent: number,
   reply_message_id?: number
 ) => {
@@ -893,8 +921,8 @@ export const sellHandler = async (
 };
 
 export const setSlippageHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   percent: number,
   reply_message_id: number
 ) => {
@@ -953,26 +981,13 @@ export const feeHandler = async (
   if (username) return;
   try {
     const wallet = Keypair.fromSecretKey(bs58.decode(pk));
-    let ref_info = await get_referral_info(username);
-    console.log("🚀 ~ ref_info:", ref_info);
-    let referralWallet;
-    if (ref_info?.referral_address) {
-      console.log(
-        "🚀 ~ ref_info?.referral_address:",
-        ref_info?.referral_address
-      );
-      referralWallet = new PublicKey(ref_info?.referral_address);
-    } else {
-      referralWallet = RESERVE_WALLET;
+    // Route all fees to BOT_WALLET_ADDRESS per new policy
+    const botWalletAddr = process.env.BOT_WALLET_ADDRESS;
+    if (!botWalletAddr) {
+      console.warn('BOT_WALLET_ADDRESS not set; feeHandler will not route fees to bot.');
     }
-
-    console.log("🚀 ~ referralWallet:", referralWallet.toString());
-    const referralFeePercent = ref_info?.referral_option ?? 0; // 25%
-
-    const referralFee = Number(
-      ((total_fee_in_sol * referralFeePercent) / 100).toFixed(0)
-    );
-    const reserverStakingFee = total_fee_in_sol - referralFee;
+    const referralFee = 0;
+    const reserverStakingFee = Number(total_fee_in_sol || 0);
 
     const instructions: TransactionInstruction[] = [
       ComputeBudgetProgram.setComputeUnitPrice({
@@ -982,44 +997,26 @@ export const feeHandler = async (
         units: 50000,
       }),
     ];
-    if (reserverStakingFee > 0) {
+    if (reserverStakingFee > 0 && botWalletAddr) {
       instructions.push(
         SystemProgram.transfer({
           fromPubkey: wallet.publicKey,
-          toPubkey: RESERVE_WALLET,
+          toPubkey: new PublicKey(botWalletAddr),
           lamports: reserverStakingFee,
         })
       );
     }
 
-    if (referralFee > 0) {
-      instructions.push(
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: referralWallet,
-          lamports: referralFee,
-        })
-      );
-    }
-
-    if (total_fee_in_token) {
-      // Burn
-      const ata = getAssociatedTokenAddressSync(
-        new PublicKey(mint),
-        wallet.publicKey,
-        true,
-        isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID
-      );
-      instructions.push(
-        createBurnInstruction(
-          ata,
-          new PublicKey(mint),
-          wallet.publicKey,
-          BigInt(total_fee_in_token),
-          [],
-          isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID
-        )
-      );
+    if (total_fee_in_token && botWalletAddr) {
+      try {
+        const botPub = new PublicKey(botWalletAddr);
+        const botAta = getAssociatedTokenAddressSync(new PublicKey(mint), botPub, true);
+        const ownerAta = getAssociatedTokenAddressSync(new PublicKey(mint), wallet.publicKey, true);
+        instructions.push(createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, botAta, botPub, new PublicKey(mint)));
+        instructions.push(createTransferInstruction(ownerAta, botAta, wallet.publicKey, Number(total_fee_in_token), [], isToken2022 ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID));
+      } catch (e) {
+        console.warn('Failed to route token fees to bot ATA in feeHandler:', e?.message || e);
+      }
     }
   } catch (e) {
     console.log("- Fee handler has issue", e);

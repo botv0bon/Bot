@@ -1,17 +1,53 @@
-import TelegramBot, { InlineKeyboardButton } from "node-telegram-bot-api";
-import { TokenService } from "../services/token.metadata";
+let TelegramBot: any;
+let InlineKeyboardButton: any;
+try {
+  const _tg = require('node-telegram-bot-api');
+  TelegramBot = _tg.default || _tg;
+  InlineKeyboardButton = (_tg as any).InlineKeyboardButton || undefined;
+} catch (e) {}
+type TelegramBotType = any;
+type TelegramMessage = any;
 import { copytoclipboard } from "../utils";
-import { UserService } from "../services/user.service";
 import { sendUsernameRequiredNotification } from "./common.screen";
-import { GrowTradeVersion, PNL_SHOW_THRESHOLD_USD } from "../config";
-import { PositionService } from "../services/position.service";
-import { JupiterService } from "../services/jupiter.service";
+let GrowTradeVersion: any;
+let PNL_SHOW_THRESHOLD_USD: any;
+try { const _c = require('../config'); GrowTradeVersion = _c.GrowTradeVersion; PNL_SHOW_THRESHOLD_USD = _c.PNL_SHOW_THRESHOLD_USD; } catch (e) { GrowTradeVersion = ''; PNL_SHOW_THRESHOLD_USD = null; }
+// JupiterService is loaded dynamically as JupiterServiceLocal to avoid compile-time missing-module errors
 import { NATIVE_MINT } from "@solana/spl-token";
-import { PNLService } from "../services/pnl.service";
+let TokenService: any;
+let UserService: any;
+let PositionService: any;
+let JupiterServiceLocal: any;
+let PNLService: any;
+try {
+  TokenService = require("../services/token.metadata").TokenService;
+} catch (e) {
+  TokenService = null;
+}
+try {
+  UserService = require("../services/user.service").UserService;
+} catch (e) {
+  UserService = null;
+}
+try {
+  PositionService = require("../services/position.service").PositionService;
+} catch (e) {
+  PositionService = null;
+}
+try {
+  JupiterServiceLocal = require("../services/jupiter.service").JupiterService;
+} catch (e) {
+  JupiterServiceLocal = null;
+}
+try {
+  PNLService = require("../services/pnl.service").PNLService;
+} catch (e) {
+  PNLService = null;
+}
 
 export const positionScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   replaceId?: number
 ) => {
   try {

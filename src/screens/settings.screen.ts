@@ -1,4 +1,6 @@
-import TelegramBot from "node-telegram-bot-api";
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
 import { Keypair, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import {
@@ -7,37 +9,117 @@ import {
   sendNoneUserNotification,
   sendUsernameRequiredNotification,
 } from "./common.screen";
-import { UserService } from "../services/user.service";
+const UserService: any = (() => {
+  try {
+    return require("../services/user.service").UserService;
+  } catch (e) {
+    return null;
+  }
+})();
 import { copytoclipboard, fromWeiToValue } from "../utils";
-import { GrowTradeVersion, MAX_WALLET, private_connection } from "../config";
-import { MsgLogService } from "../services/msglog.service";
-import redisClient from "../services/redis";
-import {
-  AUTO_BUY_TEXT,
-  PRESET_BUY_TEXT,
-  SET_GAS_FEE,
-  SET_JITO_FEE,
-  TradeBotID,
-} from "../bot.opts";
-import {
+let GrowTradeVersion: any;
+let MAX_WALLET: any;
+let private_connection: any;
+try {
+  const _c = require("../config");
+  GrowTradeVersion = _c.GrowTradeVersion;
+  MAX_WALLET = _c.MAX_WALLET;
+  private_connection = _c.private_connection;
+} catch (e) {
+  GrowTradeVersion = "";
+  MAX_WALLET = null;
+  private_connection = null;
+}
+const MsgLogService: any = (() => {
+  try {
+    return require("../services/msglog.service").MsgLogService;
+  } catch (e) {
+    return null;
+  }
+})();
+let redisClient: any;
+try {
+  // redis export may be default or named
+  const _r = require("../services/redis");
+  redisClient = _r && (_r.default || _r);
+} catch (e) {
+  redisClient = null;
+}
+let AUTO_BUY_TEXT: any;
+let PRESET_BUY_TEXT: any;
+let SET_GAS_FEE: any;
+let SET_JITO_FEE: any;
+let TradeBotID: any;
+try {
+  const _b = require("../bot.opts");
+  AUTO_BUY_TEXT = _b.AUTO_BUY_TEXT;
+  PRESET_BUY_TEXT = _b.PRESET_BUY_TEXT;
+  SET_GAS_FEE = _b.SET_GAS_FEE;
+  SET_JITO_FEE = _b.SET_JITO_FEE;
+  TradeBotID = _b.TradeBotID;
+} catch (e) {
+  AUTO_BUY_TEXT = PRESET_BUY_TEXT = SET_GAS_FEE = SET_JITO_FEE = TradeBotID = null;
+}
+const {
   GasFeeEnum,
   JitoFeeEnum,
   UserTradeSettingService,
-} from "../services/user.trade.setting.service";
+}: any = (() => {
+  try {
+    return require("../services/user.trade.setting.service");
+  } catch (e) {
+    return {};
+  }
+})();
+type GasFeeEnumType = any;
 import { welcomeKeyboardList } from "./welcome.screen";
 import { GenerateReferralCode } from "./referral.link.handler";
-import { TokenService } from "../services/token.metadata";
-import { PNLService } from "../services/pnl.service";
-import { RaydiumTokenService } from "../services/raydium.token.service";
-import { QuoteRes } from "../services/jupiter.service";
-import { JupiterService } from "../services/jupiter.service";
+const TokenService: any = (() => {
+  try {
+    return require("../services/token.metadata").TokenService;
+  } catch (e) {
+    return null;
+  }
+})();
+const PNLService: any = (() => {
+  try {
+    return require("../services/pnl.service").PNLService;
+  } catch (e) {
+    return null;
+  }
+})();
+const RaydiumTokenService: any = (() => {
+  try {
+    return require("../services/raydium.token.service").RaydiumTokenService;
+  } catch (e) {
+    return null;
+  }
+})();
+type QuoteRes = any;
+const JupiterService: any = (() => {
+  try {
+    return require("../services/jupiter.service").JupiterService;
+  } catch (e) {
+    return null;
+  }
+})();
 import { NATIVE_MINT } from "@solana/spl-token";
-import { calcAmountOut } from "../raydium/raydium.service";
-import { getCoinData } from "../pump/api";
+let calcAmountOut: any;
+try {
+  calcAmountOut = require("../raydium/raydium.service").calcAmountOut;
+} catch (e) {
+  calcAmountOut = null;
+}
+let getCoinData: any;
+try {
+  getCoinData = require("../pump/api").getCoinData;
+} catch (e) {
+  getCoinData = null;
+}
 
 export const settingScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   replaceId?: number
 ) => {
   try {
@@ -105,8 +187,8 @@ export const settingScreenHandler = async (
 };
 
 export const presetBuyBtnHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   const { chat } = msg;
   const { id: chat_id, username, first_name, last_name } = chat;
@@ -173,8 +255,8 @@ export const presetBuyBtnHandler = async (
 };
 
 export const autoBuyAmountScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   replaceId: number
 ) => {
   try {
@@ -199,8 +281,8 @@ export const autoBuyAmountScreenHandler = async (
 };
 
 export const presetBuyAmountScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   preset_index: number
 ) => {
   try {
@@ -224,8 +306,8 @@ export const presetBuyAmountScreenHandler = async (
 };
 
 export const walletViewHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const { chat, message_id } = msg;
@@ -307,8 +389,8 @@ export const walletViewHandler = async (
 };
 
 export const generateNewWalletHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const { chat } = msg;
@@ -426,8 +508,8 @@ export const generateNewWalletHandler = async (
 };
 
 export const revealWalletPrivatekyHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   nonce: number
 ) => {
   try {
@@ -469,8 +551,8 @@ export const revealWalletPrivatekyHandler = async (
 };
 
 export const switchWalletHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
   nonce: number
 ) => {
   try {
@@ -539,7 +621,7 @@ export const setCustomBuyPresetHandler = async (
 export const changeGasFeeHandler = async (
   bot: TelegramBot,
   msg: TelegramBot.Message,
-  gasfee: GasFeeEnum
+  gasfee: GasFeeEnumType
 ) => {
   const chat_id = msg.chat.id;
   const caption = msg.text;
@@ -598,8 +680,8 @@ export const changeGasFeeHandler = async (
 };
 
 export const setCustomFeeScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const chat_id = msg.chat.id;

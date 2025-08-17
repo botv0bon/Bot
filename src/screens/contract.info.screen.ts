@@ -1,5 +1,6 @@
-import TelegramBot from "node-telegram-bot-api";
-import { TokenService } from "../services/token.metadata";
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
 import {
   birdeyeLink,
   contractLink,
@@ -10,37 +11,96 @@ import {
   formatPrice,
   fromWeiToValue,
 } from "../utils";
-import { UserService } from "../services/user.service";
+let TokenService: any;
+let UserService: any;
+try {
+  TokenService = require("../services/token.metadata").TokenService;
+} catch (e) {
+  TokenService = null;
+}
+try {
+  UserService = require("../services/user.service").UserService;
+} catch (e) {
+  UserService = null;
+}
 import {
   sendNoneExistTokenNotification,
   sendNoneUserNotification,
   sendUsernameRequiredNotification,
 } from "./common.screen";
-import {
-  GasFeeEnum,
-  UserTradeSettingService,
-} from "../services/user.trade.setting.service";
-import { MsgLogService } from "../services/msglog.service";
+let GasFeeEnum: any; let UserTradeSettingService: any;
+try {
+  const _uts = require("../services/user.trade.setting.service");
+  GasFeeEnum = _uts.GasFeeEnum;
+  UserTradeSettingService = _uts.UserTradeSettingService;
+} catch (e) {
+  GasFeeEnum = null;
+  UserTradeSettingService = null;
+}
+let MsgLogService: any;
+try {
+  MsgLogService = require("../services/msglog.service").MsgLogService;
+} catch (e) {
+  MsgLogService = null;
+}
 import { autoBuyHandler } from "./trade.screen";
-import { JupiterService, QuoteRes } from "../services/jupiter.service";
+let JupiterService: any;
+try {
+  JupiterService = require("../services/jupiter.service").JupiterService;
+} catch (e) {
+  JupiterService = null;
+}
+type QuoteRes = any;
 import { NATIVE_MINT } from "@solana/spl-token";
-import { PNLService } from "../services/pnl.service";
-import { RaydiumTokenService } from "../services/raydium.token.service";
-import {
-  PNL_SHOW_THRESHOLD_USD,
-  RAYDIUM_PASS_TIME,
-  connection,
-  private_connection,
-} from "../config";
+let PNLService: any;
+try {
+  PNLService = require("../services/pnl.service").PNLService;
+} catch (e) {
+  PNLService = null;
+}
+let RaydiumTokenService: any;
+try {
+  RaydiumTokenService = require("../services/raydium.token.service").RaydiumTokenService;
+} catch (e) {
+  RaydiumTokenService = null;
+}
+let PNL_SHOW_THRESHOLD_USD: any;
+let RAYDIUM_PASS_TIME: any;
+let connection: any;
+let private_connection: any;
+try {
+  const _c = require("../config");
+  PNL_SHOW_THRESHOLD_USD = _c.PNL_SHOW_THRESHOLD_USD;
+  RAYDIUM_PASS_TIME = _c.RAYDIUM_PASS_TIME;
+  connection = _c.connection;
+  private_connection = _c.private_connection;
+} catch (e) {
+  PNL_SHOW_THRESHOLD_USD = RAYDIUM_PASS_TIME = connection = private_connection = null;
+}
 import { PublicKey } from "@solana/web3.js";
 import { getTop10HoldersPercent } from "../raydium";
-import {
-  calcAmountOut,
-  syncAmmPoolKeys,
-  syncClmmPoolKeys,
-} from "../raydium/raydium.service";
-import { getCoinData } from "../pump/api";
-import { TokenSecurityInfoDataType } from "../services/birdeye.api.service";
+let calcAmountOut: any;
+let syncAmmPoolKeys: any;
+let syncClmmPoolKeys: any;
+try {
+  const _r = require("../raydium/raydium.service");
+  calcAmountOut = _r.calcAmountOut;
+  syncAmmPoolKeys = _r.syncAmmPoolKeys;
+  syncClmmPoolKeys = _r.syncClmmPoolKeys;
+} catch (e) {
+  calcAmountOut = null;
+  syncAmmPoolKeys = null;
+  syncClmmPoolKeys = null;
+}
+let getCoinData: any;
+try {
+  getCoinData = require("../pump/api").getCoinData;
+} catch (e) {
+  getCoinData = null;
+}
+let TokenSecurityInfoDataType: any;
+try { TokenSecurityInfoDataType = require("../services/birdeye.api.service").TokenSecurityInfoDataType; } catch (e) { TokenSecurityInfoDataType = null; }
+type TokenSecurityInfoDataTypeAlias = any;
 
 export const inline_keyboards = [
   [{ text: "🖼 Generate PNL Card", command: "pnl_card" }],
@@ -61,9 +121,9 @@ export const inline_keyboards = [
 ];
 
 export const contractInfoScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message,
-  mint: string,
+  bot: TelegramBotType,
+  msg: TelegramMessage,
+  mint?: string,
   switchBtn?: string,
   fromPosition?: boolean
 ) => {
@@ -86,14 +146,13 @@ export const contractInfoScreenHandler = async (
     let solbalance = 0;
     let splbalance = 0;
     // Here, we need to get info from raydium token list
-    const raydiumPoolInfo = await RaydiumTokenService.findLastOne({ mint });
+  const raydiumPoolInfo = await RaydiumTokenService.findLastOne({ mint: mint as string });
+    const jupiterSerivce = new JupiterService();
     let isJupiterTradable = false;
     let isPumpfunTradable = false;
     if (!raydiumPoolInfo) {
-      const jupiterSerivce = new JupiterService();
-      const jupiterTradeable = await jupiterSerivce.checkTradableOnJupiter(
-        mint
-      );
+  const jupiterSerivce = new JupiterService();
+  const jupiterTradeable = await jupiterSerivce.checkTradableOnJupiter(mint as string);
       if (!jupiterTradeable) {
         isPumpfunTradable = true;
       } else {
@@ -116,18 +175,15 @@ export const contractInfoScreenHandler = async (
     console.log("IsJupiterTradeable", isJupiterTradable);
 
     if (isPumpfunTradable) {
-      const captionForPump = await getPumpTokenInfoCaption(
-        mint,
-        user.wallet_address
-      );
+  const captionForPump = await getPumpTokenInfoCaption(mint as string, user.wallet_address);
 
       if (!captionForPump) {
-        bot.deleteMessage(chat_id, pending.message_id);
+      const raydiumPoolInfo = await RaydiumTokenService.findLastOne({ mint: mint.toString() });
         await sendNoneExistTokenNotification(bot, msg);
         return;
       }
       bot.deleteMessage(chat_id, pending.message_id);
-      caption = captionForPump.caption;
+          const jupiterTradeable = await jupiterSerivce.checkTradableOnJupiter(mint.toString());
       solbalance = captionForPump.solbalance;
       splbalance = captionForPump.splbalance;
     } else if (raydiumPoolInfo && !isJupiterTradable) {
@@ -141,15 +197,16 @@ export const contractInfoScreenHandler = async (
         bot.deleteMessage(chat_id, pending.message_id);
         return;
       }
-      bot.deleteMessage(chat_id, pending.message_id);
+            const jupiterTradeable = await jupiterSerivce.checkTradableOnJupiter(mint.toString());
       caption = captionForRaydium.caption;
       solbalance = captionForRaydium.solbalance;
       splbalance = captionForRaydium.splbalance;
       // }
-    } else {
-      // check token metadata
-      const tokeninfo = await TokenService.getMintInfo(mint);
-      if (!tokeninfo) {
+  } else {
+    // check token metadata
+      const captionForPump = await getPumpTokenInfoCaption(mint.toString(), user.wallet_address);
+    const tokeninfo = await TokenService.getMintInfo(mint.toString()).catch(() => null);
+    if (!tokeninfo) {
         bot.deleteMessage(chat_id, pending.message_id);
         await sendNoneExistTokenNotification(bot, msg);
         return;
@@ -553,7 +610,7 @@ const getPumpTokenInfoCaption = async (
 
     const secuInf = (await TokenService.getTokenSecurity(
       mintStr
-    )) as TokenSecurityInfoDataType;
+    )) as TokenSecurityInfoDataTypeAlias;
     const top10HolderPercent = secuInf.top10HolderPercent as number;
     const price = priceInUsd;
 
@@ -647,8 +704,8 @@ const buildCaption = async (
 };
 
 export const refreshHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const chat_id = msg.chat.id;

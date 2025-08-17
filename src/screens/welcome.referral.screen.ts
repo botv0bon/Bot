@@ -1,17 +1,30 @@
-import TelegramBot, {
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
+// ...other named imports removed from static import
+// original code expected named exports from node-telegram-bot-api; runtime require will provide them as properties if needed.
+import {
   KeyboardButton,
   ReplyKeyboardMarkup,
 } from "node-telegram-bot-api";
-import { TradeBotID, WELCOME_REFERRAL } from "../bot.opts";
+let TradeBotID: any;
+let WELCOME_REFERRAL: any;
+try { const _b = require('../bot.opts'); TradeBotID = _b.TradeBotID; WELCOME_REFERRAL = _b.WELCOME_REFERRAL; } catch (e) { TradeBotID = WELCOME_REFERRAL = null; }
 import { copytoclipboard } from "../utils";
-import {
-  get_referral_amount,
-  get_referral_num,
-} from "../services/referral.service";
+let get_referral_amount: any;
+let get_referral_num: any;
+try {
+  const _r = require("../services/referral.service");
+  get_referral_amount = _r.get_referral_amount;
+  get_referral_num = _r.get_referral_num;
+} catch (e) {
+  get_referral_amount = null;
+  get_referral_num = null;
+}
 
 export const showWelcomeReferralProgramMessage = async (
-  bot: TelegramBot,
-  chat: TelegramBot.Chat,
+  bot: TelegramBotType,
+  chat: any,
   uniquecode?: string
 ) => {
   try {

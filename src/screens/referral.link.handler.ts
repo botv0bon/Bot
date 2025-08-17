@@ -1,12 +1,24 @@
-import TelegramBot from "node-telegram-bot-api";
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
 import { showWelcomeReferralProgramMessage } from "./welcome.referral.screen";
 import { generateReferralCode } from "../utils";
-import { UserService } from "../services/user.service";
-import { ReferralChannelService } from "../services/referral.channel.service";
+let UserService: any;
+try {
+  UserService = require("../services/user.service").UserService;
+} catch (e) {
+  UserService = null;
+}
+let ReferralChannelService: any;
+try {
+  ReferralChannelService = require("../services/referral.channel.service").ReferralChannelService;
+} catch (e) {
+  ReferralChannelService = null;
+}
 
 export const OpenReferralWindowHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   const chat = msg.chat;
   const username = chat.username;

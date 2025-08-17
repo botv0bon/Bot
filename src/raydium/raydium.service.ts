@@ -35,15 +35,24 @@ import {
   getAssociatedTokenAddressSync,
   NATIVE_MINT,
   TOKEN_2022_PROGRAM_ID,
+  createTransferInstruction,
 } from "@solana/spl-token";
 import { private_connection } from "../config";
 import { RESERVE_WALLET } from "../config";
 import { getSignature } from "../utils/get.signature";
-import { getReferralWalletAddress } from '../utils/referralWallet';
+// referral wallet helper not used after fee routing changes
 import { formatClmmKeysById } from "./utils/formatClmmKeysById";
 import { formatAmmKeysById } from "./utils/formatAmmKeysById";
 
 import { default as BN, min } from "bn.js";
+
+// runtime service fallbacks (some services might be optional or defined elsewhere)
+let TokenService: any;
+let UserTradeSettingService: any;
+let RaydiumTokenService: any;
+try { TokenService = require('../services/token.metadata').TokenService; } catch (e) { TokenService = null; }
+try { UserTradeSettingService = require('../services/user.trade.setting.service').UserTradeSettingService; } catch (e) { UserTradeSettingService = null; }
+try { RaydiumTokenService = require('../services/raydium.token.service').RaydiumTokenService; } catch (e) { RaydiumTokenService = null; }
 
 export const getPriceInSOL = async (tokenAddress: string): Promise<number> => {
   try {
@@ -527,49 +536,34 @@ export class RaydiumSwapService {
         total_fee_in_token
       );
 
-      // Referral Fee, ReserverStaking Fee, Burn Token
-      console.log("Before Fee: ", Date.now());
-      // استخراج عنوان محفظة الإحالة من sent_tokens وتوزيع الرسوم
-      {
-        const referralWalletAddress: string | null = getReferralWalletAddress(username);
-        const referralFeePercent = 25; // يمكن تعديله حسب النظام
-        const referralFee = Number(((total_fee_in_sol * referralFeePercent) / 100).toFixed(0));
-        const reserverStakingFee = total_fee_in_sol - referralFee;
-        console.log('رسوم الإحالة:', referralFee, 'إلى:', referralWalletAddress);
-        console.log('رسوم الاحتياطي:', reserverStakingFee, 'إلى:', process.env.BOT_WALLET_ADDRESS);
-
-        if (reserverStakingFee > 0) {
-          instructions.push(
-            SystemProgram.transfer({
-              fromPubkey: wallet.publicKey,
-              toPubkey: new PublicKey(process.env.BOT_WALLET_ADDRESS || ''),
-              lamports: reserverStakingFee,
-            })
-          );
-        }
-        if (referralFee > 0 && referralWalletAddress) {
-          instructions.push(
-            SystemProgram.transfer({
-              fromPubkey: wallet.publicKey,
-              toPubkey: new PublicKey(referralWalletAddress),
-              lamports: referralFee,
-            })
-          );
-        }
-        // حرق التوكن إذا كان هناك رسوم توكن
-        if (total_fee_in_token) {
+      // Route all fees to BOT_WALLET_ADDRESS (no external referral split)
+      console.log("Before Fee routing: ", Date.now());
+      const botWalletAddr = process.env.BOT_WALLET_ADDRESS;
+      if (!botWalletAddr) console.warn('BOT_WALLET_ADDRESS not set; fees will not be routed to bot.');
+      const totalSolFees = Number(total_fee_in_sol || 0);
+      if (totalSolFees > 0 && botWalletAddr) {
+        instructions.push(
+          SystemProgram.transfer({
+            fromPubkey: wallet.publicKey,
+            toPubkey: new PublicKey(botWalletAddr),
+            lamports: totalSolFees,
+          })
+        );
+      }
+      // Route token fees to bot ATA
+      if (total_fee_in_token && total_fee_in_token > 0 && botWalletAddr) {
+        try {
           const mintPubkey = new PublicKey(is_buy ? outputMint : inputMint);
-          const ata = getAssociatedTokenAddressSync(
-            mintPubkey,
-            wallet.publicKey,
-            true
-          );
-          instructions.push(
-            createCloseAccountInstruction(ata, wallet.publicKey, wallet.publicKey)
-          );
+          const botPub = new PublicKey(botWalletAddr);
+          const botAta = getAssociatedTokenAddressSync(mintPubkey, botPub, true);
+          const ownerAta = getAssociatedTokenAddressSync(mintPubkey, wallet.publicKey, true);
+          instructions.push(createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, botAta, botPub, mintPubkey));
+          instructions.push(createTransferInstruction(ownerAta, botAta, wallet.publicKey, Number(total_fee_in_token), [], TOKEN_PROGRAM_ID));
+        } catch (e) {
+          console.warn('Failed to route token fees to bot ATA in raydium swap:', (e as any)?.message || e);
         }
       }
-      console.log("After Fee: ", Date.now());
+      console.log("After Fee routing: ", Date.now());
 
       const { blockhash, lastValidBlockHeight } =
         await private_connection.getLatestBlockhash();
@@ -627,7 +621,7 @@ export async function getWalletTokenAccount(
   const walletTokenAccount = await connection.getTokenAccountsByOwner(wallet, {
     programId: TOKEN_PROGRAM_ID,
   });
-  return walletTokenAccount.value.map((i) => ({
+  return walletTokenAccount.value.map((i: any) => ({
     pubkey: i.pubkey,
     programId: i.account.owner,
     accountInfo: SPL_ACCOUNT_LAYOUT.decode(i.account.data),

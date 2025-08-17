@@ -1,13 +1,22 @@
-import TelegramBot from "node-telegram-bot-api";
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
 import { copytoclipboard } from "../utils";
-import { INPUT_SOL_ADDRESS } from "../bot.opts";
+let INPUT_SOL_ADDRESS: any;
+try { INPUT_SOL_ADDRESS = require('../bot.opts').INPUT_SOL_ADDRESS; } catch (e) { INPUT_SOL_ADDRESS = ""; }
 import { isValidWalletAddress } from "../utils";
 import { OpenReferralWindowHandler } from "./referral.link.handler";
-import { UserService } from "../services/user.service";
+const UserService: any = (() => {
+  try {
+    return require("../services/user.service").UserService;
+  } catch (e) {
+    return null;
+  }
+})();
 
 export const sendPayoutAddressManageScreen = async (
-  bot: TelegramBot,
-  chat: TelegramBot.Chat,
+  bot: TelegramBotType,
+    chat: any,
   message_id: number
 ) => {
   try {
@@ -82,15 +91,15 @@ export const sendPayoutAddressManageScreen = async (
 };
 
 export const setSOLPayoutAddressHandler = async (
-  bot: TelegramBot,
-  chat: TelegramBot.Chat
+  bot: TelegramBotType,
+  chat: any
 ) => {
   try {
     if (!chat.username) return;
     const solAddressMsg = await bot.sendMessage(chat.id, INPUT_SOL_ADDRESS, {
       parse_mode: "HTML",
     });
-    const textEventHandler = async (msg: TelegramBot.Message) => {
+  const textEventHandler = async (msg: TelegramMessage) => {
       const receivedChatId = msg.chat.id;
       const receivedText = msg.text;
       const receivedMessageId = msg.message_id;

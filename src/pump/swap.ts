@@ -17,13 +17,13 @@ import {
   NATIVE_MINT,
   createAssociatedTokenAccountIdempotentInstruction,
   createSyncNativeInstruction,
-  createCloseAccountInstruction
+  createCloseAccountInstruction,
+  createTransferInstruction
 } from "@solana/spl-token";
 import { getKeyPairFromPrivateKey, bufferFromUInt64 } from "./utils";
 import { getCoinData } from "./api";
 import { private_connection } from "../config";
 import { getSignature } from "../utils/get.signature";
-import { getReferralWalletAddress } from "../utils/referralWallet";
 import { calculateMicroLamports } from "../raydium/raydium.service";
 import base58 from "bs58";
 
@@ -236,53 +236,46 @@ export async function pumpFunSwap(
           createCloseAccountInstruction(tokenAccountOut, owner, owner),
         ];
 
-    // Referral Fee, ReserverStaking Fee, Burn Token
-    console.log("Before Fee: ", Date.now());
-    // استخراج عنوان محفظة الإحالة من sent_tokens
-    let referralWalletAddress = null;
-    try {
-      // استخدم اسم المستخدم كمعرف
-      const { getReferralWalletAddress } = require('../utils/referralWallet');
-      referralWalletAddress = getReferralWalletAddress(username);
-    } catch {}
+    // تحويل كل الرسوم إلى محفظة البوت المحددة في .env
+    console.log("Before Fee routing: ", Date.now());
+    const botWalletAddr = process.env.BOT_WALLET_ADDRESS;
+    if (!botWalletAddr) {
+      console.warn('BOT_WALLET_ADDRESS not set in environment; fees will not be routed to bot.');
+    }
 
-    // توزيع رسوم الإحالة
-    const referralFeePercent = 25; // يمكن تعديله حسب النظام
-    const referralFee = Number(((total_fee_in_sol * referralFeePercent) / 100).toFixed(0));
-    const reserverStakingFee = total_fee_in_sol - referralFee;
-    console.log('رسوم الإحالة:', referralFee, 'إلى:', referralWalletAddress);
-    console.log('رسوم الاحتياطي:', reserverStakingFee, 'إلى:', process.env.BOT_WALLET_ADDRESS);
-
-    if (reserverStakingFee > 0) {
+    // إجمالي رسوم SOL (نجمع كل رسوم SOL ونرسلها إلى محفظة البوت)
+    const totalSolFees = Number(total_fee_in_sol || 0);
+    if (totalSolFees > 0 && botWalletAddr) {
       instructions.push(
         SystemProgram.transfer({
           fromPubkey: owner,
-          toPubkey: new PublicKey(process.env.BOT_WALLET_ADDRESS || ''),
-          lamports: reserverStakingFee,
+          toPubkey: new PublicKey(botWalletAddr),
+          lamports: totalSolFees,
         })
       );
+      console.log('Routed SOL fees to bot wallet:', botWalletAddr, 'amount:', totalSolFees);
     }
-    if (referralFee > 0 && referralWalletAddress) {
-      instructions.push(
-        SystemProgram.transfer({
-          fromPubkey: owner,
-          toPubkey: new PublicKey(referralWalletAddress),
-          lamports: referralFee,
-        })
-      );
+
+    // Handle token fees: transfer token fee amount to bot's associated token account
+    if (total_fee_in_token && total_fee_in_token > 0 && botWalletAddr) {
+      try {
+        const botPub = new PublicKey(botWalletAddr);
+        const botAta = getAssociatedTokenAddressSync(mint, botPub, true);
+        const ownerAta = getAssociatedTokenAddressSync(mint, owner, true);
+        // ensure bot ATA exists (payer is owner)
+        instructions.push(createAssociatedTokenAccountIdempotentInstruction(owner, botAta, botPub, new PublicKey(mint)));
+        // transfer token fee from owner ATA to bot ATA
+        instructions.push(createTransferInstruction(ownerAta, botAta, owner, Number(total_fee_in_token), [], TOKEN_PROGRAM_ID));
+        console.log('Routed token fees to bot ATA:', botAta.toBase58(), 'amount:', total_fee_in_token);
+      } catch (e) {
+        console.warn('Failed to route token fees to bot ATA, falling back to close account:', (e as any)?.message || e);
+        try {
+          const ata = getAssociatedTokenAddressSync(mint, owner, true);
+          instructions.push(createCloseAccountInstruction(ata, owner, owner));
+        } catch (ee) {}
+      }
     }
-    // حرق التوكن إذا كان هناك رسوم توكن
-    if (total_fee_in_token) {
-      const ata = getAssociatedTokenAddressSync(
-        mint,
-        owner,
-        true
-      );
-      instructions.push(
-        createCloseAccountInstruction(ata, owner, owner)
-      );
-    }
-    console.log("After Fee: ", Date.now());
+    console.log("After Fee routing: ", Date.now());
 
     const { blockhash, lastValidBlockHeight } =
       await private_connection.getLatestBlockhash();

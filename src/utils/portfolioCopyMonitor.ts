@@ -20,12 +20,18 @@ const lastExecutedTx: { [wallet: string]: string } = {};
 
 import fetch from 'node-fetch';
 
+// Use runtime requires for optional modules to avoid type errors
+let autoBuy: any; let sellWithOrca: any; let bot: any;
+try { autoBuy = require('../utils/autoBuy').autoBuy; } catch (e) { autoBuy = null; }
+try { sellWithOrca = require('../sell').sellWithOrca; } catch (e) { sellWithOrca = null; }
+try { bot = require('../telegramBot').bot; } catch (e) { bot = null; }
+
 // Helper: Fetch recent trades for a wallet from Birdeye API
 async function fetchRecentTrades(wallet: string): Promise<Array<{token: string; amount: number; type: 'buy'|'sell'; tx: string;}>> {
   try {
     const res = await fetch(`https://public-api.birdeye.so/public/wallet/txs?address=${wallet}&limit=5`);
-    const data = await res.json();
-    if (!Array.isArray(data?.data)) return [];
+  const data = await res.json() as any;
+  if (!Array.isArray(data?.data)) return [];
     // Convert Birdeye transactions to unified model
     return data.data
       .filter((tx: any) => tx.type === 'buy' || tx.type === 'sell')
@@ -41,28 +47,26 @@ async function fetchRecentTrades(wallet: string): Promise<Array<{token: string; 
 }
 
 // Helper: Execute a copy trade for a user
-import { autoBuy } from './autoBuy';
-import { sellWithOrca } from '../sell';
-import { bot } from '../telegramBot';
-
 async function executeCopyTrade(user: TrackerUser, trade: {token: string; amount: number; type: 'buy'|'sell'; tx: string;}): Promise<string> {
   try {
     if (trade.type === 'buy') {
-      // Execute buy via autoBuy
+      if (!autoBuy) throw new Error('autoBuy not available');
       return await autoBuy(trade.token, trade.amount, user.secret);
     } else {
-      // Execute sell via sellWithOrca
+      if (!sellWithOrca) throw new Error('sellWithOrca not available');
       const tx = await sellWithOrca(trade.token, trade.amount);
       return typeof tx === 'string' ? tx : 'done';
     }
   } catch (e: any) {
-    return 'error: ' + (e?.message || 'Unknown');
+    return 'error: ' + ((e as any)?.message || 'Unknown');
   }
 }
 
 // Helper: Notify user via Telegram bot
 function notifyUser(userId: string, message: string) {
-  bot.telegram.sendMessage(userId, message);
+  if (bot && bot.telegram && typeof bot.telegram.sendMessage === 'function') {
+    bot.telegram.sendMessage(userId, message);
+  }
 }
 
 // Main monitoring logic

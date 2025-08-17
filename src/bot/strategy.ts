@@ -38,6 +38,8 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
     strategy?: any;
     note?: string;
     error?: string;
+  fee?: number | null;
+  slippage?: number | null;
     summary?: string;
   };
 
@@ -49,6 +51,7 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
   const entryPrice = token.price || token.entryPrice || null;
   const amount = user.strategy.buyAmount || 0.01;
   const tx = buyResult?.tx;
+  const { fee: buyFee, slippage: buySlippage } = extractTradeMeta(buyResult, 'buy');
   // سجل صفقة الشراء
   const buyTrade: TradeEntry = {
     id: genId(),
@@ -60,7 +63,9 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
     time: Date.now(),
     status: tx ? 'success' : 'fail',
     strategy: { ...user.strategy },
-    summary: `Buy ${token.address} | ${amount} SOL | ${tx ? 'Tx: ' + tx : 'No Tx'}`,
+  summary: `Buy ${token.address} | ${amount} SOL | ${tx ? 'Tx: ' + tx : 'No Tx'}`,
+  fee: buyFee,
+  slippage: buySlippage,
   };
   userTrades.push(buyTrade);
 
@@ -172,17 +177,7 @@ export async function monitorAndAutoSellTrades(user: any, tokens: any[], priceFi
   }
 }
 // دالة مساعدة لاستخراج الرسوم والانزلاق من نتيجة unifiedBuy/unifiedSell
-function extractTradeMeta(result: any, mode: 'buy' | 'sell') {
-  let fee = null, slippage = null;
-  if (mode === 'buy' && result) {
-    fee = result.fee ?? result.feeAmount ?? null;
-    slippage = result.slippage ?? null;
-  } else if (mode === 'sell' && result) {
-    fee = result.fee ?? result.feeAmount ?? null;
-    slippage = result.slippage ?? null;
-  }
-  return { fee, slippage };
-}
+import { extractTradeMeta } from '../utils/tradeMeta';
 import fs from 'fs';
 import path from 'path';
 import { unifiedBuy, unifiedSell } from '../tradeSources';

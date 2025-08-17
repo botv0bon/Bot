@@ -7,6 +7,8 @@ import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
 import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokens, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
+import { normalizeStrategy } from './src/utils/strategyNormalizer';
+import { startFastTokenFetcher } from './src/fastTokenFetcher';
 import { generateKeypair, exportSecretKey, parseKey } from './src/wallet';
 
 console.log('--- Bot starting: Imports loaded ---');
@@ -401,7 +403,7 @@ bot.on('text', async (ctx, next) => {
               await ctx.reply(`📝 ${tradeFields[state.step].label}`);
             } else {
               if (!users[userId]) users[userId] = {};
-              users[userId].strategy = { ...state.values, ...state.tradeSettings, enabled: true };
+              users[userId].strategy = normalizeStrategy({ ...state.values, ...state.tradeSettings, enabled: true });
               saveUsers(users);
               delete userStrategyStates[userId];
               await ctx.reply('✅ Strategy and trade settings saved successfully! You can now press "📊 Show Tokens" to see matching tokens and trades.');
@@ -569,6 +571,14 @@ console.log('--- About to launch bot ---');
   try {
     await bot.launch();
     console.log('✅ Bot launched successfully (polling)');
+    try {
+      // Start fast token fetcher to prioritize some users (1s polling)
+      const fast = startFastTokenFetcher(users, bot.telegram, { intervalMs: 1000 });
+      // Optionally keep a reference: globalThis.__fastFetcher = fast;
+      // Caller may call fast.stop() to stop it.
+    } catch (e) {
+      console.warn('Failed to start fast token fetcher:', e);
+    }
   } catch (err: any) {
     if (err?.response?.error_code === 409) {
       console.error('❌ Bot launch failed: Conflict 409. Make sure the bot is not running elsewhere or stop all other sessions.');

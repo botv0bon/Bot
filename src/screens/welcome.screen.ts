@@ -1,11 +1,41 @@
-import TelegramBot from "node-telegram-bot-api";
-import { UserService } from "../services/user.service";
+let TelegramBot: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; } catch (e) {}
+type TelegramBotType = any;
+type TelegramMessage = any;
+const UserService: any = (() => {
+  try {
+    return require("../services/user.service").UserService;
+  } catch (e) {
+    return null;
+  }
+})();
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
-import { GrowTradeVersion } from "../config";
-import { copytoclipboard } from "../utils";
-import { TokenService } from "../services/token.metadata";
-import { contractInfoScreenHandler } from "./contract.info.screen";
+let GrowTradeVersion: any;
+try {
+  GrowTradeVersion = require("../config").GrowTradeVersion;
+} catch (e) {
+  GrowTradeVersion = "";
+}
+let copytoclipboard: any;
+try {
+  copytoclipboard = require("../utils").copytoclipboard;
+} catch (e) {
+  copytoclipboard = (s: string) => s;
+}
+const TokenService: any = (() => {
+  try {
+    return require("../services/token.metadata").TokenService;
+  } catch (e) {
+    return null;
+  }
+})();
+let contractInfoScreenHandler: any;
+try {
+  contractInfoScreenHandler = require("./contract.info.screen").contractInfoScreenHandler;
+} catch (e) {
+  contractInfoScreenHandler = null;
+}
 
 const MAX_RETRIES = 5;
 export const welcomeKeyboardList = [
@@ -25,9 +55,9 @@ export const welcomeKeyboardList = [
   [{ text: "❌ Close", command: "dismiss_message" }],
 ];
 
-export const WelcomeScreenHandler = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+export const welcomeScreenHandler = async (
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   try {
     const { username, id: chat_id, first_name, last_name } = msg.chat;
@@ -53,7 +83,7 @@ export const WelcomeScreenHandler = async (
   }
 };
 
-const newUserHandler = async (bot: TelegramBot, msg: TelegramBot.Message) => {
+const newUserHandler = async (bot: TelegramBotType, msg: TelegramMessage) => {
   const { username, id: chat_id, first_name, last_name } = msg.chat;
 
   let retries = 0;

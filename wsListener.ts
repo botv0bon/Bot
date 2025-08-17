@@ -22,18 +22,21 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
       });
 
       // Import required functions
-      const { buildTokenMessage } = await import('./src/utils/tokenUtils');
-      const { filterTokensByStrategy } = await import('./src/bot/strategy');
+  const { buildTokenMessage } = await import('./src/utils/tokenUtils');
+  const { filterTokensByStrategy } = await import('./src/bot/strategy');
+  const { normalizeStrategy } = await import('./src/utils/strategyNormalizer');
+      const { extractTradeMeta } = await import('./src/utils/tradeMeta');
 
-      // Import hash and sent-tokens helpers from telegramBot.ts
-      const { hashTokenAddress, readSentHashes, appendSentHash } = await import('./telegramBot');
+      // Import hash and sent-tokens helpers from fastTokenFetcher
+      const { hashTokenAddress, readSentHashes, appendSentHash } = await import('./src/fastTokenFetcher');
 
       for (const userId of Object.keys(users)) {
         const user = users[userId];
         // Robustly check user, wallet, and strategy
         if (!user || !user.wallet || !user.secret || !user.strategy || !user.strategy.enabled) continue;
-        // Filter tokens for each user based on their actual strategy
-        let userTokens = filterTokensByStrategy(filteredTokens, user.strategy);
+  // Normalize user's strategy then filter tokens for that user
+  const normStrategy = normalizeStrategy(user.strategy);
+  let userTokens = filterTokensByStrategy(filteredTokens, normStrategy);
         // Exclude tokens already sent to this user
         const sentHashes = await readSentHashes(userId);
         userTokens = userTokens.filter(token => {
@@ -52,13 +55,27 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
           // --- AUTO-BUY/SELL/STOP-LOSS LOGIC ---
           try {
             const buyAmount = Number(user.strategy.buyAmount);
-            if (!isNaN(buyAmount) && buyAmount > 0 && user.strategy.autoBuy !== false) {
+              if (!isNaN(buyAmount) && buyAmount > 0 && user.strategy.autoBuy !== false) {
               // Only buy if not already bought (not in sentHashes)
-              const result = await unifiedBuy(addr, buyAmount, user.secret);
+                // Final hard-check against normalized strategy before autoBuy
+                const finalStrategy = normalizeStrategy(user.strategy);
+                const finalOk = filterTokensByStrategy([token], finalStrategy);
+                if (!finalOk || finalOk.length === 0) {
+                  // skip buy - token does not meet user's strategy anymore
+                  continue;
+                }
+                const result = await unifiedBuy(addr, buyAmount, user.secret);
+                const { fee, slippage } = extractTradeMeta(result, 'buy');
+                const resSource = (result as any)?.source ?? 'unknown';
+                const resTx = (result as any)?.tx ?? '';
               if (!user.history) user.history = [];
-              user.history.push(`AutoBuy: ${addr} | Amount: ${buyAmount} SOL | Source: ${result.source} | Tx: ${result.tx}`);
+              user.history.push(`AutoBuy: ${addr} | Amount: ${buyAmount} SOL | Source: ${resSource} | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
               saveUsers(users);
-              await bot.telegram.sendMessage(userId, `✅ <b>AutoBuy Executed</b>\nToken: <code>${addr}</code>\nAmount: <b>${buyAmount}</b> SOL\nSource: <b>${result.source}</b>\n<a href='https://solscan.io/tx/${result.tx}'>View Tx</a>`, { parse_mode: 'HTML', disable_web_page_preview: false });
+              let buyMsg = `✅ <b>AutoBuy Executed</b>\nToken: <code>${addr}</code>\nAmount: <b>${buyAmount}</b> SOL\nSource: <b>${resSource}</b>`;
+              if (resTx) buyMsg += `\n<a href='https://solscan.io/tx/${resTx}'>View Tx</a>`;
+              if (fee != null) buyMsg += `\nFee: <b>${fee}</b>`;
+              if (slippage != null) buyMsg += `\nSlippage: <b>${slippage}</b>`;
+              await bot.telegram.sendMessage(userId, buyMsg, { parse_mode: 'HTML', disable_web_page_preview: false });
 
               // --- AUTO-SELL/STOP-LOSS LOGIC ---
               const buyPrice = Number(token.priceUsd || token.price || 0);
@@ -79,11 +96,18 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                 const changePercent = ((currentPrice - buyPrice) / buyPrice) * 100;
                 // Check profit target
                 if (profitTargetPercent && changePercent >= profitTargetPercent) {
-                  try {
+                    try {
                     const sellResult = await unifiedSell(addr, buyAmount, user.secret);
-                    user.history.push(`AutoSell: ${addr} | Amount: ${buyAmount} SOL | Source: ${sellResult.source} | Tx: ${sellResult.tx}`);
+                    const { fee: sellFee, slippage: sellSlippage } = extractTradeMeta(sellResult, 'sell');
+                    const sellSource = (sellResult as any)?.source ?? 'unknown';
+                    const sellTx = (sellResult as any)?.tx ?? '';
+                    user.history.push(`AutoSell: ${addr} | Amount: ${buyAmount} SOL | Source: ${sellSource} | Tx: ${sellTx} | Fee: ${sellFee ?? 'N/A'} | Slippage: ${sellSlippage ?? 'N/A'}`);
                     saveUsers(users);
-                    await bot.telegram.sendMessage(userId, `💰 <b>AutoSell (Profit Target) Executed</b>\nToken: <code>${addr}</code>\nProfit: <b>${changePercent.toFixed(2)}%</b>\n<a href='https://solscan.io/tx/${sellResult.tx}'>View Tx</a>`, { parse_mode: 'HTML', disable_web_page_preview: false });
+                    let sellMsg = `💰 <b>AutoSell (Profit Target) Executed</b>\nToken: <code>${addr}</code>\nProfit: <b>${changePercent.toFixed(2)}%</b>`;
+                    if (sellTx) sellMsg += `\n<a href='https://solscan.io/tx/${sellTx}'>View Tx</a>`;
+                    if (sellFee != null) sellMsg += `\nFee: <b>${sellFee}</b>`;
+                    if (sellSlippage != null) sellMsg += `\nSlippage: <b>${sellSlippage}</b>`;
+                    await bot.telegram.sendMessage(userId, sellMsg, { parse_mode: 'HTML', disable_web_page_preview: false });
                     sold = true;
                     break;
                   } catch (err) {
@@ -92,11 +116,18 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
                 }
                 // Check stop loss
                 if (stopLossPercent && changePercent <= -Math.abs(stopLossPercent)) {
-                  try {
+                    try {
                     const sellResult = await unifiedSell(addr, buyAmount, user.secret);
-                    user.history.push(`AutoSell (StopLoss): ${addr} | Amount: ${buyAmount} SOL | Source: ${sellResult.source} | Tx: ${sellResult.tx}`);
+                    const { fee: sellFee, slippage: sellSlippage } = extractTradeMeta(sellResult, 'sell');
+                    const sellSource = (sellResult as any)?.source ?? 'unknown';
+                    const sellTx = (sellResult as any)?.tx ?? '';
+                    user.history.push(`AutoSell (StopLoss): ${addr} | Amount: ${buyAmount} SOL | Source: ${sellSource} | Tx: ${sellTx} | Fee: ${sellFee ?? 'N/A'} | Slippage: ${sellSlippage ?? 'N/A'}`);
                     saveUsers(users);
-                    await bot.telegram.sendMessage(userId, `🛑 <b>AutoSell (Stop Loss) Executed</b>\nToken: <code>${addr}</code>\nLoss: <b>${changePercent.toFixed(2)}%</b>\n<a href='https://solscan.io/tx/${sellResult.tx}'>View Tx</a>`, { parse_mode: 'HTML', disable_web_page_preview: false });
+                    let sellMsg = `🛑 <b>AutoSell (Stop Loss) Executed</b>\nToken: <code>${addr}</code>\nLoss: <b>${changePercent.toFixed(2)}%</b>`;
+                    if (sellTx) sellMsg += `\n<a href='https://solscan.io/tx/${sellTx}'>View Tx</a>`;
+                    if (sellFee != null) sellMsg += `\nFee: <b>${sellFee}</b>`;
+                    if (sellSlippage != null) sellMsg += `\nSlippage: <b>${sellSlippage}</b>`;
+                    await bot.telegram.sendMessage(userId, sellMsg, { parse_mode: 'HTML', disable_web_page_preview: false });
                     sold = true;
                     break;
                   } catch (err) {

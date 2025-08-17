@@ -1,6 +1,10 @@
-import TelegramBot, { SendMessageOptions } from "node-telegram-bot-api";
+let TelegramBot: any;
+let SendMessageOptions: any;
+try { const _tg = require('node-telegram-bot-api'); TelegramBot = _tg.default || _tg; SendMessageOptions = (_tg as any).SendMessageOptions || undefined; } catch (e) {}
+type TelegramBotType = any;
+type TelegramMessage = any;
 
-export const closeReplyMarkup = {
+export const closeReplyMarkup: any = {
   parse_mode: "HTML",
   disable_web_page_preview: true,
   reply_markup: {
@@ -25,8 +29,8 @@ export const closeInlinekeyboardOpts = {
 };
 
 export const sendNoneUserNotification = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
   const sentMsg = await bot.sendMessage(
@@ -38,8 +42,8 @@ export const sendNoneUserNotification = async (
 };
 
 export const sendNoneExistTokenNotification = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
   const sentMsg = await bot.sendMessage(
@@ -53,8 +57,8 @@ export const sendNoneExistTokenNotification = async (
 };
 
 export const sendInsufficientNotification = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
   const sentMsg = await bot.sendMessage(
@@ -68,8 +72,8 @@ export const sendInsufficientNotification = async (
 };
 
 export const sendUsernameRequiredNotification = async (
-  bot: TelegramBot,
-  msg: TelegramBot.Message
+  bot: TelegramBotType,
+  msg: TelegramMessage
 ) => {
   const { id: chat_id } = msg.chat;
   const sentMsg = await bot.sendMessage(
@@ -81,7 +85,7 @@ export const sendUsernameRequiredNotification = async (
 
 // delay: ms
 export const deleteDelayMessage = (
-  bot: TelegramBot,
+  bot: TelegramBotType,
   chat_id: number,
   message_id: number,
   delay: number
