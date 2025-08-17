@@ -11,9 +11,15 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
       return;
     }
     // تحقق من وجود شراء سابق غير مباع
-    if (hasPendingBuy(userId, tokenAddress)) {
-      await ctx.reply('⚠️ لا يمكنك شراء نفس العملة مرتين قبل بيعها.');
-      return;
+    try {
+      const pending = await hasPendingBuy(userId, tokenAddress);
+      if (pending) {
+        await ctx.reply('⚠️ لا يمكنك شراء نفس العملة مرتين قبل بيعها.');
+        return;
+      }
+    } catch (e) {
+      // if check fails, log and proceed conservatively
+      console.error('[buy handler] hasPendingBuy failed:', e);
     }
     await ctx.reply('⏳ جاري تنفيذ عملية الشراء، يرجى الانتظار...', { parse_mode: 'HTML' });
     try {

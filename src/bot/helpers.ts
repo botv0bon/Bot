@@ -1,24 +1,40 @@
 import path from 'path';
+import fs from 'fs';
+const fsp = fs.promises;
+
+// Simple per-file write queue to serialize writes and avoid races
+const writeQueues: Record<string, Promise<void>> = {};
+
+export function writeJsonFile(filePath: string, obj: any) {
+  const data = JSON.stringify(obj, null, 2);
+  writeQueues[filePath] = (writeQueues[filePath] || Promise.resolve()).then(() => {
+    return fsp.writeFile(filePath, data, 'utf8');
+  }).catch((err) => {
+    console.error('Error writing file', filePath, err);
+  });
+  return writeQueues[filePath];
+}
 /**
  * تحقق هل المستخدم اشترى العملة مسبقًا ولم يبعها بعد
  */
-export function hasPendingBuy(userId: string, tokenAddress: string): boolean {
+export async function hasPendingBuy(userId: string, tokenAddress: string): Promise<boolean> {
   if (!userId || userId === 'undefined') {
     console.warn('[hasPendingBuy] Invalid userId, skipping check.');
     return false;
   }
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
-  if (!fs.existsSync(userFile)) return false;
   try {
-    const userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8'));
+    const stat = await fsp.stat(userFile).catch(() => false);
+    if (!stat) return false;
+    const data = await fsp.readFile(userFile, 'utf8');
+    const userTrades = JSON.parse(data || '[]');
     return userTrades.some((t: any) => t.mode === 'buy' && t.token === tokenAddress && t.status === 'success' &&
       !userTrades.some((s: any) => s.mode === 'sell' && s.token === tokenAddress && s.status === 'success'));
   } catch {
     return false;
   }
 }
-import fs from 'fs';
 import { Markup } from 'telegraf';
 
 export function getErrorMessage(e: any): string {
@@ -45,18 +61,31 @@ export function walletKeyboard() {
   ]);
 }
 
-export function loadUsers(): Record<string, any> {
+export async function loadUsers(): Promise<Record<string, any>> {
+  try {
+    const stat = await fsp.stat('users.json').catch(() => false);
+    if (stat) {
+      const data = await fsp.readFile('users.json', 'utf8');
+      return JSON.parse(data || '{}');
+    }
+  } catch (e) { console.error('Error loading users.json:', e); }
+  return {};
+}
+
+// backward-compatible synchronous loader (for scripts that call it sync)
+export function loadUsersSync(): Record<string, any> {
   try {
     if (fs.existsSync('users.json')) {
       return JSON.parse(fs.readFileSync('users.json', 'utf8'));
     }
-  } catch {}
+  } catch (e) { console.error('Error loading users.json (sync):', e); }
   return {};
 }
 
 export function saveUsers(users: Record<string, any>) {
   try {
-    fs.writeFileSync('users.json', JSON.stringify(users, null, 2), 'utf8');
+    // enqueue async write, do not block caller
+    writeJsonFile('users.json', users).catch((e) => console.error('saveUsers error:', e));
   } catch (e) {
     console.error('Error saving users.json:', e);
   }

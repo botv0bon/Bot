@@ -1,7 +1,14 @@
 /**
  * عند تسجيل صفقة شراء، احفظ سعر الدخول والهدف وأضف أمر بيع pending
  */
-export function registerBuyWithTarget(user: any, token: any, buyResult: any, targetPercent = 10) {
+import { writeJsonFile } from './helpers';
+import { extractTradeMeta } from '../utils/tradeMeta';
+import { unifiedBuy, unifiedSell } from '../tradeSources';
+import fs from 'fs';
+const fsp = fs.promises;
+import path from 'path';
+
+export async function registerBuyWithTarget(user: any, token: any, buyResult: any, targetPercent = 10) {
   // تأكد من وجود معرف المستخدم داخل الكائن
   const userId = user.id || user.userId || user.telegramId;
   if (!user.id && userId) user.id = userId;
@@ -16,9 +23,13 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   let userTrades: any[] = [];
-  if (fs.existsSync(userFile)) {
-    try { userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8')); } catch {}
-  }
+  try {
+    const stat = await fsp.stat(userFile).catch(() => false);
+    if (stat) {
+      const data = await fsp.readFile(userFile, 'utf8');
+      userTrades = JSON.parse(data || '[]');
+    }
+  } catch {}
   // تعريف نوع موحد للتداول
   type TradeEntry = {
     id: string;
@@ -130,7 +141,8 @@ export function registerBuyWithTarget(user: any, token: any, buyResult: any, tar
       });
     }
   }
-  fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  // persist trades using queued async writer
+  try { await writeJsonFile(userFile, userTrades); } catch {}
 }
 /**
  * مراقبة صفقات الشراء للمستخدم وتنفيذ البيع تلقائياً عند تحقق الشروط
@@ -142,9 +154,12 @@ export async function monitorAndAutoSellTrades(user: any, tokens: any[], priceFi
   const userId = user.id || user.userId || user.telegramId;
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
-  if (!fs.existsSync(userFile)) return;
+  try {
+    const stat = await fsp.stat(userFile).catch(() => false);
+    if (!stat) return;
+  } catch { return; }
   let userTrades: any[] = [];
-  try { userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8')); } catch {}
+  try { const data = await fsp.readFile(userFile, 'utf8'); userTrades = JSON.parse(data || '[]'); } catch {}
   // إيجاد أوامر البيع pending المرتبطة بصفقات شراء ناجحة
   const pendingSells = userTrades.filter(t => t.mode === 'sell' && t.status === 'pending' && t.linkedBuyTx);
   for (const sell of pendingSells) {
@@ -158,29 +173,25 @@ export async function monitorAndAutoSellTrades(user: any, tokens: any[], priceFi
     if (sell.stopLossPrice && currentPrice <= sell.stopLossPrice) shouldSell = true;
     if (shouldSell) {
       try {
-        const result = await unifiedSell(token.address, sell.amount, user.secret /*, { slippage: user.strategy.slippage }*/);
+  const result = await unifiedSell(token.address, sell.amount, user.secret /*, { slippage: user.strategy.slippage }*/);
         const { fee, slippage } = extractTradeMeta(result, 'sell');
         // حدث حالة الأمر من pending إلى success
         sell.status = result?.tx ? 'success' : 'fail';
         sell.tx = result?.tx;
         sell.fee = fee;
         sell.slippage = slippage;
-        sell.executedTime = Date.now();
-        fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+    sell.executedTime = Date.now();
+  try { await writeJsonFile(userFile, userTrades); } catch {}
       } catch (e) {
         sell.status = 'fail';
         sell.error = (e instanceof Error ? e.message : String(e));
         sell.executedTime = Date.now();
-        fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  try { await writeJsonFile(userFile, userTrades); } catch {}
       }
     }
   }
 }
-// دالة مساعدة لاستخراج الرسوم والانزلاق من نتيجة unifiedBuy/unifiedSell
-import { extractTradeMeta } from '../utils/tradeMeta';
-import fs from 'fs';
-import path from 'path';
-import { unifiedBuy, unifiedSell } from '../tradeSources';
+// (imports consolidated at top)
 /**
  * تنفيذ صفقات متعددة (شراء أو بيع) للمستخدم على قائمة عملات
  * @param user بيانات المستخدم
@@ -193,11 +204,9 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
   const userId = user.id || user.userId || user.telegramId;
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
-  if (!fs.existsSync(sentTokensDir)) fs.mkdirSync(sentTokensDir);
+  try { await fsp.mkdir(sentTokensDir, { recursive: true }); } catch {}
   let userTrades: any[] = [];
-  if (fs.existsSync(userFile)) {
-    try { userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8')); } catch {}
-  }
+  try { const stat = await fsp.stat(userFile).catch(() => false); if (stat) { const data = await fsp.readFile(userFile, 'utf8'); userTrades = JSON.parse(data || '[]'); } } catch {}
   for (const token of tokens) {
     try {
       let result, amount, tx = null;
@@ -223,7 +232,7 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
         time: Date.now(),
         status: tx ? 'success' : 'fail',
       });
-      fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  try { await writeJsonFile(userFile, userTrades); } catch {}
     } catch (e) {
       userTrades.push({
         mode,
@@ -232,7 +241,7 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
         time: Date.now(),
         status: 'fail',
       });
-      fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  try { await writeJsonFile(userFile, userTrades); } catch {}
     }
     if (delayMs > 0) await new Promise(res => setTimeout(res, delayMs));
   }
@@ -248,59 +257,96 @@ export function filterTokensByStrategy(tokens: any[], strategy: Strategy): any[]
   // Use getField from tokenUtils for robust field extraction
   const { getField } = require('../utils/tokenUtils');
   const filtered = tokens.filter(token => {
-    // Price in USD
-    const price = Number(getField(token, 'priceUsd', 'price', 'priceNative', 'baseToken.priceUsd', 'baseToken.price'));
-    if (strategy.minPrice !== undefined && price < strategy.minPrice) return false;
-    if (strategy.maxPrice !== undefined && price > strategy.maxPrice) return false;
+  const name = token.address || token.symbol || token.name || token.tokenAddress || 'n/a';
+  // Price in USD
+  let price = Number(getField(token, 'priceUsd', 'price', 'priceNative', 'baseToken.priceUsd', 'baseToken.price'));
+  if (isNaN(price)) price = 0;
+  if (strategy.minPrice !== undefined && price < strategy.minPrice) return false;
+  if (strategy.maxPrice !== undefined && price > strategy.maxPrice) return false;
 
     // Market Cap
     const marketCap = Number(getField(token, 'marketCap', 'fdv', 'baseToken.marketCap', 'baseToken.fdv'));
-    if (strategy.minMarketCap !== undefined && marketCap < strategy.minMarketCap) return false;
+    if (strategy.minMarketCap !== undefined && marketCap < strategy.minMarketCap) {
+      return false;
+    }
 
     // Liquidity
-    const liquidity = Number(getField(token, 'liquidity', 'liquidityUsd', 'baseToken.liquidity', 'baseToken.liquidityUsd'));
-    if (strategy.minLiquidity !== undefined && liquidity < strategy.minLiquidity) return false;
+  const liquidity = Number(getField(token, 'liquidity', 'liquidityUsd', 'baseToken.liquidity', 'baseToken.liquidityUsd'));
+  if (isNaN(liquidity)) { /* treat as 0 */ }
+  if (strategy.minLiquidity !== undefined && liquidity < strategy.minLiquidity) return false;
 
     // Volume
-    const volume = Number(getField(token, 'volume', 'volume24h', 'amount', 'totalAmount', 'baseToken.volume', 'baseToken.amount'));
-    if (strategy.minVolume !== undefined && volume < strategy.minVolume) return false;
+  let volume = Number(getField(token, 'volume', 'volume24h', 'amount', 'totalAmount', 'baseToken.volume', 'baseToken.amount'));
+  if (isNaN(volume)) volume = 0;
+  if (strategy.minVolume !== undefined && volume < strategy.minVolume) return false;
 
     // Holders
-    const holders = Number(getField(token, 'holders', 'totalAmount', 'baseToken.holders', 'baseToken.totalAmount'));
-    if (strategy.minHolders !== undefined && holders < strategy.minHolders) return false;
+  const holders = Number(getField(token, 'holders', 'totalAmount', 'baseToken.holders', 'baseToken.totalAmount'));
+  if (isNaN(holders)) { /* treat as 0 */ }
+  if (strategy.minHolders !== undefined && holders < strategy.minHolders) return false;
 
-  // Age in minutes (robust extraction)
-  let ageMinutes: number | undefined = undefined;
-    let ageVal = getField(token, 'ageMinutes', 'age', 'createdAt', 'poolOpenTime', 'genesis_date', 'baseToken.createdAt');
+    // Age in minutes (robust extraction)
+    let ageMinutes: number | undefined = undefined;
+    // Try a broad set of possible fields that different sources use
+    let ageVal = getField(token,
+      'ageMinutes', 'age', 'createdAt', 'created_at', 'creation_date', 'created',
+      'poolOpenTime', 'listed_at', 'listedAt', 'genesis_date', 'published_at',
+      'time', 'timestamp', 'first_trade_time', 'baseToken.createdAt', 'baseToken.published_at'
+    );
+    // Normalize common string formats
     if (typeof ageVal === 'string') {
-      if (!isNaN(Number(ageVal))) ageVal = Number(ageVal);
-      else if (/^\d{4}-\d{2}-\d{2}/.test(ageVal)) ageVal = Date.parse(ageVal);
+      const s = ageVal.trim();
+      // plain number string
+      if (/^\d+$/.test(s)) {
+        ageVal = Number(s);
+      } else if (/^\d+\.?\d*\s*(m|min|minute)s?$/i.test(s)) {
+        // e.g. "5m" or "5 min"
+        const n = Number(s.match(/\d+\.?\d*/)?.[0] || 0);
+        ageVal = n;
+      } else if (/^\d+\.?\d*\s*(h|hr|hour)s?$/i.test(s)) {
+        const n = Number(s.match(/\d+\.?\d*/)?.[0] || 0);
+        ageVal = n * 60;
+      } else if (/^\d{4}-\d{2}-\d{2}/.test(s) || /T/.test(s)) {
+        // ISO-ish datetime
+        const parsed = Date.parse(s);
+        if (!isNaN(parsed)) ageVal = parsed;
+      } else if (!isNaN(Number(s))) {
+        ageVal = Number(s);
+      }
     }
+    // Numeric handling
     if (typeof ageVal === 'number' && !isNaN(ageVal)) {
+      // heuristics: ms epoch (>1e12), s epoch (>1e9), minutes (small)
       if (ageVal > 1e12) { // ms timestamp
         ageMinutes = Math.floor((Date.now() - ageVal) / 60000);
       } else if (ageVal > 1e9) { // s timestamp
         ageMinutes = Math.floor((Date.now() - ageVal * 1000) / 60000);
-      } else if (ageVal < 1e7 && ageVal > 0) { // already in minutes
-        ageMinutes = ageVal;
+      } else if (ageVal > 0 && ageVal < 1e7) { // likely minutes
+        ageMinutes = Math.floor(ageVal);
       }
     }
+    // If we couldn't determine ageMinutes: fallback behavior
     if (typeof ageMinutes !== 'number' || isNaN(ageMinutes)) {
-      console.warn(`[filterTokensByStrategy] Token ${token.address || token.symbol || token.name} ignored: cannot determine age.`);
-      return false;
+      // permissive: if user requested minAge <= 1, accept tokens with unknown age
+      if (typeof strategy.minAge === 'number' && strategy.minAge <= 1) {
+        // accept by fallback
+      } else {
+        return false;
+      }
+    } else {
+      if (strategy.minAge !== undefined && ageMinutes < strategy.minAge) {
+        return false;
+      }
     }
-    if (strategy.minAge !== undefined && ageMinutes < strategy.minAge) return false;
 
-    // Verification
-    const verified = getField(token, 'verified', 'baseToken.verified') === true || getField(token, 'verified', 'baseToken.verified') === 'true';
-    if (strategy.onlyVerified === true && !verified) return false;
+  // Verification
+  const verified = getField(token, 'verified', 'baseToken.verified') === true || getField(token, 'verified', 'baseToken.verified') === 'true';
+  if (strategy.onlyVerified === true && !verified) return false;
 
-    // Strategy enabled
-    if (strategy.enabled === false) return false;
+  // Strategy enabled
+  if (strategy.enabled === false) return false;
 
-    // طباعة معلومات العملة المقبولة
-    console.log(`[filterTokensByStrategy] Accepted token: ${token.address || token.symbol || token.name}, ageMinutes=${ageMinutes}`);
-    return true;
+  return true;
   });
   return filtered;
 }

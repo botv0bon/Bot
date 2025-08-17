@@ -1,12 +1,15 @@
 // =================== Imports ===================
 import dotenv from 'dotenv';
+import fs from 'fs';
+const fsp = fs.promises;
 import { Telegraf, Markup } from 'telegraf';
-import { loadUsers, saveUsers, walletKeyboard, getErrorMessage, limitHistory, hasWallet } from './src/bot/helpers';
+import { loadUsers, loadUsersSync, saveUsers, walletKeyboard, getErrorMessage, limitHistory, hasWallet, writeJsonFile } from './src/bot/helpers';
 import { helpMessages } from './src/helpMessages';
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
 import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokens, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
+import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
 import { startFastTokenFetcher } from './src/fastTokenFetcher';
 import { generateKeypair, exportSecretKey, parseKey } from './src/wallet';
@@ -26,13 +29,18 @@ if (!TELEGRAM_TOKEN) {
 
 const bot = new Telegraf(TELEGRAM_TOKEN as string);
 console.log('--- Telegraf instance created ---');
-let users: Record<string, any> = loadUsers();
-console.log('--- Users loaded ---');
+let users: Record<string, any> = {};
+console.log('--- Users placeholder created ---');
 let globalTokenCache: any[] = [];
 let lastCacheUpdate = 0;
 const CACHE_TTL = 1000 * 60 * 2;
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
+
+// Strategy state machine for interactive setup (single declaration)
+const userStrategyStates: Record<string, { step: number, values: Record<string, any>, phase?: string, tradeSettings?: Record<string, any> }> = {};
+
+// buy/sell handlers will be registered after users are loaded in startup sequence
 
 bot.command('auto_execute', async (ctx) => {
   const userId = String(ctx.from?.id);
@@ -99,7 +107,8 @@ bot.action('show_secret', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (user && hasWallet(user)) {
-    await ctx.reply('🔑 Your private key:\n<code>' + user.secret + '</code>', { parse_mode: 'HTML' });
+    // For security, do not send the private key in chat. Prompt the user to restore or view locally.
+    await ctx.reply('🔒 For your safety the private key is not shown in chat. Use /restore_wallet to restore from your key or manage your wallet locally.');
   } else {
     await ctx.reply('❌ No wallet found for this user.');
   }
@@ -150,78 +159,7 @@ bot.command('notify_tokens', async (ctx) => {
 
 
 
-bot.action(/buy_(.+)/, async (ctx: any) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  const tokenAddress = ctx.match[1];
-  console.log(`[buy] User: ${userId}, Token: ${tokenAddress}`);
-  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
-    return;
-  }
-  try {
-    const amount = user.strategy.buyAmount || 0.01;
-    await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
-    const result = await unifiedBuy(tokenAddress, amount, user.secret);
-    if (result && result.tx) {
-      if (!boughtTokens[userId]) boughtTokens[userId] = new Set();
-      boughtTokens[userId].add(tokenAddress);
-      const entry = `ManualBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.tx}`;
-      user.history = user.history || [];
-      user.history.push(entry);
-      limitHistory(user);
-      saveUsers(users);
-      registerBuyWithTarget(user, { address: tokenAddress }, result, user.strategy.targetPercent || 10);
-      await ctx.reply(`Token bought successfully!\nAuto-sell order placed for profit target ${(user.strategy.targetPercent || 10)}%.\nCheck your orders with /pending_sells`);
-    } else {
-      await ctx.reply('Buy failed: Transaction was not completed.');
-    }
-  } catch (e) {
-    await ctx.reply('❌ Error during buy: ' + getErrorMessage(e));
-    console.error('buy error:', e);
-  }
-});
-
-
-
-async function getUserTokenBalance(user: any, tokenAddress: string): Promise<number> {
-  if (user && user.balances && typeof user.balances[tokenAddress] === 'number') {
-    return user.balances[tokenAddress];
-  }
-  return user.strategy.buyAmount || 0.01;
-}
-
-
-bot.action(/sell_(.+)/, async (ctx: any) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  const tokenAddress = ctx.match[1];
-  console.log(`[sell] User: ${userId}, Token: ${tokenAddress}`);
-  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
-    return;
-  }
-  try {
-    const sellPercent = user.strategy.sellPercent1 || 100;
-    const balance = await getUserTokenBalance(user, tokenAddress);
-    const amount = (balance * sellPercent) / 100;
-    await ctx.reply(`🔻 Selling token: <code>${tokenAddress}</code> with <b>${sellPercent}%</b> of your balance (${balance}) ...`, { parse_mode: 'HTML' });
-    const result = await unifiedSell(tokenAddress, amount, user.secret);
-    if (result?.tx) {
-      const entry = `ManualSell: ${tokenAddress} | Amount: ${amount} | Source: unifiedSell | Tx: ${result.tx}`;
-      user.history = user.history || [];
-      user.history.push(entry);
-      limitHistory(user);
-      saveUsers(users);
-      await ctx.reply('Token sold successfully!');
-    } else {
-      await ctx.reply('Sell failed: Transaction was not completed.');
-    }
-  } catch (e: any) {
-    await ctx.reply(`❌ Error during sell: ${getErrorMessage(e)}`);
-    console.error('sell error:', e);
-  }
-});
+// buy/sell handlers are centralized in src/bot/buySellHandlers.ts via registerBuySellHandlers
 
 
 bot.command('wallet', async (ctx) => {
@@ -229,7 +167,7 @@ bot.command('wallet', async (ctx) => {
   const userId = String(ctx.from?.id);
   const user = users[userId];
   if (user && hasWallet(user)) {
-    await ctx.reply('🔑 Your wallet private key:\n' + user.secret);
+  await ctx.reply('� You have a wallet configured. For security the private key is not displayed. Use the inline button "Show Private Key" if absolutely needed, or /restore_wallet to restore from your secret.');
   } else {
     await ctx.reply('❌ No wallet found for this user.', walletKeyboard());
   }
@@ -295,15 +233,26 @@ setInterval(async () => {
     await monitorAndAutoSellTrades(user, tokens);
     const sentTokensDir = process.cwd() + '/sent_tokens';
     const userFile = `${sentTokensDir}/${userId}.json`;
-    if (!require('fs').existsSync(userFile)) continue;
-    let userTrades = [];
-    try { userTrades = JSON.parse(require('fs').readFileSync(userFile, 'utf8')); } catch {}
+    try {
+      if (!(await fsp.stat(userFile).catch(() => false))) continue;
+    } catch {
+      continue;
+    }
+    let userTrades: any[] = [];
+    try {
+      const data = await fsp.readFile(userFile, 'utf8');
+      userTrades = JSON.parse(data || '[]');
+    } catch {}
     const executed = userTrades.filter((t: any) => t.mode === 'sell' && t.status === 'success' && t.auto && !t.notified);
     for (const sellOrder of executed) {
       await notifyAutoSell(user, sellOrder);
       (sellOrder as any).notified = true;
     }
-    require('fs').writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+    try {
+      await writeJsonFile(userFile, userTrades);
+    } catch (e) {
+      console.error('[monitorAndAutoSellTrades] Failed to write user trades for', userFile, e);
+    }
   }
 }, 5 * 60 * 1000);
 
@@ -340,6 +289,8 @@ bot.action('restore_wallet', async (ctx) => {
 bot.on('text', async (ctx, next) => {
   console.log(`[text] User: ${String(ctx.from?.id)}, Message: ${ctx.message.text}`);
   const userId = String(ctx.from?.id);
+
+  // 1) Wallet restore flow
   if (restoreStates[userId]) {
     const secret = ctx.message.text.trim();
     try {
@@ -351,96 +302,89 @@ bot.on('text', async (ctx, next) => {
       saveUsers(users);
       delete restoreStates[userId];
 
-      await ctx.reply(`✅ Wallet restored successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key (keep it safe): <code>${user.secret}</code>`, { parse_mode: 'HTML' });
-          } catch {
-            await ctx.reply('❌ Failed to restore wallet. Invalid key. Try again or create a new wallet.');
-          }
-          return;
-        }
-        if (typeof next === 'function') return next();
-      });
+      await ctx.reply(`✅ Wallet restored successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key stored securely.`, { parse_mode: 'HTML' });
+    } catch {
+      await ctx.reply('❌ Failed to restore wallet. Invalid key. Try again or create a new wallet.');
+    }
+    return;
+  }
 
-      const userStrategyStates: Record<string, { step: number, values: Record<string, any>, phase?: string, tradeSettings?: Record<string, any> }> = {};
+  // 2) Interactive strategy setup flow
+  if (userStrategyStates[userId]) {
+    const state = userStrategyStates[userId];
+    // Trade settings phase
+    if (state.phase === 'tradeSettings') {
+      const tradeFields = [
+        { key: 'buyAmount', label: 'Buy amount per trade (SOL)', type: 'number' },
+        { key: 'sellPercent1', label: 'Sell percent for first target (%)', type: 'number' },
+        { key: 'target1', label: 'Profit target 1 (%)', type: 'number' },
+        { key: 'sellPercent2', label: 'Sell percent for second target (%)', type: 'number' },
+        { key: 'target2', label: 'Profit target 2 (%)', type: 'number' },
+        { key: 'stopLoss', label: 'Stop loss (%)', type: 'number' },
+        { key: 'maxTrades', label: 'Max concurrent trades', type: 'number' }
+      ];
+      if (state.step >= tradeFields.length) {
+        delete userStrategyStates[userId];
+        return;
+      }
+      const current = tradeFields[state.step];
+      let value: any = ctx.message.text.trim();
+      const numValue = Number(value);
+      if (isNaN(numValue)) {
+        await ctx.reply('❗ Please enter a valid number.');
+        return;
+      }
+      value = numValue;
+      if (!state.tradeSettings) state.tradeSettings = {};
+      state.tradeSettings[current.key] = value;
+      state.step++;
+      if (state.step < tradeFields.length) {
+        await ctx.reply(`📝 ${tradeFields[state.step].label}`);
+      } else {
+        if (!users[userId]) users[userId] = {};
+        users[userId].strategy = normalizeStrategy({ ...state.values, ...state.tradeSettings, enabled: true });
+        saveUsers(users);
+        delete userStrategyStates[userId];
+        await ctx.reply('✅ Strategy and trade settings saved successfully! You can now press "📊 Show Tokens" to see matching tokens and trades.');
+      }
+      return;
+    }
 
-      bot.hears('⚙️ Strategy', async (ctx) => {
-        const userId = String(ctx.from?.id);
-        userStrategyStates[userId] = { step: 0, values: {} };
-        await ctx.reply('🚦 Strategy Setup:\nPlease enter the required value for each field. Send "skip" to skip any optional field.');
-        const field = STRATEGY_FIELDS[0];
-        await ctx.reply(`📝 ${field.label}${field.optional ? ' (optional)' : ''}`);
-      });
+    // Main strategy fields phase
+    if (state.step >= STRATEGY_FIELDS.length) {
+      delete userStrategyStates[userId];
+      return;
+    }
+    const field = STRATEGY_FIELDS[state.step];
+    let value: any = ctx.message.text.trim();
+    if (value === 'skip' && field.optional) {
+      value = undefined;
+    } else if (field.type === 'number') {
+      const numValue = Number(value);
+      if (isNaN(numValue)) {
+        await ctx.reply('❗ Please enter a valid number.');
+        return;
+      }
+      value = numValue;
+    }
+    state.values[field.key] = value;
+    state.step++;
+    if (state.step < STRATEGY_FIELDS.length) {
+      const nextField = STRATEGY_FIELDS[state.step];
+      await ctx.reply(`📝 ${nextField.label}${nextField.optional ? ' (optional)' : ''}`);
+    } else {
+      state.step = 0;
+      state.phase = 'tradeSettings';
+      state.tradeSettings = {};
+      await ctx.reply('⚙️ Trade settings:\nPlease enter the buy amount per trade (SOL):');
+    }
+    return;
+  }
 
-      bot.on('text', async (ctx, next) => {
-        const userId = String(ctx.from?.id);
-        if (userStrategyStates[userId]) {
-          const state = userStrategyStates[userId];
-          if (state.phase === 'tradeSettings') {
-            const tradeFields = [
-              { key: 'buyAmount', label: 'Buy amount per trade (SOL)', type: 'number' },
-              { key: 'sellPercent1', label: 'Sell percent for first target (%)', type: 'number' },
-              { key: 'target1', label: 'Profit target 1 (%)', type: 'number' },
-              { key: 'sellPercent2', label: 'Sell percent for second target (%)', type: 'number' },
-              { key: 'target2', label: 'Profit target 2 (%)', type: 'number' },
-              { key: 'stopLoss', label: 'Stop loss (%)', type: 'number' },
-              { key: 'maxTrades', label: 'Max concurrent trades', type: 'number' }
-            ];
-            if (state.step >= tradeFields.length) {
-              delete userStrategyStates[userId];
-              return;
-            }
-            const current = tradeFields[state.step];
-            let value: any = ctx.message.text.trim();
-            const numValue = Number(value);
-            if (isNaN(numValue)) {
-              await ctx.reply('❗ Please enter a valid number.');
-              return;
-            }
-            value = numValue;
-            if (!state.tradeSettings) state.tradeSettings = {};
-            state.tradeSettings[current.key] = value;
-            state.step++;
-            if (state.step < tradeFields.length) {
-              await ctx.reply(`📝 ${tradeFields[state.step].label}`);
-            } else {
-              if (!users[userId]) users[userId] = {};
-              users[userId].strategy = normalizeStrategy({ ...state.values, ...state.tradeSettings, enabled: true });
-              saveUsers(users);
-              delete userStrategyStates[userId];
-              await ctx.reply('✅ Strategy and trade settings saved successfully! You can now press "📊 Show Tokens" to see matching tokens and trades.');
-            }
-            return;
-          }
-          if (state.step >= STRATEGY_FIELDS.length) {
-            delete userStrategyStates[userId];
-            return;
-          }
-          const field = STRATEGY_FIELDS[state.step];
-          let value: any = ctx.message.text.trim();
-          if (value === 'skip' && field.optional) {
-            value = undefined;
-          } else if (field.type === 'number') {
-            const numValue = Number(value);
-            if (isNaN(numValue)) {
-              await ctx.reply('❗ Please enter a valid number.');
-              return;
-            }
-            value = numValue;
-          }
-          state.values[field.key] = value;
-          state.step++;
-          if (state.step < STRATEGY_FIELDS.length) {
-            const nextField = STRATEGY_FIELDS[state.step];
-            await ctx.reply(`📝 ${nextField.label}${nextField.optional ? ' (optional)' : ''}`);
-          } else {
-            state.step = 0;
-            state.phase = 'tradeSettings';
-            state.tradeSettings = {};
-            await ctx.reply('⚙️ Trade settings:\nPlease enter the buy amount per trade (SOL):');
-          }
-          return;
-        }
-        if (typeof next === 'function') return next();
-      });
+  if (typeof next === 'function') return next();
+});
+
+  // Note: strategy state handlers are registered earlier to avoid duplicate registrations
 
       bot.command('show_token', async (ctx) => {
   console.log(`[show_token] User: ${String(ctx.from?.id)}`);
@@ -486,7 +430,7 @@ bot.on('text', async (ctx, next) => {
               saveUsers(users);
               // سجل أمر بيع تلقائي
               const targetPercent = user.strategy.targetPercent || 10;
-              registerBuyWithTarget(user, { address: tokenAddress, price }, buyResult, targetPercent);
+              try { await registerBuyWithTarget(user, { address: tokenAddress, price }, buyResult, targetPercent); } catch (e) { console.error('registerBuyWithTarget error:', e); }
               buyResults.push(`🟢 <b>${name}</b> (<code>${tokenAddress}</code>)\nPrice: <b>${price}</b> USD\nAmount: <b>${buyAmount}</b> SOL\nTx: <a href='https://solscan.io/tx/${buyResult.tx}'>${buyResult.tx}</a>\n<a href='${dexUrl}'>DexScreener</a> | <a href='https://solscan.io/token/${tokenAddress}'>Solscan</a>\n------------------------------`);
             } else {
               failCount++;
@@ -569,6 +513,15 @@ bot.action(/showtoken_sell_(.+)/, async (ctx) => {
 console.log('--- About to launch bot ---');
 (async () => {
   try {
+    // Load users from disk before registering handlers and launching
+    try {
+      users = await loadUsers();
+      console.log('--- Users loaded (async) ---');
+    } catch (e) { console.error('Failed to load users async:', e); users = loadUsersSync(); }
+
+    // Register centralized buy/sell handlers now that users are loaded
+    try { registerBuySellHandlers(bot, users, boughtTokens); } catch (e) { console.error('Failed to register buy/sell handlers:', e); }
+
     await bot.launch();
     console.log('✅ Bot launched successfully (polling)');
     try {

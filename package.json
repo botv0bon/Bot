@@ -2,10 +2,10 @@
   "name": "solgradetradebot",
   "version": "1.0.0",
   "description": "growtrade bot on the top of growsol project",
-  "main": "serve.ts",
+  "main": "telegramBot.ts",
   "scripts": {
     "serve": "nodemon ./telegramBot.ts",
-    "start": "npx ts-node serve.ts",
+    "start": "npx ts-node telegramBot.ts",
     "build": "npm run clean && tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

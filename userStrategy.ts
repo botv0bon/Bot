@@ -10,25 +10,25 @@ export async function getSolBalance(userSecret: string): Promise<number> {
   return balance / 1e9; // تحويل من lamports إلى SOL
 }
 import fs from 'fs';
+const fsp = fs.promises;
 import path from 'path';
+import { writeJsonFile } from './src/bot/helpers';
 
 /**
  * Record a buy or sell operation in the user's file inside sent_tokens
  */
-export function recordUserTrade(userId: string, trade: any) {
+export async function recordUserTrade(userId: string, trade: any) {
   if (!userId || userId === 'undefined') {
     console.warn('[recordUserTrade] Invalid userId, skipping trade record.');
     return;
   }
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
-  if (!fs.existsSync(sentTokensDir)) fs.mkdirSync(sentTokensDir);
+  try { await fsp.mkdir(sentTokensDir, { recursive: true }); } catch {}
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   let userTrades: any[] = [];
-  if (fs.existsSync(userFile)) {
-    try { userTrades = JSON.parse(fs.readFileSync(userFile, 'utf8')); } catch {}
-  }
+  try { const stat = await fsp.stat(userFile).catch(() => false); if (stat) { const data = await fsp.readFile(userFile, 'utf8'); userTrades = JSON.parse(data || '[]'); } } catch {}
   userTrades.push({ ...trade, time: Date.now() });
-  fs.writeFileSync(userFile, JSON.stringify(userTrades, null, 2));
+  try { await writeJsonFile(userFile, userTrades); } catch {}
 }
 // userStrategy.ts
 require('dotenv').config();
@@ -152,7 +152,7 @@ export async function executeHoneyStrategy(
         const solBalance = await getSolBalance(user.secret);
   if (solBalance < token.buyAmount + 0.002) { // 0.002 SOL estimated for fees
           token.status = 'error';
-          recordUserTrade(userId, {
+          await recordUserTrade(userId, {
             mode: 'buy',
             token: token.address,
             amount: token.buyAmount,
@@ -167,7 +167,7 @@ export async function executeHoneyStrategy(
         token.status = 'active';
         token.currentStage = 0;
         token.lastTxId = txId;
-        recordUserTrade(userId, {
+  await recordUserTrade(userId, {
           mode: 'buy',
           token: token.address,
           amount: token.buyAmount,
@@ -177,7 +177,7 @@ export async function executeHoneyStrategy(
         });
       } catch (e) {
         token.status = 'error';
-        recordUserTrade(userId, {
+  await recordUserTrade(userId, {
           mode: 'buy',
           token: token.address,
           amount: token.buyAmount,
@@ -201,7 +201,7 @@ export async function executeHoneyStrategy(
           const solBalance = await getSolBalance(user.secret);
           if (solBalance < sellAmount + 0.002) {
             token.status = 'error';
-            recordUserTrade(userId, {
+            await recordUserTrade(userId, {
               mode: 'sell',
               token: token.address,
               amount: sellAmount,
@@ -215,7 +215,7 @@ export async function executeHoneyStrategy(
           token.lastSellPrice = currentPrice;
           token.currentStage = i + 1;
           token.lastTxId = txId;
-          recordUserTrade(userId, {
+          await recordUserTrade(userId, {
             mode: 'sell',
             token: token.address,
             amount: sellAmount,
@@ -229,7 +229,7 @@ export async function executeHoneyStrategy(
           }
         } catch (e) {
           token.status = 'error';
-          recordUserTrade(userId, {
+          await recordUserTrade(userId, {
             mode: 'sell',
             token: token.address,
             amount: sellAmount,

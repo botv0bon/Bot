@@ -4,8 +4,11 @@ import { normalizeStrategy } from './utils/strategyNormalizer';
 import { registerBuyWithTarget } from './bot/strategy';
 import { extractTradeMeta } from './utils/tradeMeta';
 import { unifiedBuy } from './tradeSources';
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
-import { saveUsers } from './bot/helpers';
+import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko } from './utils/tokenUtils';
+import { existsSync, mkdirSync } from 'fs';
+import fs from 'fs';
+const fsp = fs.promises;
+import { saveUsers, writeJsonFile } from './bot/helpers';
 import path from 'path';
 
 type UsersMap = Record<string, any>;
@@ -16,34 +19,41 @@ export function hashTokenAddress(addr: string) {
   return String(addr || '').toLowerCase().trim();
 }
 
-function ensureSentDir() {
+async function ensureSentDir() {
   const sent = path.join(process.cwd(), 'sent_tokens');
-  if (!existsSync(sent)) mkdirSync(sent);
+  try {
+    await fsp.mkdir(sent, { recursive: true });
+  } catch {}
   return sent;
 }
 
-export function readSentHashes(userId: string): Set<string> {
+export async function readSentHashes(userId: string): Promise<Set<string>> {
   try {
-    const sentDir = ensureSentDir();
+  const sentDir = await ensureSentDir();
     const file = path.join(sentDir, `${userId}.json`);
-    if (!existsSync(file)) return new Set();
-    const data = JSON.parse(readFileSync(file, 'utf8')) as any[];
+    const stat = await fsp.stat(file).catch(() => false);
+    if (!stat) return new Set();
+    const data = JSON.parse(await fsp.readFile(file, 'utf8')) as any[];
     return new Set((data || []).map(d => d.hash).filter(Boolean));
   } catch (e) {
     return new Set();
   }
 }
 
-export function appendSentHash(userId: string, hash: string) {
+export async function appendSentHash(userId: string, hash: string) {
   try {
-    const sentDir = ensureSentDir();
+  const sentDir = await ensureSentDir();
     const file = path.join(sentDir, `${userId}.json`);
     let arr: any[] = [];
-    if (existsSync(file)) {
-      try { arr = JSON.parse(readFileSync(file, 'utf8')) || []; } catch {}
-    }
+    try {
+      const stat = await fsp.stat(file).catch(() => false);
+      if (stat) {
+        arr = JSON.parse(await fsp.readFile(file, 'utf8')) || [];
+      }
+    } catch {}
     arr.push({ hash, time: Date.now() });
-    writeFileSync(file, JSON.stringify(arr.slice(-500), null, 2));
+    // write atomically via helper queue
+    await writeJsonFile(file, arr.slice(-500)).catch(() => {});
   } catch (e) {}
 }
 
@@ -53,101 +63,103 @@ export function appendSentHash(userId: string, hash: string) {
  */
 export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: { intervalMs?: number }) {
   const intervalMs = options?.intervalMs || 1000;
+  const perUserLimit = (options as any)?.perUserLimit || 1; // max messages per interval
+  const batchLimit = (options as any)?.batchLimit || 20; // tokens per user per interval
   let running = true;
+
+  const lastSent: Map<string, number> = new Map();
 
   async function loop() {
     while (running) {
       try {
-        const res = await axios.get(DEXBOOSTS, { timeout: 5000 });
-        const data = res.data;
-        let tokens: any[] = [];
-        if (Array.isArray(data)) tokens = data;
-        else if (Array.isArray(data.boosts)) tokens = data.boosts;
-        else if (Array.isArray(data.profiles)) tokens = data.profiles;
+        // Fetch & filter tokens for all users using shared cache
+        const perUserTokens = await fetchAndFilterTokensForUsers(users, { limit: 200, force: false });
 
-        if (!tokens.length) {
-          await sleep(intervalMs);
-          continue;
-        }
+        // Build prioritized list ordered by priorityRank desc then priority boolean
+        const priorityUsers = Object.keys(users)
+          .filter(uid => {
+            const u = users[uid];
+            return u && u.strategy && (u.strategy.priority === true || (u.strategy.priorityRank && u.strategy.priorityRank > 0));
+          })
+          .sort((a, b) => ( (users[b].strategy?.priorityRank || 0) - (users[a].strategy?.priorityRank || 0) ));
 
-        // Build prioritized users list (normalize strategy per user)
-        const prioritized: string[] = [];
-        for (const uid of Object.keys(users)) {
-          const u = users[uid];
-          if (!u || !u.strategy) continue;
-          const norm = normalizeStrategy(u.strategy);
-          if (!norm || norm.enabled === false) continue;
-          // replace temporarily for use below
-          u.__normalizedStrategy = norm;
-          if (norm.priority === true || (norm.priorityRank && norm.priorityRank > 0)) prioritized.push(uid);
-        }
+        // First process priority users, then regular users
+        const processOrder = [...priorityUsers, ...Object.keys(users).filter(u => !priorityUsers.includes(u))];
 
-        // Process tokens and attempt notify/buy for prioritized users first
-        for (const token of tokens) {
-          // Normalize token address field candidates
-          const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || token.pair?.address || '';
-          if (!addr) continue;
-          for (const uid of prioritized) {
-            const user = users[uid];
-            // Skip invalid users
-            if (!user || !user.secret || !user.strategy || !user.strategy.enabled) continue;
-            // Skip if already sent
-            const sent = readSentHashes(uid);
-            const h = hashTokenAddress(addr);
-            if (sent.has(h)) continue;
-            // Run filtering for this single token using normalized strategy
-            try {
-              const strategyToUse = user.__normalizedStrategy || normalizeStrategy(user.strategy);
-              const ok = filterTokensByStrategy([token], strategyToUse);
-              if (ok && ok.length) {
-                // Notify user (simple message)
+        for (const uid of processOrder) {
+          try {
+            const u = users[uid];
+            if (!u || !u.strategy || u.strategy.enabled === false) continue;
+            const matches = perUserTokens[uid] || [];
+            if (!matches.length) continue;
+
+            // rate limiting: allow perUserLimit messages per interval
+            const last = lastSent.get(uid) || 0;
+            if (Date.now() - last < intervalMs * (perUserLimit)) {
+              // skip this user this iteration
+              continue;
+            }
+
+            // limit tokens per user per interval
+            const tokensToSend = matches.slice(0, batchLimit);
+
+            // Filter out tokens already sent (sent hashes)
+            const sent = await readSentHashes(uid);
+            const filtered = tokensToSend.filter(t => {
+              const addr = t.tokenAddress || t.address || t.mint || t.pairAddress || '';
+              const h = hashTokenAddress(addr);
+              return addr && !sent.has(h);
+            });
+            if (!filtered.length) continue;
+
+            // Send notifications in a batch (one message with multiple tokens or multiple messages)
+            for (const token of filtered) {
+              const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
+              const h = hashTokenAddress(addr);
+              try {
+                const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
+                await telegram.sendMessage(uid, msg);
+                await appendSentHash(uid, h);
+              } catch (e) {
+                // ignore send errors per token
+              }
+            }
+
+            // Optionally auto-buy for users with autoBuy enabled
+            if (u.strategy.autoBuy !== false && Number(u.strategy.buyAmount) > 0) {
+                    for (const token of filtered) {
+                const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
                 try {
-                  const msg = `🚀 Priority token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
-                  await telegram.sendMessage(uid, msg);
-                } catch (e) {}
-                appendSentHash(uid, h);
-                // Optionally auto-buy if enabled and buyAmount > 0
-                if (user.strategy.autoBuy !== false && Number(user.strategy.buyAmount) > 0) {
-                  try {
-                    // Final hard-check: ensure token still passes the user's normalized strategy
-                    const finalStrategy = user.__normalizedStrategy || normalizeStrategy(user.strategy);
-                    const finalOk = filterTokensByStrategy([token], finalStrategy);
-                    if (!finalOk || finalOk.length === 0) {
-                      // token no longer matches strategy -> skip autoBuy
-                      continue;
+                  const finalStrategy = normalizeStrategy(u.strategy);
+                  const finalOk = filterTokensByStrategy([token], finalStrategy);
+                  if (!finalOk || finalOk.length === 0) continue;
+                  const amount = Number(u.strategy.buyAmount);
+                  const result = await unifiedBuy(addr, amount, u.secret);
+                  if (result && ((result as any).tx || (result as any).success)) {
+                    try { await registerBuyWithTarget(u, { address: addr, price: token.price || token.priceUsd }, result, u.strategy.targetPercent || 10); } catch {}
+                    const { fee, slippage } = extractTradeMeta(result, 'buy');
+                    u.history = u.history || [];
+                    const resTx = (result as any)?.tx ?? '';
+                    u.history.push(`AutoBuy: ${addr} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
+                    try { saveUsers(users); } catch {}
+                    // notify user about executed buy
+                    try { await telegram.sendMessage(uid, `✅ AutoBuy executed for ${addr}\nTx: ${resTx}`); } catch {}
                     }
-                    const amount = Number(user.strategy.buyAmount);
-                    const result = await unifiedBuy(addr, amount, user.secret);
-                    if (result && ((result as any).tx || (result as any).success)) {
-                      // register buy entry if available
-                      try { registerBuyWithTarget(user, { address: addr, price: token.price || token.priceUsd }, result, user.strategy.targetPercent || 10); } catch {}
-                      // extract fee/slippage
-                      const { fee, slippage } = extractTradeMeta(result, 'buy');
-                      // save a light history entry including fee/slippage
-                      user.history = user.history || [];
-                      const resTx = (result as any)?.tx ?? '';
-                      user.history.push(`PriorityAutoBuy: ${addr} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
-                      // send a lightweight telegram notification for priority auto-buy
-                      try {
-                        let msg = `✅ <b>Priority AutoBuy Executed</b>\nToken: ${token.description || token.name || addr}\nAddress: ${addr}\nAmount: <b>${amount}</b> SOL`;
-                        if (resTx) msg += `\n<a href='https://solscan.io/tx/${resTx}'>View Tx</a>`;
-                        if (fee != null) msg += `\nFee: <b>${fee}</b>`;
-                        if (slippage != null) msg += `\nSlippage: <b>${slippage}</b>`;
-                        await telegram.sendMessage(uid, msg, { parse_mode: 'HTML', disable_web_page_preview: false });
-                      } catch (e) {}
-                      // persist users to disk
-                      try { saveUsers(users); } catch (e) {}
-                    }
-                  } catch (e) {}
+                } catch (e) {
+                  // ignore per-token buy errors
                 }
               }
-            } catch (e) {
-              // ignore per-user filter errors
             }
+
+            lastSent.set(uid, Date.now());
+          } catch (e) {
+            // per-user loop error: continue
+            continue;
           }
         }
+
       } catch (err) {
-        // ignore fetch errors
+        // ignore fetch loop errors
       }
       await sleep(intervalMs);
     }
@@ -161,3 +173,68 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
 }
 
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+
+// =========================
+// New: fetch and filter tokens per-user
+// =========================
+let __global_fetch_cache: any[] = [];
+let __global_fetch_ts = 0;
+const __GLOBAL_FETCH_TTL = 1000 * 60 * 1; // 1 minute default
+
+/**
+ * Fetch tokens from common sources (DexScreener, CoinGecko fallback) once,
+ * then filter tokens per user based on their normalized strategy.
+ * Returns a map: { [userId]: tokens[] }
+ */
+export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { limit?: number, force?: boolean }): Promise<Record<string, any[]>> {
+  const now = Date.now();
+  if (!opts?.force && __global_fetch_cache.length && (now - __global_fetch_ts) < __GLOBAL_FETCH_TTL) {
+    // use cache
+  } else {
+    try {
+      const limit = opts?.limit || 200;
+      // fetch main list from DexScreener (merged profiles + pairs)
+      __global_fetch_cache = await fetchDexScreenerTokens('solana', { limit: String(limit) } as any);
+      __global_fetch_ts = Date.now();
+    } catch (e) {
+      // fallback: try coinGecko single fetch
+      try {
+        const cg = await fetchSolanaFromCoinGecko();
+        __global_fetch_cache = cg ? [cg] : [];
+        __global_fetch_ts = Date.now();
+      } catch {
+        __global_fetch_cache = [];
+      }
+    }
+  }
+
+  const result: Record<string, any[]> = {};
+  const normalizedMap: Record<string, any> = {};
+  // pre-normalize strategies
+  for (const uid of Object.keys(users)) {
+    const u = users[uid];
+    if (!u || !u.strategy) continue;
+    try {
+      normalizedMap[uid] = normalizeStrategy(u.strategy);
+    } catch {
+      normalizedMap[uid] = u.strategy;
+    }
+  }
+
+  // For each user, filter tokens using filterTokensByStrategy (robust)
+  for (const uid of Object.keys(normalizedMap)) {
+    const strat = normalizedMap[uid];
+    if (!strat || strat.enabled === false) {
+      result[uid] = [];
+      continue;
+    }
+    try {
+      const matches = filterTokensByStrategy(__global_fetch_cache, strat);
+      result[uid] = Array.isArray(matches) ? matches : [];
+    } catch (e) {
+      result[uid] = [];
+    }
+  }
+
+  return result;
+}
