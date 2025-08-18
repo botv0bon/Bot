@@ -148,7 +148,7 @@ bot.command('notify_tokens', async (ctx) => {
     globalTokenCache = await fetchDexScreenerTokens('solana');
     lastCacheUpdate = now;
   }
-  const filteredTokens = filterTokensByStrategy(globalTokenCache, user.strategy);
+  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(globalTokenCache, user.strategy));
   if (!filteredTokens.length) {
     await ctx.reply('No tokens currently match your strategy.');
     return;
@@ -399,7 +399,7 @@ bot.on('text', async (ctx, next) => {
           globalTokenCache = await fetchDexScreenerTokens('solana');
           lastCacheUpdate = now;
         }
-        const filteredTokens = filterTokensByStrategy(globalTokenCache, user.strategy);
+  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(globalTokenCache, user.strategy));
         const maxTrades = user.strategy.maxTrades && user.strategy.maxTrades > 0 ? user.strategy.maxTrades : 5;
         const tokensToTrade = filteredTokens.slice(0, maxTrades);
         if (!tokensToTrade.length) {

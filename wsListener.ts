@@ -36,7 +36,7 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
         if (!user || !user.wallet || !user.secret || !user.strategy || !user.strategy.enabled) continue;
   // Normalize user's strategy then filter tokens for that user
   const normStrategy = normalizeStrategy(user.strategy);
-  let userTokens = filterTokensByStrategy(filteredTokens, normStrategy);
+  let userTokens = await filterTokensByStrategy(filteredTokens, normStrategy);
         // Exclude tokens already sent to this user
         const sentHashes = await readSentHashes(userId);
         userTokens = userTokens.filter(token => {
@@ -59,11 +59,46 @@ function registerWsNotifications(bot: any, users: Record<string, any>) {
               // Only buy if not already bought (not in sentHashes)
                 // Final hard-check against normalized strategy before autoBuy
                 const finalStrategy = normalizeStrategy(user.strategy);
-                const finalOk = filterTokensByStrategy([token], finalStrategy);
+                // If strategy requires Jupiter or pump info, attempt lightweight enrichment for this token
+                const mint = token.tokenAddress || token.address || token.mint || token.pairAddress;
+                try {
+      const needJupiter = typeof finalStrategy.minJupiterUsd === 'number' || finalStrategy.requireJupiterRoute === true;
+      // pump.fun will be used for enrichment/metadata only; do not require it as a hard filter
+      const needPump = false;
+      if (needJupiter) {
+                    const { JUPITER_QUOTE_API } = await import('./src/config');
+                    const { getCoinData } = await import('./src/pump/api');
+                    const mint = token.tokenAddress || token.address || token.mint || token.pairAddress;
+        if (needJupiter && JUPITER_QUOTE_API && mint) {
+                      try {
+                        // default to $50 for quick check if min not set
+                        const amountUsd = finalStrategy.minJupiterUsd || 50;
+                        const lamports = Math.floor((amountUsd / 1) * 1e9);
+                        const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${mint}&amount=${lamports}&slippage=1`;
+                        const axios = (await import('axios')).default;
+                        const r = await axios.get(url, { timeout: 5000 });
+                        token.jupiter = r.data;
+                      } catch (e) { /* ignore */ }
+                    }
+                    // optional pump enrichment (non-blocking)
+                    try { token.pump = await getCoinData(mint); } catch (e) {}
+                  }
+                } catch (e) {}
+                const finalOk = await filterTokensByStrategy([token], finalStrategy);
                 if (!finalOk || finalOk.length === 0) {
                   // skip buy - token does not meet user's strategy anymore
                   continue;
                 }
+                // Final Jupiter simulation check before executing actual buy
+                try {
+                  const { finalJupiterCheck } = await import('./src/utils/tokenUtils');
+                  const buyAmt = Number(user.strategy.buyAmount) || 0.01;
+                  const jres = await finalJupiterCheck(mint, buyAmt, { minJupiterUsd: finalStrategy.minJupiterUsd, requireRoute: finalStrategy.requireJupiterRoute, timeoutMs: 3000 });
+                  if (!jres.ok) {
+                    await bot.telegram.sendMessage(userId, `⚠️ Skipped AutoBuy for ${mint}: Jupiter check failed (${jres.reason})`, { parse_mode: 'HTML' });
+                    continue;
+                  }
+                } catch (e) {}
                 const result = await unifiedBuy(addr, buyAmount, user.secret);
                 const { fee, slippage } = extractTradeMeta(result, 'buy');
                 const resSource = (result as any)?.source ?? 'unknown';

@@ -252,8 +252,17 @@ import type { Strategy } from './types';
  * Filters a list of tokens based on the user's strategy settings.
  * All comments and variable names are in English for clarity.
  */
-export function filterTokensByStrategy(tokens: any[], strategy: Strategy): any[] {
+export async function filterTokensByStrategy(tokens: any[], strategy: Strategy): Promise<any[]> {
   if (!strategy || !Array.isArray(tokens)) return [];
+  // Enrich a small sample to improve fetching accuracy (Jupiter/pump used for fetching only,
+  // not as hard filter conditions). This avoids blocking filtering on external APIs.
+  if (tokens.length > 0) {
+    try {
+  // No local enrichment here — official enrichment is handled in fetcher when needed.
+    } catch (e) {
+      // ignore enrichment errors
+    }
+  }
   // Use getField from tokenUtils for robust field extraction
   const { getField } = require('../utils/tokenUtils');
   const filtered = tokens.filter(token => {
@@ -342,6 +351,9 @@ export function filterTokensByStrategy(tokens: any[], strategy: Strategy): any[]
   // Verification
   const verified = getField(token, 'verified', 'baseToken.verified') === true || getField(token, 'verified', 'baseToken.verified') === 'true';
   if (strategy.onlyVerified === true && !verified) return false;
+
+  // Jupiter integration: allow strategy to require Jupiter route or min swap USD
+  // Jupiter/pump are enrichment-only sources now; do not use them as hard filters here.
 
   // Strategy enabled
   if (strategy.enabled === false) return false;

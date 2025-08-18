@@ -149,6 +149,46 @@ export async function executeHoneyStrategy(
     if (!token.lastEntryPrice) {
       // Initial buy
       try {
+        // Normalize strategy for user's checks
+        const finalStrategy = (user.strategy && typeof user.strategy === 'object') ? require('./src/utils/strategyNormalizer').normalizeStrategy(user.strategy) : {};
+        // If Jupiter/pump requirements exist, perform a lightweight check
+  const needJupiter = typeof finalStrategy.minJupiterUsd === 'number' || finalStrategy.requireJupiterRoute === true;
+  // pump.fun is enrichment-only and will not be used as a blocking filter
+  const needPump = false;
+  if (needJupiter && token.address) {
+          try {
+            const { JUPITER_QUOTE_API } = require('./src/config');
+            const axios = require('axios');
+            const mint = token.address;
+            if (needJupiter && JUPITER_QUOTE_API) {
+              const amountUsd = finalStrategy.minJupiterUsd || 50;
+              const lamports = Math.floor((amountUsd / 1) * 1e9);
+              try {
+                const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${mint}&amount=${lamports}&slippage=1`;
+                const r = await axios.get(url, { timeout: 5000 });
+                (token as any).jupiter = r.data;
+                const swap = Number(r.data?.swapUsdValue || 0);
+                if (typeof finalStrategy.minJupiterUsd === 'number' && swap < finalStrategy.minJupiterUsd) {
+                  token.status = 'error';
+                  await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Jupiter liquidity below threshold' });
+                  continue;
+                }
+                if (finalStrategy.requireJupiterRoute === true && !(r.data?.routePlan || r.data?.data)) {
+                  token.status = 'error';
+                  await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'No Jupiter route' });
+                  continue;
+                }
+              } catch (e) {
+                // treat as not meeting requirements
+                token.status = 'error';
+                await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Jupiter check failed' });
+                continue;
+              }
+            }
+            // Optional pump enrichment (non-blocking)
+            try { const p = await require('./src/pump/api').getCoinData(token.address); (token as any).pump = p; } catch (e) {}
+          } catch (e) {}
+        }
         const solBalance = await getSolBalance(user.secret);
   if (solBalance < token.buyAmount + 0.002) { // 0.002 SOL estimated for fees
           token.status = 'error';

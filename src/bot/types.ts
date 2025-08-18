@@ -12,4 +12,6 @@ export interface Strategy {
   profitTargets?: string;
   sellPercents?: string;
   stopLossPercent?: number;
+  // Extended fields for Jupiter / pump integration
+  requirePool?: boolean;
 }

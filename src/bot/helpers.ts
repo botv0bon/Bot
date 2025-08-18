@@ -82,6 +82,23 @@ export function loadUsersSync(): Record<string, any> {
   return {};
 }
 
+/**
+ * Load users and return a sanitized map suitable for external use/UI.
+ * This wraps `loadUsers()` and applies `publicUsers` to the result.
+ */
+export async function loadPublicUsers(opts?: { removeSecret?: boolean, trimHistory?: boolean, maxHistory?: number }) {
+  const users = await loadUsers();
+  return publicUsers(users, opts);
+}
+
+/**
+ * Synchronous version of `loadPublicUsers` that reads from disk and sanitizes.
+ */
+export function loadPublicUsersSync(opts?: { removeSecret?: boolean, trimHistory?: boolean, maxHistory?: number }) {
+  const users = loadUsersSync();
+  return publicUsers(users, opts);
+}
+
 export function saveUsers(users: Record<string, any>) {
   try {
     // enqueue async write, do not block caller
@@ -89,4 +106,49 @@ export function saveUsers(users: Record<string, any>) {
   } catch (e) {
     console.error('Error saving users.json:', e);
   }
+}
+
+/**
+ * Produce a sanitized copy of a user object suitable for external return/UI.
+ * By default this removes sensitive fields (secret/private_key) and trims history.
+ * Options:
+ *  - removeSecret: boolean (default true) - strip private keys
+ *  - trimHistory: boolean (default true) - keep only the last `maxHistory` entries
+ *  - maxHistory: number (default 10)
+ */
+export function publicUser(user: Record<string, any> | undefined | null, opts?: { removeSecret?: boolean, trimHistory?: boolean, maxHistory?: number }) {
+  if (!user) return null;
+  const { removeSecret = true, trimHistory = true, maxHistory = 10 } = opts || {};
+  // shallow copy
+  const u: Record<string, any> = { ...user };
+  // normalize common id fields
+  if (!u.id && (u.userId || u.telegramId)) u.id = u.userId || u.telegramId;
+  // remove sensitive fields
+  if (removeSecret) {
+    delete u.secret;
+    delete u.private_key;
+    delete u.privateKey;
+    delete u._secret;
+  }
+  // trim history for UI safety
+  if (trimHistory && Array.isArray(u.history)) {
+    u.history = u.history.slice(-Math.max(0, Number(maxHistory)));
+  }
+  return u;
+}
+
+/**
+ * Sanitize a map of users. Returns a shallow copy map with each user passed through `publicUser`.
+ */
+export function publicUsers(users: Record<string, any> | undefined | null, opts?: { removeSecret?: boolean, trimHistory?: boolean, maxHistory?: number }) {
+  if (!users || typeof users !== 'object') return {};
+  const out: Record<string, any> = {};
+  for (const k of Object.keys(users)) {
+    try {
+      out[k] = publicUser(users[k], opts);
+    } catch (e) {
+      out[k] = null;
+    }
+  }
+  return out;
 }

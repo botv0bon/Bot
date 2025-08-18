@@ -5,6 +5,8 @@ import { registerBuyWithTarget } from './bot/strategy';
 import { extractTradeMeta } from './utils/tradeMeta';
 import { unifiedBuy } from './tradeSources';
 import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko } from './utils/tokenUtils';
+import { JUPITER_QUOTE_API } from './config';
+import { getCoinData as getPumpData } from './pump/api';
 import { existsSync, mkdirSync } from 'fs';
 import fs from 'fs';
 const fsp = fs.promises;
@@ -131,7 +133,7 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
                 const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
                 try {
                   const finalStrategy = normalizeStrategy(u.strategy);
-                  const finalOk = filterTokensByStrategy([token], finalStrategy);
+                  const finalOk = await (require('./bot/strategy').filterTokensByStrategy([token], finalStrategy));
                   if (!finalOk || finalOk.length === 0) continue;
                   const amount = Number(u.strategy.buyAmount);
                   const result = await unifiedBuy(addr, amount, u.secret);
@@ -193,8 +195,9 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
   } else {
     try {
       const limit = opts?.limit || 200;
-      // fetch main list from DexScreener (merged profiles + pairs)
-      __global_fetch_cache = await fetchDexScreenerTokens('solana', { limit: String(limit) } as any);
+  // fetch unified tokens (DexScreener + Solana RPC + Jupiter enrichment)
+  const { fetchUnifiedTokens } = require('./utils/tokenUtils');
+  __global_fetch_cache = await fetchUnifiedTokens('solana', { limit: String(limit) } as any);
       __global_fetch_ts = Date.now();
     } catch (e) {
       // fallback: try coinGecko single fetch
@@ -229,8 +232,30 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
       continue;
     }
     try {
-      const matches = filterTokensByStrategy(__global_fetch_cache, strat);
-      result[uid] = Array.isArray(matches) ? matches : [];
+      // Official enrichment: for safety, check a small sample using Solana RPC + Jupiter.
+      // We do this when user has autoBuy enabled or buyAmount > 0 to avoid unnecessary calls.
+      const needOfficial = (typeof strat.buyAmount === 'number' && strat.buyAmount > 0) || strat.autoBuy !== false;
+      let workCache = __global_fetch_cache;
+      if (needOfficial && Array.isArray(workCache) && workCache.length > 0) {
+        const sampleSize = 200;
+        const sample = workCache.slice(0, sampleSize);
+        const { officialEnrich } = require('./utils/tokenUtils');
+        const concurrency = 5;
+        let idx = 0;
+        async function worker() {
+          while (idx < sample.length) {
+            const i = idx++;
+            const t = sample[i];
+            try { await officialEnrich(t, { amountUsd: Number(strat.buyAmount) || 50, timeoutMs: 4000 }); } catch (e) {}
+          }
+        }
+        const workers = Array.from({ length: Math.min(concurrency, sample.length) }, () => worker());
+        const globalTimeoutMs = 10000;
+        await Promise.race([ Promise.all(workers), new Promise(res => setTimeout(res, globalTimeoutMs)) ]);
+        workCache = [...sample, ...workCache.slice(sampleSize)];
+      }
+  const matches = await (require('./bot/strategy').filterTokensByStrategy(workCache, strat));
+  result[uid] = Array.isArray(matches) ? matches : [];
     } catch (e) {
       result[uid] = [];
     }
