@@ -75,6 +75,27 @@ function extractNumeric(val: any, fallback?: number): number | undefined {
   return fallback;
 }
 
+// Parse duration input (supports numbers and strings like '30s','5m','2h')
+export function parseDuration(v: string | number | undefined | null): number | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (typeof v === 'number') {
+    // Backwards compatibility: plain numbers are treated as minutes (legacy behaviour)
+    return Math.floor(Number(v) * 60);
+  }
+  const s = String(v).trim().toLowerCase();
+  const match = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hr|hrs|hours|d|day|days)?$/);
+  if (!match) return undefined;
+  const n = Number(match[1]);
+  const unit = match[2] || 'm';
+  switch (unit) {
+    case 's': case 'sec': case 'secs': case 'seconds': return Math.floor(n);
+    case 'm': case 'min': case 'mins': case 'minutes': return Math.floor(n * 60);
+    case 'h': case 'hr': case 'hrs': case 'hours': return Math.floor(n * 3600);
+    case 'd': case 'day': case 'days': return Math.floor(n * 86400);
+    default: return Math.floor(n * 60);
+  }
+}
+
 
 export async function retryAsync<T>(fn: () => Promise<T>, retries = 3, delayMs = 2000): Promise<T> {
   let lastErr;
@@ -307,16 +328,19 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
       // seconds -> ms
       ct = ct * 1000;
     }
-    // If ct now looks like ms timestamp, compute minutes
+    // If ct now looks like ms timestamp, compute minutes and seconds
     if (typeof ct === 'number' && ct > 1e12) {
       t.poolOpenTime = ct;
       t.ageMinutes = Math.floor((Date.now() - ct) / 60000);
+      t.ageSeconds = Math.floor((Date.now() - ct) / 1000);
     } else if (typeof t.ageMinutes === 'number' && !isNaN(t.ageMinutes)) {
-      // already set (assume minutes)
+      // already set (assume minutes) -> normalize and provide seconds
       t.ageMinutes = Math.floor(t.ageMinutes);
+      t.ageSeconds = Math.floor(t.ageMinutes * 60);
     } else {
       // give a safe undefined rather than various formats
       t.ageMinutes = undefined;
+      t.ageSeconds = undefined;
     }
   }
 
@@ -380,7 +404,345 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
       allTokens[addr] = { ...t };
     }
   }
+  // Ensure each token has poolOpenTimeMs and ageSeconds where possible
+  for (const addr of Object.keys(allTokens)) {
+    const t = allTokens[addr];
+    // ensure poolOpenTimeMs if we have poolOpenTime
+    if (t.poolOpenTime && typeof t.poolOpenTime === 'number') {
+      // convert seconds -> ms if needed
+      let ct = t.poolOpenTime;
+      if (ct > 0 && ct < 1e12 && ct > 1e9) ct = ct * 1000;
+      t.poolOpenTimeMs = ct;
+      if (typeof ct === 'number' && ct > 0) {
+        t.ageSeconds = Math.floor((Date.now() - ct) / 1000);
+        t.ageMinutes = Math.floor((Date.now() - ct) / 60000);
+      }
+    }
+    if (t.ageMinutes === undefined && typeof t.ageSeconds === 'number') {
+      t.ageMinutes = Math.floor((t.ageSeconds || 0) / 60);
+    }
+  }
   return Object.values(allTokens);
+}
+
+
+// ===== Enrichment helpers (Helius primary, RPC fallback) =====
+const heliusTimestampCache: Record<string, { ts: number | null; fetchedAt: number }> = {};
+// Per-host state to avoid tight retry loops when a provider starts returning 429s
+const heliusHostState: Record<string, { failureCount: number; cooldownUntil: number }> = {};
+const enrichmentMetrics: {
+  heliusCalls: number; heliusFailures: number; heliusTotalMs: number;
+  rpcCalls: number; rpcFailures: number; rpcTotalMs: number;
+  solscanCalls: number; solscanFailures: number; solscanTotalMs: number;
+} = {
+  heliusCalls: 0, heliusFailures: 0, heliusTotalMs: 0,
+  rpcCalls: 0, rpcFailures: 0, rpcTotalMs: 0,
+  solscanCalls: 0, solscanFailures: 0, solscanTotalMs: 0
+};
+
+async function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+
+async function getFirstTxTimestampFromRpc(address: string): Promise<number | null> {
+  try {
+    const { Connection, PublicKey } = await import('@solana/web3.js');
+    const rpcUrl = process.env.HELIUS_RPC_URL || process.env.MAINNET_RPC;
+    if (!rpcUrl) return null;
+    const conn = new Connection(rpcUrl, { commitment: 'confirmed' } as any);
+    const pub = new PublicKey(address);
+    const start = Date.now();
+    enrichmentMetrics.rpcCalls++;
+    // fetch signatures (most recent first) — we will pick the oldest found in this batch
+    const sigs = await conn.getSignaturesForAddress(pub, { limit: 50 });
+    if (!sigs || sigs.length === 0) {
+      enrichmentMetrics.rpcTotalMs += (Date.now() - start);
+      return null;
+    }
+    // check transactions for blockTime; try to find earliest blockTime
+    let earliestMs: number | null = null;
+    for (const s of sigs) {
+      try {
+        const tx = await conn.getTransaction(s.signature, { commitment: 'confirmed' } as any);
+        const bt = tx?.blockTime;
+        if (bt) {
+          const ms = (bt > 1e9 && bt < 1e12) ? bt * 1000 : (bt > 1e12 ? bt : bt * 1000);
+          if (!earliestMs || ms < earliestMs) earliestMs = ms;
+        }
+      } catch (e) {
+        // ignore individual tx failures
+      }
+    }
+    enrichmentMetrics.rpcTotalMs += (Date.now() - start);
+    return earliestMs;
+  } catch (e) {
+    enrichmentMetrics.rpcFailures++;
+    return null;
+  }
+}
+
+async function getFirstTxTimestampFromHelius(address: string): Promise<number | null> {
+  // Prefer Helius RPC (if provided) which is typically higher-rate for paid keys.
+  const heliusRpc = process.env.HELIUS_RPC_URL || process.env.MAINNET_RPC;
+  const apiUrlTemplate = process.env.HELIUS_PARSE_HISTORY_URL || process.env.HELIUS_PARSE_TX_URL;
+  // cache check
+  const cached = heliusTimestampCache[address];
+  const ttl = Number(process.env.HELIUS_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+  if (cached && (Date.now() - cached.fetchedAt) < ttl) return cached.ts;
+
+  // Helper: HTTP GET with retry/backoff honoring Retry-After
+  async function heliusHttpGetWithRetries(url: string, maxAttempts = Number(process.env.HELIUS_RETRY_MAX_ATTEMPTS || 6)) {
+    const axios = (await import('axios')).default;
+    let lastErr: any = null;
+    const baseMs = Number(process.env.HELIUS_RETRY_BASE_MS || 500);
+    const jitterMs = Number(process.env.HELIUS_RETRY_JITTER_MS || 300);
+    // derive host key for simple circuit breaker / cooldown
+    let hostKey: string | null = null;
+    try { hostKey = new URL(url).host; } catch (e) { hostKey = null; }
+    if (hostKey) {
+      const state = heliusHostState[hostKey];
+      if (state && state.cooldownUntil && Date.now() < state.cooldownUntil) {
+        // Fail fast silently (no repeated logs)
+        const err: any = new Error(`Host ${hostKey} in cooldown`);
+        err.code = 'HELIUS_HOST_COOLDOWN';
+        throw err;
+      }
+    }
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const start = Date.now();
+      try {
+        enrichmentMetrics.heliusCalls++;
+        const headers: Record<string,string> = { 'Accept': 'application/json' };
+        if (process.env.HELIUS_API_KEY) headers['x-api-key'] = process.env.HELIUS_API_KEY;
+        const r = await axios.get(url, { timeout: 20000, headers });
+        enrichmentMetrics.heliusTotalMs += (Date.now() - start);
+        // on success, reset host failure count
+        if (hostKey && heliusHostState[hostKey]) {
+          heliusHostState[hostKey].failureCount = 0;
+          heliusHostState[hostKey].cooldownUntil = 0;
+        }
+        return r;
+      } catch (err: any) {
+        lastErr = err;
+        const status = err?.response?.status;
+        if (!status || status >= 500 || status === 429) enrichmentMetrics.heliusFailures++;
+        const retryAfter = err?.response?.headers?.['retry-after'];
+        // If non-retryable client error (4xx other than 429), bail
+        if (status && status >= 400 && status < 500 && status !== 429) break;
+        // If host is returning 429s, increment failure counter and set longer cooldown
+        if (status === 429 && hostKey) {
+          const state = heliusHostState[hostKey] || { failureCount: 0, cooldownUntil: 0 };
+          state.failureCount = (state.failureCount || 0) + 1;
+          // exponential cooldown (cap at 5 minutes) + jitter
+          const cooldown = Math.min(baseMs * Math.pow(2, state.failureCount), 5 * 60 * 1000) + Math.floor(Math.random() * jitterMs);
+          state.cooldownUntil = Date.now() + cooldown;
+          heliusHostState[hostKey] = state;
+          // Wait a short time before next attempt but avoid tight loops
+          const wait = Math.min(cooldown, 15000);
+          await sleep(wait);
+          // Do not log every retry; log only when entering cooldown threshold
+          if (state.failureCount === 1) {
+            console.warn(`Helius host ${hostKey} returned 429 — entering short cooldown (${Math.round(cooldown/1000)}s)`);
+          }
+          continue;
+        }
+        // If server provided Retry-After, honor it
+        if (retryAfter) {
+          const ra = Number(retryAfter);
+          if (!isNaN(ra) && ra > 0) {
+            await sleep(ra * 1000);
+            continue;
+          }
+        }
+        // Default exponential backoff with jitter
+        if (attempt < maxAttempts) {
+          let wait = Math.min(baseMs * Math.pow(2, attempt - 1), 30000);
+          wait += Math.floor(Math.random() * jitterMs);
+          await sleep(wait);
+          continue;
+        }
+        break;
+      }
+    }
+    // Final: if we are about to throw, emit a single concise error log
+    console.error('Helius HTTP failure after retries:', lastErr?.message || lastErr);
+    throw lastErr;
+  }
+
+  try {
+    // 1) Try Helius RPC endpoint via solana web3 (best for paid keys)
+    if (heliusRpc) {
+      try {
+        const { Connection, PublicKey } = await import('@solana/web3.js');
+        const conn = new Connection(heliusRpc, { commitment: 'confirmed' } as any);
+        const pub = new PublicKey(address);
+        const start = Date.now();
+        enrichmentMetrics.heliusCalls++;
+        const sigs = await conn.getSignaturesForAddress(pub, { limit: 200 });
+        if (sigs && sigs.length > 0) {
+          let earliestMs: number | null = null;
+          // fetch transactions in parallel but with small concurrency to avoid throttling
+          const concurrency = 8;
+          for (let i = 0; i < sigs.length; i += concurrency) {
+            const slice = sigs.slice(i, i + concurrency);
+            const txs = await Promise.all(slice.map(s => conn.getTransaction(s.signature, { commitment: 'confirmed' } as any).catch(() => null)));
+            for (const tx of txs) {
+              const bt = tx?.blockTime;
+              if (!bt) continue;
+              const ms = (bt > 1e9 && bt < 1e12) ? bt * 1000 : (bt > 1e12 ? bt : bt * 1000);
+              if (!earliestMs || ms < earliestMs) earliestMs = ms;
+            }
+            // small delay to avoid bursts
+            await sleep(50);
+          }
+          enrichmentMetrics.heliusTotalMs += (Date.now() - start);
+          heliusTimestampCache[address] = { ts: earliestMs, fetchedAt: Date.now() };
+          return earliestMs;
+        }
+      } catch (err) {
+        // if RPC attempt fails, continue to parse API below
+      }
+    }
+
+    // 2) Fall back to Helius parse/history HTTP endpoints (if configured)
+    if (apiUrlTemplate) {
+      const url = (apiUrlTemplate.indexOf('{address}') !== -1) ? apiUrlTemplate.replace('{address}', address) : apiUrlTemplate + '&mint=' + address;
+      const r = await heliusHttpGetWithRetries(url);
+      const items: any[] = Array.isArray(r.data) ? r.data : (r.data?.transactions || []);
+      if (!items || items.length === 0) {
+        heliusTimestampCache[address] = { ts: null, fetchedAt: Date.now() };
+        return null;
+      }
+      let earliest = Number.MAX_SAFE_INTEGER;
+      for (const it of items) {
+        const bt = it.blockTime || it.timestamp || (it.slot ? undefined : undefined);
+        if (!bt) continue;
+        if (bt > 1e9 && bt < 1e12) earliest = Math.min(earliest, bt * 1000);
+        else if (bt > 1e12) earliest = Math.min(earliest, bt);
+        else if (bt < 1e9) earliest = Math.min(earliest, bt * 1000);
+      }
+      const resultMs = (earliest === Number.MAX_SAFE_INTEGER) ? null : earliest;
+      heliusTimestampCache[address] = { ts: resultMs, fetchedAt: Date.now() };
+      return resultMs;
+    }
+
+    // 3) If nothing configured, return null
+    return null;
+  } catch (e) {
+    // If HTTP / RPC failed: try Solscan then RPC fallback if enabled
+    enrichmentMetrics.heliusFailures++;
+    if ((process.env.SOLSCAN_FALLBACK_ENABLED || 'true') === 'true') {
+      try {
+        const ts = await getFirstTxTimestampFromSolscan(address);
+        if (ts) return ts;
+      } catch (err) {
+        // ignore
+      }
+    }
+    if ((process.env.HELIUS_FALLBACK_ENABLED || 'true') === 'true') {
+      const fallback = await getFirstTxTimestampFromRpc(address);
+      return fallback;
+    }
+    return null;
+  }
+}
+
+async function getFirstTxTimestampFromSolscan(address: string): Promise<number | null> {
+  try {
+    const base = process.env.SOLSCAN_API_URL;
+    if (!base) return null;
+    const url = `${base.replace(/\/+$/,'')}/account/transactions?address=${encodeURIComponent(address)}&limit=50`;
+    const axios = (await import('axios')).default;
+    const start = Date.now();
+    enrichmentMetrics.solscanCalls++;
+    const r = await axios.get(url, { timeout: 8000 });
+    enrichmentMetrics.solscanTotalMs += (Date.now() - start);
+    const items: any[] = Array.isArray(r.data) ? r.data : (r.data?.data || []);
+    if (!items || items.length === 0) {
+      enrichmentMetrics.solscanFailures++;
+      return null;
+    }
+    let earliest = Number.MAX_SAFE_INTEGER;
+    for (const it of items) {
+      const bt = it.blockTime || it.block_time || it.timestamp || it.time;
+      if (!bt) continue;
+      if (bt > 1e9 && bt < 1e12) earliest = Math.min(earliest, bt * 1000);
+      else if (bt > 1e12) earliest = Math.min(earliest, bt);
+      else if (bt < 1e9) earliest = Math.min(earliest, bt * 1000);
+    }
+    const resultMs = (earliest === Number.MAX_SAFE_INTEGER) ? null : earliest;
+    return resultMs;
+  } catch (e) {
+    enrichmentMetrics.solscanFailures++;
+    return null;
+  }
+}
+
+export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: number; delayMs?: number }) {
+  const batchSize = opts?.batchSize ?? Number(process.env.HELIUS_BATCH_SIZE || 8);
+  const delayMs = opts?.delayMs ?? Number(process.env.HELIUS_BATCH_DELAY_MS || 500);
+  const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 20);
+  // Build canonical address -> token map
+  const addrMap = new Map<string, any>();
+  for (const t of tokens) {
+    const key = t.tokenAddress || t.address || t.mint || t.pairAddress;
+    if (key) addrMap.set(key, t);
+  }
+  // Rank candidates by liquidity then volume (desc)
+  const candidates = Array.from(addrMap.entries()).map(([addr, t]) => ({ addr, token: t, score: (Number(t.liquidity || 0) + Number(t.volume || 0)) }));
+  candidates.sort((a, b) => (b.score || 0) - (a.score || 0));
+  const toEnrich = candidates.slice(0, Math.min(enrichLimit, candidates.length)).map(c => c.addr);
+  // Summary counters
+  let enrichedCount = 0;
+  let skippedCount = 0;
+  let errorCount = 0;
+  // Enrich in small batches to avoid bursts
+  for (let i = 0; i < toEnrich.length; i += batchSize) {
+    const batch = toEnrich.slice(i, i + batchSize);
+    const results: Array<number | null> = [];
+    for (const addr of batch) {
+      try {
+        // Prefer Solscan (lower rate) first if configured
+        let ts = null as number | null;
+        if ((process.env.SOLSCAN_FALLBACK_ENABLED || 'true') === 'true' && process.env.SOLSCAN_API_URL) {
+          try { ts = await getFirstTxTimestampFromSolscan(addr); } catch (e) { ts = null; }
+        }
+        // If Solscan didn't return, try Helius (RPC/parse)
+        if (!ts) {
+          try { ts = await getFirstTxTimestampFromHelius(addr); } catch (e) { ts = null; }
+        }
+        // Last-resort RPC fallback
+        if (!ts && (process.env.HELIUS_FALLBACK_ENABLED || 'true') === 'true') {
+          try { ts = await getFirstTxTimestampFromRpc(addr); } catch (e) { ts = null; }
+        }
+        results.push(ts);
+      } catch (e) {
+        errorCount++;
+        results.push(null);
+      }
+    }
+    // Apply results to tokens
+    for (let j = 0; j < batch.length; j++) {
+      const addr = batch[j];
+      const tsMs = results[j];
+      const token = addrMap.get(addr);
+      if (!token) { skippedCount++; continue; }
+      if (tsMs) {
+        token.poolOpenTimeMs = tsMs;
+        token.ageSeconds = Math.floor((Date.now() - tsMs) / 1000);
+        token.ageMinutes = Math.floor(token.ageSeconds / 60);
+        enrichedCount++;
+      } else {
+        skippedCount++;
+      }
+    }
+    if (i + batchSize < toEnrich.length) await sleep(delayMs);
+  }
+  // Final concise log
+  // Avoid printing repetitive messages; print a single-line summary
+  console.log(`Enrichment summary: attempted=${toEnrich.length} enriched=${enrichedCount} skipped=${skippedCount} errors=${errorCount}`);
+}
+
+export function getEnrichmentMetrics() {
+  return { ...enrichmentMetrics };
 }
 
 // ========== Formatting and display functions ==========
@@ -625,14 +987,27 @@ export function autoFilterTokens(tokens: any[], strategy: Record<string, any>): 
       if (field.tokenField === 'volume' && tokenValue && typeof tokenValue === 'object' && typeof tokenValue.h24 === 'number') {
         tokenValue = tokenValue.h24;
       }
+      // Handle age specially: prefer ageSeconds if present, else try tokenValue conversions
       if (field.tokenField === 'age') {
-        let ageVal = tokenValue;
-        if (typeof ageVal === 'string') ageVal = Number(ageVal);
-        if (ageVal > 1e12) {
-          tokenValue = Math.floor((Date.now() - ageVal) / 60000);
-        } else if (ageVal > 1e9) {
-          tokenValue = Math.floor((Date.now() - ageVal * 1000) / 60000);
+        // Strategy value may be duration string like '30s' or number (legacy minutes)
+        const minAgeSeconds = parseDuration(value) ?? undefined;
+        // token may have ageSeconds, or ageMinutes, or various timestamp formats
+        let tokenAgeSeconds: number | undefined = undefined;
+        if (typeof token.ageSeconds === 'number' && !isNaN(token.ageSeconds)) tokenAgeSeconds = token.ageSeconds;
+        else if (typeof token.ageMinutes === 'number' && !isNaN(token.ageMinutes)) tokenAgeSeconds = Math.floor(token.ageMinutes * 60);
+        else if (typeof tokenValue === 'number' && !isNaN(tokenValue)) {
+          // tokenValue might be a timestamp or minutes; try to detect
+          if (tokenValue > 1e12) tokenAgeSeconds = Math.floor((Date.now() - tokenValue) / 1000);
+          else if (tokenValue > 1e9) tokenAgeSeconds = Math.floor((Date.now() - tokenValue * 1000) / 1000);
+          else tokenAgeSeconds = Math.floor(Number(tokenValue) * 60);
         }
+        // If user provided a duration (minAgeSeconds) and token age unknown, fail the filter for strict fields
+        if (minAgeSeconds !== undefined && (tokenAgeSeconds === undefined || isNaN(tokenAgeSeconds))) {
+          if (!field.optional) return false;
+          else continue;
+        }
+        // Attach tokenValue as seconds for subsequent comparisons
+        tokenValue = tokenAgeSeconds;
       }
       // تطبيع القيمة الرقمية دائماً
       tokenValue = extractNumeric(tokenValue);
@@ -646,13 +1021,20 @@ export function autoFilterTokens(tokens: any[], strategy: Record<string, any>): 
         }
       }
       if (field.type === "number") {
-        if (field.key.startsWith("min") && !isNaN(numValue)) {
-          if (numTokenValue < numValue) {
+        // For age fields, strategy values may be duration strings => parsed as seconds earlier
+        let compareValue = numValue;
+        // If this is an age field and user specified string durations, parseDuration will convert; otherwise use number
+        if (field.tokenField === 'age') {
+          const parsed = parseDuration(value);
+          if (!isNaN(Number(parsed))) compareValue = parsed ?? numValue * 60; // legacy: numeric strategy considered minutes
+        }
+        if (field.key.startsWith("min") && !isNaN(compareValue)) {
+          if (numTokenValue < compareValue) {
             return false;
           }
         }
-        if (field.key.startsWith("max") && !isNaN(numValue)) {
-          if (numTokenValue > numValue) {
+        if (field.key.startsWith("max") && !isNaN(compareValue)) {
+          if (numTokenValue > compareValue) {
             return false;
           }
         }
@@ -712,4 +1094,32 @@ export function logTrade(trade: {
   status: string;
 }) {
   console.log(`[TRADE] ${trade.action} | ${trade.source} | Token: ${trade.token} | Amount: ${trade.amount} | Price: ${trade.price} | Tx: ${trade.tx} | Latency: ${trade.latency}ms | Status: ${trade.status}`);
+}
+
+/**
+ * finalJupiterCheck: lightweight verification that a Jupiter route exists for a mint and amount.
+ * Returns { ok: boolean, reason?: string }
+ * This helper is intentionally permissive: when the Jupiter API is not configured it returns ok=true.
+ */
+export async function finalJupiterCheck(mint: string, buyAmountSol: number, opts?: { minJupiterUsd?: number; requireRoute?: boolean; timeoutMs?: number }) {
+  try {
+  const cfgMod = await import('../config');
+  const cfg = (cfgMod as any) && ((cfgMod as any).default || cfgMod);
+  const { JUPITER_QUOTE_API } = cfg || {};
+    const timeout = opts?.timeoutMs || 3000;
+    // If the environment does not provide a Jupiter quote API, allow by default
+    if (!JUPITER_QUOTE_API) return { ok: true, reason: 'no-jupiter-api' };
+    if (!mint) return { ok: false, reason: 'no-mint' };
+    // Amount: default to $50 if not specified
+    const amountUsd = opts?.minJupiterUsd || 50;
+    const lamports = Math.floor((amountUsd / 1) * 1e9);
+    const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${encodeURIComponent(mint)}&amount=${lamports}&slippage=1`;
+    const axios = (await import('axios')).default;
+    const res = await axios.get(url, { timeout });
+    if (res && res.data) return { ok: true };
+    return { ok: false, reason: 'no-data' };
+  } catch (err: any) {
+    // If the caller does not require Jupiter strictly, return ok=false but include reason
+    return { ok: false, reason: err?.message || String(err) };
+  }
 }

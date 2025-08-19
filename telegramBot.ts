@@ -37,6 +37,120 @@ const CACHE_TTL = 1000 * 60 * 2;
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
 
+// Per-user token cache to allow fetching tailored token lists per-user strategy
+const userTokenCache: Record<string, { tokens: any[]; ts: number }> = {};
+
+async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
+  const now = Date.now();
+  // If user has no strategy or empty filters, reuse global cache for efficiency
+  if (!strategy || Object.keys(strategy).length === 0) {
+    if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
+      try {
+        globalTokenCache = await fetchDexScreenerTokens('solana');
+        lastCacheUpdate = Date.now();
+      } catch (e: any) {
+        console.error('[getTokensForUser] Failed to refresh globalTokenCache:', e?.message || e);
+      }
+    }
+    return globalTokenCache;
+  }
+
+  // Check per-user cache
+  const cached = userTokenCache[userId];
+  if (cached && now - cached.ts < CACHE_TTL) return cached.tokens;
+
+  // Build extra params from strategy fields (only numeric/boolean filters)
+  const extraParams: Record<string, string> = {};
+  try {
+    for (const f of STRATEGY_FIELDS) {
+      if (!(f.key in strategy)) continue;
+      const v = strategy[f.key];
+      if (v === undefined || v === null) continue;
+      if (f.type === 'number') {
+        const n = Number(v);
+        if (!isNaN(n) && n !== 0) extraParams[f.key] = String(n);
+      } else if (f.type === 'boolean') {
+        extraParams[f.key] = v ? '1' : '0';
+      } else {
+        extraParams[f.key] = String(v);
+      }
+    }
+  } catch (e) {
+    console.error('[getTokensForUser] Error building extraParams from strategy', e);
+  }
+
+  // If no meaningful params, fall back to global cache
+  if (Object.keys(extraParams).length === 0) {
+    if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
+      try {
+        globalTokenCache = await fetchDexScreenerTokens('solana');
+        lastCacheUpdate = Date.now();
+      } catch (e: any) {
+        console.error('[getTokensForUser] Fallback failed to refresh globalTokenCache:', e?.message || e);
+      }
+    }
+    return globalTokenCache;
+  }
+
+  // Try to fetch with user-specific params. If it fails, fall back to global cache.
+  try {
+    const tokens = await fetchDexScreenerTokens('solana', extraParams);
+    // If strategy references age, apply fast numeric pre-filters (exclude age)
+    try {
+      const needsAge = Object.keys(strategy).some(k => k.toLowerCase().includes('age'));
+      if (needsAge) {
+        // Build a shallow strategy copy without age-related fields
+        const fastStrategy: Record<string, any> = {};
+        for (const k of Object.keys(strategy)) {
+          if (String(k).toLowerCase().includes('age')) continue;
+          fastStrategy[k] = strategy[k];
+        }
+        // Use tokenUtils.autoFilterTokens for quick numeric filtering
+        const tokenUtils = await import('./src/utils/tokenUtils');
+        const prefiltered = (() => {
+          try { return tokenUtils.autoFilterTokens(tokens, fastStrategy); } catch { return tokens; }
+        })();
+        const resolvedPrefiltered = Array.isArray(prefiltered) ? prefiltered : tokens;
+        // enrich only top candidates (by liquidity then volume)
+        const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 25);
+        // sort candidates by liquidity (fallback to volume or marketCap)
+        const ranked = resolvedPrefiltered.slice().sort((a: any, b: any) => {
+          const la = (a.liquidity || a.liquidityUsd || 0) as number;
+          const lb = (b.liquidity || b.liquidityUsd || 0) as number;
+          if (lb !== la) return lb - la;
+          const va = (a.volume || a.volumeUsd || 0) as number;
+          const vb = (b.volume || b.volumeUsd || 0) as number;
+          return vb - va;
+        });
+        const toEnrich = ranked.slice(0, enrichLimit);
+        const { enrichTokenTimestamps } = await import('./src/utils/tokenUtils');
+        await enrichTokenTimestamps(toEnrich, { batchSize: Number(process.env.HELIUS_BATCH_SIZE || 8), delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 250) });
+        // Merge enriched timestamps back into tokens list for returned set
+        const enrichedMap = new Map(toEnrich.map((t: any) => [(t.tokenAddress || t.address || t.mint || t.pairAddress), t]));
+        for (let i = 0; i < tokens.length; i++) {
+          const key = tokens[i].tokenAddress || tokens[i].address || tokens[i].mint || tokens[i].pairAddress;
+          if (enrichedMap.has(key)) tokens[i] = enrichedMap.get(key);
+        }
+      }
+    } catch (e) {
+      console.error('[getTokensForUser] enrichment error:', e?.message || e);
+    }
+    userTokenCache[userId] = { tokens, ts: Date.now() };
+    return tokens;
+  } catch (e: any) {
+    console.error('[getTokensForUser] Failed to fetch tokens with extraParams, falling back to global cache:', e?.message || e);
+    if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
+      try {
+        globalTokenCache = await fetchDexScreenerTokens('solana');
+        lastCacheUpdate = Date.now();
+      } catch (err: any) {
+        console.error('[getTokensForUser] Final fallback failed to refresh globalTokenCache:', err?.message || err);
+      }
+    }
+    return globalTokenCache;
+  }
+}
+
 // Strategy state machine for interactive setup (single declaration)
 const userStrategyStates: Record<string, { step: number, values: Record<string, any>, phase?: string, tradeSettings?: Record<string, any> }> = {};
 
@@ -51,13 +165,10 @@ bot.command('auto_execute', async (ctx) => {
     return;
   }
   const now = Date.now();
-  if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
-    globalTokenCache = await fetchDexScreenerTokens('solana');
-    lastCacheUpdate = now;
-  }
+  const tokens = await getTokensForUser(userId, user.strategy);
   await ctx.reply('Executing your strategy on matching tokens...');
   try {
-    await autoExecuteStrategyForUser(user, globalTokenCache, 'buy');
+    await autoExecuteStrategyForUser(user, tokens, 'buy');
     await ctx.reply('Strategy executed successfully!');
   } catch (e: any) {
     await ctx.reply('Error during auto execution: ' + getErrorMessage(e));
@@ -144,11 +255,8 @@ bot.command('notify_tokens', async (ctx) => {
     return;
   }
   const now = Date.now();
-  if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
-    globalTokenCache = await fetchDexScreenerTokens('solana');
-    lastCacheUpdate = now;
-  }
-  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(globalTokenCache, user.strategy));
+  const tokens = await getTokensForUser(userId, user.strategy);
+  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy));
   if (!filteredTokens.length) {
     await ctx.reply('No tokens currently match your strategy.');
     return;
@@ -221,16 +329,15 @@ async function notifyAutoSell(user: any, sellOrder: any) {
 
 setInterval(async () => {
   console.log(`[monitorAndAutoSellTrades] Interval triggered`);
-  if (!globalTokenCache || !Array.isArray(globalTokenCache)) return;
   if (!users || typeof users !== 'object') return;
-  const tokens = globalTokenCache;
   for (const userId in users) {
     if (!userId || userId === 'undefined') {
       console.warn('[monitorAndAutoSellTrades] Invalid userId, skipping.');
       continue;
     }
-    const user = users[userId];
-    await monitorAndAutoSellTrades(user, tokens);
+  const user = users[userId];
+  const tokensForUser = await getTokensForUser(userId, user?.strategy);
+  await monitorAndAutoSellTrades(user, tokensForUser);
     const sentTokensDir = process.cwd() + '/sent_tokens';
     const userFile = `${sentTokensDir}/${userId}.json`;
     try {
@@ -394,12 +501,8 @@ bot.on('text', async (ctx, next) => {
           await ctx.reply('❌ You must set a strategy first using /strategy');
           return;
         }
-        const now = Date.now();
-        if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
-          globalTokenCache = await fetchDexScreenerTokens('solana');
-          lastCacheUpdate = now;
-        }
-  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(globalTokenCache, user.strategy));
+    const tokens = await getTokensForUser(userId, user.strategy);
+  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy));
         const maxTrades = user.strategy.maxTrades && user.strategy.maxTrades > 0 ? user.strategy.maxTrades : 5;
         const tokensToTrade = filteredTokens.slice(0, maxTrades);
         if (!tokensToTrade.length) {
