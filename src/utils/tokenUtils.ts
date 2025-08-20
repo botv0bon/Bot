@@ -578,6 +578,79 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
   }
 
   try {
+    // Optional: try Helius WebSocket RPC when configured (preferred for live parsed streams)
+    if ((process.env.HELIUS_USE_WEBSOCKET || 'false') === 'true' && process.env.HELIUS_WEBSOCKET_URL) {
+      try {
+  const wsMod = await import('ws');
+  const WebSocketCtor: any = (wsMod && (wsMod.default || wsMod));
+  const wsUrl = process.env.HELIUS_WEBSOCKET_URL as string;
+  const socket: any = new WebSocketCtor(wsUrl);
+        // wait open
+        await new Promise((resolve, reject) => {
+          const to = setTimeout(() => reject(new Error('ws open timeout')), 5000);
+          socket.once('open', () => { clearTimeout(to); resolve(null); });
+          socket.once('error', (err: any) => { clearTimeout(to); reject(err); });
+        });
+        const sigLimit = Number(process.env.HELIUS_SIG_LIMIT || 20);
+        const reqId = Math.floor(Math.random() * 1e9);
+        const req = { jsonrpc: '2.0', id: reqId, method: 'getSignaturesForAddress', params: [address, { limit: sigLimit }] };
+        socket.send(JSON.stringify(req));
+        const sigsResp: any = await new Promise((resolve, reject) => {
+          const to = setTimeout(() => reject(new Error('ws sigs timeout')), 10000);
+          const onMsg = (msg: any) => {
+            try {
+              const o = JSON.parse(msg.toString());
+              if (o.id === reqId) {
+                clearTimeout(to);
+                socket.removeListener('message', onMsg);
+                resolve(o);
+              }
+            } catch (e) {}
+          };
+          socket.on('message', onMsg);
+          socket.on('error', (err: any) => { clearTimeout(to); socket.removeListener('message', onMsg); reject(err); });
+        }).catch(() => null as any);
+        if (sigsResp && (sigsResp.result || sigsResp.value)) {
+          const sigs = sigsResp.result || sigsResp.value;
+          let earliestMs: number | null = null;
+          // fetch transactions sequentially (bounded) to avoid bursts
+          for (const s of sigs) {
+            try {
+              const txReqId = Math.floor(Math.random() * 1e9);
+              const txReq = { jsonrpc: '2.0', id: txReqId, method: 'getTransaction', params: [s.signature, { commitment: 'confirmed' }] };
+              socket.send(JSON.stringify(txReq));
+              const txResp: any = await new Promise((resolve, reject) => {
+                const to = setTimeout(() => reject(new Error('ws tx timeout')), 7000);
+                const onMsg = (msg: any) => {
+                  try {
+                    const o = JSON.parse(msg.toString());
+                    if (o.id === txReqId) {
+                      clearTimeout(to);
+                      socket.removeListener('message', onMsg);
+                      resolve(o);
+                    }
+                  } catch (e) {}
+                };
+                socket.on('message', onMsg);
+                socket.on('error', (err: any) => { clearTimeout(to); socket.removeListener('message', onMsg); reject(err); });
+              }).catch(() => null as any);
+              const tx = txResp && (txResp.result || txResp.value) ? (txResp.result || txResp.value) : null;
+              const bt = tx?.blockTime;
+              if (bt) {
+                const ms = (bt > 1e9 && bt < 1e12) ? bt * 1000 : (bt > 1e12 ? bt : bt * 1000);
+                if (!earliestMs || ms < earliestMs) earliestMs = ms;
+              }
+            } catch (e) { /* ignore per-tx failures */ }
+          }
+          try { socket.close(); } catch (e) {}
+          if (earliestMs) { heliusTimestampCache[address] = { ts: earliestMs, fetchedAt: Date.now() }; return earliestMs; }
+        } else {
+          try { socket.close(); } catch (e) {}
+        }
+      } catch (e) {
+        // websocket attempt failed - continue to next methods
+      }
+    }
     // 1) Try Helius RPC endpoint via solana web3 (best for paid keys)
     if (heliusRpc) {
       try {
@@ -686,6 +759,9 @@ async function getFirstTxTimestampFromSolscan(address: string): Promise<number |
     return null;
   }
 }
+
+// --- Debug exports (temporary): expose internal helpers for diagnosis
+export { getFirstTxTimestampFromHelius, getFirstTxTimestampFromSolscan, getFirstTxTimestampFromRpc };
 
 // ----- On-chain activity quick checks -----
 export async function checkOnChainActivity(address: string): Promise<{ firstTxMs: number | null; found: boolean }> {
@@ -1126,8 +1202,15 @@ export function autoFilterTokens(tokens: any[], strategy: Record<string, any>): 
           else if (tokenValue > 1e9) tokenAgeSeconds = Math.floor((Date.now() - tokenValue * 1000) / 1000);
           else tokenAgeSeconds = Math.floor(Number(tokenValue) * 60);
         }
-        // If user provided a duration (minAgeSeconds) and token age unknown, fail the filter for strict fields
+        // If user provided a duration (minAgeSeconds) and token age unknown, decide behavior:
+        // - If the user requested a very small minimum age (<= 1 minute), treat missing age as acceptable.
+        // - Otherwise, fail the filter for strict fields (or skip if optional).
         if (minAgeSeconds !== undefined && (tokenAgeSeconds === undefined || isNaN(tokenAgeSeconds))) {
+          // allow missing age for very small minAge (<= 60 seconds)
+          if (minAgeSeconds <= 60) {
+            // consider this criterion satisfied when age is missing and user asked for <= 1 minute
+            continue;
+          }
           if (!field.optional) return false;
           else continue;
         }

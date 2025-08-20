@@ -1,8 +1,0 @@
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646661147,"chatId":123456789},"startedAt":1755646890556}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646661147,"chatId":123456789},"startedAt":1755651333952}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646661147,"chatId":123456789},"startedAt":1755651869066}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646661147,"chatId":123456789},"startedAt":1755651869066,"finishedAt":1755652730563,"resultCount":30}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646801476,"chatId":123456789},"startedAt":1755652731066}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646801476,"chatId":123456789},"startedAt":1755652731066,"finishedAt":1755653251906,"resultCount":30}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646841000,"chatId":123456789},"startedAt":1755653252409}
-{"job":{"userId":"testuser","strategy":{"minAge":1},"requestTs":1755646841000,"chatId":123456789},"startedAt":1755653252409,"finishedAt":1755653698647,"resultCount":30}

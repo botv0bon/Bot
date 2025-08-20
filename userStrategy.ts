@@ -1,12 +1,41 @@
-import { Connection, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { connection as sharedConnection } from './src/config';
 /**
  * Fetch the user's Solana balance
  */
+// Simple in-memory cache for decoded Keypairs to avoid repeated expensive decoding
+const __keypairCache: Map<string, Keypair> = new Map();
+
 export async function getSolBalance(userSecret: string): Promise<number> {
-  const connection = new Connection('https://api.mainnet-beta.solana.com');
-  const secretKey = Uint8Array.from(Buffer.from(userSecret, 'base64'));
-  const keypair = require('@solana/web3.js').Keypair.fromSecretKey(secretKey);
-  const balance = await connection.getBalance(keypair.publicKey);
+  const conn: Connection = (sharedConnection as Connection) || new Connection(process.env.MAINNET_RPC || 'https://api.mainnet-beta.solana.com');
+  if (!userSecret) return 0;
+  // Try cached keypair first
+  let keypair = __keypairCache.get(userSecret);
+  if (!keypair) {
+    let secretKey: Uint8Array | null = null;
+    try {
+      // common encoding: base64
+      secretKey = Uint8Array.from(Buffer.from(userSecret, 'base64'));
+    } catch (e) {
+      try {
+        // fallback: base58
+        const bs58 = require('bs58');
+        secretKey = Uint8Array.from(bs58.decode(userSecret));
+      } catch (e) {
+        // final fallback: attempt JSON array
+        try {
+          const arr = JSON.parse(userSecret);
+          if (Array.isArray(arr)) secretKey = Uint8Array.from(arr);
+        } catch (e) {
+          secretKey = null;
+        }
+      }
+    }
+    if (!secretKey) throw new Error('Invalid user secret format');
+    keypair = Keypair.fromSecretKey(secretKey);
+    try { __keypairCache.set(userSecret, keypair); } catch {}
+  }
+  const balance = await conn.getBalance(keypair.publicKey);
   return balance / 1e9; // تحويل من lamports إلى SOL
 }
 import fs from 'fs';

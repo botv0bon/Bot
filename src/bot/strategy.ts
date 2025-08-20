@@ -271,108 +271,95 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
       console.warn('[filterTokensByStrategy] enrichment failed or timed out:', e?.message || e);
     }
   }
-  // Use getField from tokenUtils for robust field extraction
-  const { getField } = require('../utils/tokenUtils');
-  const filtered = tokens.filter(token => {
-  const name = token.address || token.symbol || token.name || token.tokenAddress || 'n/a';
-  // Price in USD
-  let price = Number(getField(token, 'priceUsd', 'price', 'priceNative', 'baseToken.priceUsd', 'baseToken.price'));
-  if (isNaN(price)) price = 0;
-  if (strategy.minPrice !== undefined && price < strategy.minPrice) return false;
-  if (strategy.maxPrice !== undefined && price > strategy.maxPrice) return false;
+  // Use helpers from tokenUtils for robust field extraction and fast filtering
+  const utils = require('../utils/tokenUtils');
+  const { getField, autoFilterTokens, parseDuration } = utils;
 
-    // Market Cap
-    const marketCap = Number(getField(token, 'marketCap', 'fdv', 'baseToken.marketCap', 'baseToken.fdv'));
-    if (strategy.minMarketCap !== undefined && marketCap < strategy.minMarketCap) {
-      return false;
-    }
+  // 1) Fast pass: use `autoFilterTokens` for the simple numeric checks (marketCap, liquidity, volume, basic age rules)
+  const prelim = autoFilterTokens(tokens, strategy);
 
-    // Liquidity
-  const liquidity = Number(getField(token, 'liquidity', 'liquidityUsd', 'baseToken.liquidity', 'baseToken.liquidityUsd'));
-  if (isNaN(liquidity)) { /* treat as 0 */ }
-  if (strategy.minLiquidity !== undefined && liquidity < strategy.minLiquidity) return false;
+  // 2) Apply the remaining, more expensive or strict checks on the pre-filtered list
+  const filtered = prelim.filter(token => {
+    // Price checks (optional)
+    const price = Number(getField(token, 'priceUsd', 'price', 'priceNative', 'baseToken.priceUsd', 'baseToken.price')) || 0;
+    if (strategy.minPrice !== undefined && price < strategy.minPrice) return false;
+    if (strategy.maxPrice !== undefined && price > strategy.maxPrice) return false;
 
-    // Volume
-  let volume = Number(getField(token, 'volume', 'volume24h', 'amount', 'totalAmount', 'baseToken.volume', 'baseToken.amount'));
-  if (isNaN(volume)) volume = 0;
-  if (strategy.minVolume !== undefined && volume < strategy.minVolume) return false;
+    // Holders check (may not be covered by autoFilterTokens depending on STRATEGY_FIELDS)
+    const holders = Number(getField(token, 'holders', 'totalAmount', 'baseToken.holders', 'baseToken.totalAmount')) || 0;
+    if (strategy.minHolders !== undefined && holders < strategy.minHolders) return false;
 
-    // Holders
-  const holders = Number(getField(token, 'holders', 'totalAmount', 'baseToken.holders', 'baseToken.totalAmount'));
-  if (isNaN(holders)) { /* treat as 0 */ }
-  if (strategy.minHolders !== undefined && holders < strategy.minHolders) return false;
-
-    // Age in minutes (robust extraction)
-    let ageMinutes: number | undefined = undefined;
-    // Try a broad set of possible fields that different sources use
-    let ageVal = getField(token,
-      'ageMinutes', 'age', 'createdAt', 'created_at', 'creation_date', 'created',
-      'poolOpenTime', 'listed_at', 'listedAt', 'genesis_date', 'published_at',
+    // Age checks: compute age in seconds with no integer-flooring to preserve fractional minutes/seconds
+    let ageSeconds: number | undefined = undefined;
+    const ageVal = getField(token,
+      'ageSeconds', 'ageMinutes', 'age', 'createdAt', 'created_at', 'creation_date', 'created',
+      'poolOpenTime', 'poolOpenTimeMs', 'listed_at', 'listedAt', 'genesis_date', 'published_at',
       'time', 'timestamp', 'first_trade_time', 'baseToken.createdAt', 'baseToken.published_at'
     );
-    // Normalize common string formats
-    if (typeof ageVal === 'string') {
-      const s = ageVal.trim();
-      // plain number string
-      if (/^\d+$/.test(s)) {
-        ageVal = Number(s);
-      } else if (/^\d+\.?\d*\s*(m|min|minute)s?$/i.test(s)) {
-        // e.g. "5m" or "5 min"
-        const n = Number(s.match(/\d+\.?\d*/)?.[0] || 0);
-        ageVal = n;
-      } else if (/^\d+\.?\d*\s*(h|hr|hour)s?$/i.test(s)) {
-        const n = Number(s.match(/\d+\.?\d*/)?.[0] || 0);
-        ageVal = n * 60;
-      } else if (/^\d{4}-\d{2}-\d{2}/.test(s) || /T/.test(s)) {
-        // ISO-ish datetime
-        const parsed = Date.parse(s);
-        if (!isNaN(parsed)) ageVal = parsed;
-      } else if (!isNaN(Number(s))) {
-        ageVal = Number(s);
+    if (ageVal !== undefined && ageVal !== null) {
+      if (typeof ageVal === 'number') {
+        if (ageVal > 1e12) { // ms timestamp
+          ageSeconds = (Date.now() - ageVal) / 1000;
+        } else if (ageVal > 1e9) { // s timestamp
+          ageSeconds = (Date.now() - ageVal * 1000) / 1000;
+        } else {
+          // treat as minutes
+          ageSeconds = Number(ageVal) * 60;
+        }
+      } else if (typeof ageVal === 'string') {
+        // try numeric string
+        const n = Number(ageVal);
+        if (!isNaN(n)) {
+          if (n > 1e9) ageSeconds = (Date.now() - n * 1000) / 1000;
+          else ageSeconds = n * 60;
+        } else {
+          // try duration parse (parseDuration returns seconds)
+          const parsed = parseDuration(ageVal);
+          if (parsed !== undefined) ageSeconds = parsed;
+          else {
+            const parsedDate = Date.parse(ageVal);
+            if (!isNaN(parsedDate)) ageSeconds = (Date.now() - parsedDate) / 1000;
+          }
+        }
       }
+    } else if (typeof token.ageSeconds === 'number') {
+      ageSeconds = token.ageSeconds;
+    } else if (typeof token.ageMinutes === 'number') {
+      ageSeconds = token.ageMinutes * 60;
     }
-    // Numeric handling
-    if (typeof ageVal === 'number' && !isNaN(ageVal)) {
-      // heuristics: ms epoch (>1e12), s epoch (>1e9), minutes (small)
-      if (ageVal > 1e12) { // ms timestamp
-        ageMinutes = Math.floor((Date.now() - ageVal) / 60000);
-      } else if (ageVal > 1e9) { // s timestamp
-        ageMinutes = Math.floor((Date.now() - ageVal * 1000) / 60000);
-      } else if (ageVal > 0 && ageVal < 1e7) { // likely minutes
-        ageMinutes = Math.floor(ageVal);
-      }
-    }
-    // If we couldn't determine ageMinutes: fallback behavior
-    const DEFAULT_MAX_AGE_MINUTES = Number(process.env.DEFAULT_MAX_AGE_MINUTES || 10000);
-  const maxAge = typeof (strategy as any).maxAge === 'number' ? (strategy as any).maxAge : DEFAULT_MAX_AGE_MINUTES;
-    if (typeof ageMinutes !== 'number' || isNaN(ageMinutes)) {
-      // permissive: if user requested minAge <= 1, accept tokens with unknown age
-      if (typeof strategy.minAge === 'number' && strategy.minAge <= 1) {
-        // accept by fallback
+
+    // If age is unknown and strategy requires strict minAge > 60s, fail; otherwise allow (keeps parity with autoFilterTokens permissive rule)
+    const minAgeSeconds = strategy.minAge !== undefined ? (typeof strategy.minAge === 'string' ? parseDuration(strategy.minAge) : Number(strategy.minAge) * 60) : undefined;
+    if (minAgeSeconds !== undefined) {
+      if (ageSeconds === undefined || isNaN(ageSeconds)) {
+        if (minAgeSeconds > 60) return false; // strict requirement
       } else {
-        return false;
-      }
-    } else {
-      if (strategy.minAge !== undefined && ageMinutes < strategy.minAge) {
-        return false;
-      }
-      // Reject tokens that are excessively old unless user explicitly sets a larger maxAge
-      if (typeof maxAge === 'number' && ageMinutes > maxAge) {
-        return false;
+        if (ageSeconds < minAgeSeconds) return false;
       }
     }
 
-  // Verification
-  const verified = getField(token, 'verified', 'baseToken.verified') === true || getField(token, 'verified', 'baseToken.verified') === 'true';
-  if (strategy.onlyVerified === true && !verified) return false;
+    // Freshness / on-chain requirement checks
+    try {
+      const minFresh = (strategy as any)?.minFreshnessScore !== undefined ? Number((strategy as any).minFreshnessScore) : undefined;
+      if (!isNaN(Number(minFresh)) && typeof token.freshnessScore === 'number') {
+        if ((token.freshnessScore || 0) < Number(minFresh)) return false;
+      }
+      if ((strategy as any)?.requireOnchain) {
+        const onChainTs = token?.freshnessDetails?.onChainTs || token?.freshnessDetails?.firstTxMs || null;
+        if (!onChainTs) return false;
+      }
+    } catch (e) {
+      // ignore scoring errors and proceed
+    }
 
-  // Jupiter integration: allow strategy to require Jupiter route or min swap USD
-  // Jupiter/pump are enrichment-only sources now; do not use them as hard filters here.
+    // Verification
+    const verified = getField(token, 'verified', 'baseToken.verified') === true || getField(token, 'verified', 'baseToken.verified') === 'true';
+    if (strategy.onlyVerified === true && !verified) return false;
 
-  // Strategy enabled
-  if (strategy.enabled === false) return false;
+    // Strategy enabled check
+    if (strategy.enabled === false) return false;
 
-  return true;
+    return true;
   });
   return filtered;
 }
