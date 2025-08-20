@@ -274,10 +274,10 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
       const needOfficial = (typeof strat.buyAmount === 'number' && strat.buyAmount > 0) || strat.autoBuy !== false;
       let workCache = __global_fetch_cache;
       if (needOfficial && Array.isArray(workCache) && workCache.length > 0) {
-        const sampleSize = 200;
-        const sample = workCache.slice(0, sampleSize);
-        const { officialEnrich } = require('./utils/tokenUtils');
-        const concurrency = 5;
+  const sampleSize = Number(process.env.FASTFETCH_SAMPLE_SIZE || 40);
+  const sample = workCache.slice(0, sampleSize);
+  const { officialEnrich } = require('./utils/tokenUtils');
+  const concurrency = Number(process.env.FASTFETCH_ENRICH_CONCURRENCY || 1);
         let idx = 0;
         async function worker() {
           while (idx < sample.length) {
@@ -287,7 +287,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
           }
         }
         const workers = Array.from({ length: Math.min(concurrency, sample.length) }, () => worker());
-        const globalTimeoutMs = 10000;
+  const globalTimeoutMs = Number(process.env.FASTFETCH_GLOBAL_TIMEOUT_MS || 4000);
         await Promise.race([ Promise.all(workers), new Promise(res => setTimeout(res, globalTimeoutMs)) ]);
         workCache = [...sample, ...workCache.slice(sampleSize)];
       }
@@ -330,7 +330,7 @@ function extractMintFromItemLocal(it: any): string | null {
   return it.tokenAddress || it.mint || it.address || null;
 }
 
-export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, timeout = 2500, retries = 1) {
+export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, timeout = 2500, retries = 0) {
   const payload = { jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [mint, { limit: 3 }] };
   let attempt = 0;
   while (attempt <= retries) {
@@ -354,7 +354,7 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
 
 // Handle a new mint event: attempt quick enrichment (first signature => blockTime) and log
 // --- Helpers: lightweight helius/json-rpc wrapper and verification helpers
-async function heliusRpc(method: string, params: any[] = [], timeout = 4000, retries = 1): Promise<any> {
+async function heliusRpc(method: string, params: any[] = [], timeout = 4000, retries = 0): Promise<any> {
   const heliusUrl = process.env.HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL;
   if (!heliusUrl) return { __error: 'no-helius-url' };
   const payload = { jsonrpc: '2.0', id: 1, method, params };
@@ -411,7 +411,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
       console.log('handleNewMintEvent: no helius url');
       return null;
     }
-    const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 1);
+  const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0);
     if (!r || r.__error) { if (r?.__error) console.log(`Enrich ${mint} error: ${r.__error}`); return null; }
     const arr = Array.isArray(r) ? r : (r.result ?? r);
     const first = Array.isArray(arr) && arr[0] ? arr[0] : null;
@@ -554,7 +554,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
         hostState[hk] = state;
         return;
       }
-      const r = await heliusGetSignaturesFast(t.mint, heliusUrl, timeoutMs, 1);
+  const r = await heliusGetSignaturesFast(t.mint, heliusUrl, timeoutMs, 0);
       if (r && r.__error) {
         // increment 429 counter if applicable
         if (String(r.__error).includes('http-429')) {
@@ -567,7 +567,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
         // fallback to HELIUS_RPC_URL if different and available
         const alt = process.env.HELIUS_RPC_URL;
         if (alt && alt !== heliusUrl) {
-          const r2 = await heliusGetSignaturesFast(t.mint, alt, timeoutMs, 1);
+          const r2 = await heliusGetSignaturesFast(t.mint, alt, timeoutMs, 0);
           if (r2 && r2.__error) {
             // try solscan fallback
             const solscanUrl = `${process.env.SOLSCAN_API_URL}/token/${t.mint}/transactions`;

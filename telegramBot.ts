@@ -9,6 +9,7 @@ import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
 import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokens, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
+import { enqueueEnrichJob, startEnrichQueue } from './src/bot/enrichQueue';
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
 import { startFastTokenFetcher } from './src/fastTokenFetcher';
@@ -123,8 +124,14 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
           return vb - va;
         });
         const toEnrich = ranked.slice(0, enrichLimit);
-        const { enrichTokenTimestamps } = await import('./src/utils/tokenUtils');
-        await enrichTokenTimestamps(toEnrich, { batchSize: Number(process.env.HELIUS_BATCH_SIZE || 8), delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 250) });
+        const { enrichTokenTimestamps, withTimeout } = await import('./src/utils/tokenUtils');
+        try {
+          const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
+          await withTimeout(enrichTokenTimestamps(toEnrich, { batchSize: Number(process.env.HELIUS_BATCH_SIZE || 8), delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 250) }), timeoutMs, 'getTokens-enrich');
+        } catch (e: any) {
+          // Keep a concise log and proceed with un-enriched token list to avoid blocking handlers
+          console.warn('[getTokensForUser] enrichment skipped/timeout:', e?.message || e);
+        }
         // Merge enriched timestamps back into tokens list for returned set
         const enrichedMap = new Map(toEnrich.map((t: any) => [(t.tokenAddress || t.address || t.mint || t.pairAddress), t]));
         for (let i = 0; i < tokens.length; i++) {
@@ -620,6 +627,7 @@ console.log('--- About to launch bot ---');
     try {
       users = await loadUsers();
       console.log('--- Users loaded (async) ---');
+      try { startEnrichQueue(bot.telegram, users, { intervalMs: 2000 }); } catch (err) { console.warn('Failed to start enrich queue early:', err); }
     } catch (e) { console.error('Failed to load users async:', e); users = loadUsersSync(); }
 
     // Register centralized buy/sell handlers now that users are loaded
@@ -627,14 +635,18 @@ console.log('--- About to launch bot ---');
 
     await bot.launch();
     console.log('✅ Bot launched successfully (polling)');
-    try {
-      // Start fast token fetcher to prioritize some users (1s polling)
-      const fast = startFastTokenFetcher(users, bot.telegram, { intervalMs: 1000 });
-      // Optionally keep a reference: globalThis.__fastFetcher = fast;
-      // Caller may call fast.stop() to stop it.
-    } catch (e) {
-      console.warn('Failed to start fast token fetcher:', e);
-    }
+      try {
+        // Start fast token fetcher to prioritize some users (1s polling)
+        const fast = startFastTokenFetcher(users, bot.telegram, { intervalMs: 1000 });
+        // Optionally keep a reference: globalThis.__fastFetcher = fast;
+        // Caller may call fast.stop() to stop it.
+        try {
+          // Start background enrich queue conservatively
+          startEnrichQueue(bot.telegram, users, { intervalMs: 2000 });
+        } catch (err) { console.warn('Failed to start enrich queue:', err); }
+      } catch (e) {
+        console.warn('Failed to start fast token fetcher:', e);
+      }
   } catch (err: any) {
     if (err?.response?.error_code === 409) {
       console.error('❌ Bot launch failed: Conflict 409. Make sure the bot is not running elsewhere or stop all other sessions.');
@@ -652,4 +664,22 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
+});
+
+// Lightweight show_token handler: enqueue background job and return immediately
+bot.command('show_token', async (ctx) => {
+  console.log(`[show_token] User: ${String(ctx.from?.id)}`);
+  const userId = String(ctx.from?.id);
+  const user = users[userId];
+  if (!user || !user.strategy || !user.strategy.enabled) {
+    await ctx.reply('❌ You must set a strategy first using /strategy');
+    return;
+  }
+  try {
+    await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id });
+    await ctx.reply('🔔 Your request is queued for background processing. You will be notified if matching tokens are found (this avoids long waits and provider rate limits).');
+  } catch (e) {
+    console.error('[show_token] enqueue error:', e);
+    await ctx.reply('❌ Failed to enqueue background job. Try again later.');
+  }
 });

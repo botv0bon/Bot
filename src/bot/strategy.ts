@@ -254,13 +254,21 @@ import type { Strategy } from './types';
  */
 export async function filterTokensByStrategy(tokens: any[], strategy: Strategy): Promise<any[]> {
   if (!strategy || !Array.isArray(tokens)) return [];
-  // Enrich a small sample to improve fetching accuracy (Jupiter/pump used for fetching only,
-  // not as hard filter conditions). This avoids blocking filtering on external APIs.
+  // Integrated enrichment: attempt to enrich tokens with on-chain timestamps and freshness
+  // using Helius (RPC/parse/websocket), Solscan and RPC fallbacks. This improves age
+  // detection and allows downstream freshness scoring to be used in filters.
   if (tokens.length > 0) {
     try {
-  // No local enrichment here — official enrichment is handled in fetcher when needed.
-    } catch (e) {
-      // ignore enrichment errors
+      const utils = await import('../utils/tokenUtils');
+      const enrichPromise = utils.enrichTokenTimestamps(tokens, {
+        batchSize: Number(process.env.HELIUS_BATCH_SIZE || 4),
+        delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 400)
+      });
+      const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
+      // Bound the enrichment so filtering remains responsive
+      await utils.withTimeout(enrichPromise, timeoutMs, 'filter-enrich');
+    } catch (e: any) {
+      console.warn('[filterTokensByStrategy] enrichment failed or timed out:', e?.message || e);
     }
   }
   // Use getField from tokenUtils for robust field extraction
@@ -335,6 +343,8 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
       }
     }
     // If we couldn't determine ageMinutes: fallback behavior
+    const DEFAULT_MAX_AGE_MINUTES = Number(process.env.DEFAULT_MAX_AGE_MINUTES || 10000);
+  const maxAge = typeof (strategy as any).maxAge === 'number' ? (strategy as any).maxAge : DEFAULT_MAX_AGE_MINUTES;
     if (typeof ageMinutes !== 'number' || isNaN(ageMinutes)) {
       // permissive: if user requested minAge <= 1, accept tokens with unknown age
       if (typeof strategy.minAge === 'number' && strategy.minAge <= 1) {
@@ -344,6 +354,10 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
       }
     } else {
       if (strategy.minAge !== undefined && ageMinutes < strategy.minAge) {
+        return false;
+      }
+      // Reject tokens that are excessively old unless user explicitly sets a larger maxAge
+      if (typeof maxAge === 'number' && ageMinutes > maxAge) {
         return false;
       }
     }

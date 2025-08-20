@@ -20,6 +20,7 @@ function fmtField(val: number | string | undefined | null, field: string): strin
   }
 }
 import axios from 'axios';
+import { Connection, PublicKey } from '@solana/web3.js';
 
 
 // ========== General Constants ==========
@@ -97,7 +98,7 @@ export function parseDuration(v: string | number | undefined | null): number | u
 }
 
 
-export async function retryAsync<T>(fn: () => Promise<T>, retries = 3, delayMs = 2000): Promise<T> {
+export async function retryAsync<T>(fn: () => Promise<T>, retries = 0, delayMs = 2000): Promise<T> {
   let lastErr;
   for (let i = 0; i < retries; i++) {
     try {
@@ -489,7 +490,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
   if (cached && (Date.now() - cached.fetchedAt) < ttl) return cached.ts;
 
   // Helper: HTTP GET with retry/backoff honoring Retry-After
-  async function heliusHttpGetWithRetries(url: string, maxAttempts = Number(process.env.HELIUS_RETRY_MAX_ATTEMPTS || 6)) {
+  async function heliusHttpGetWithRetries(url: string, maxAttempts = Number(process.env.HELIUS_RETRY_MAX_ATTEMPTS || 1)) {
     const axios = (await import('axios')).default;
     let lastErr: any = null;
     const baseMs = Number(process.env.HELIUS_RETRY_BASE_MS || 500);
@@ -538,9 +539,12 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
           // Wait a short time before next attempt but avoid tight loops
           const wait = Math.min(cooldown, 15000);
           await sleep(wait);
-          // Do not log every retry; log only when entering cooldown threshold
+          // Minimal, single-line notification when entering cooldown; avoid printing every retry or stack
           if (state.failureCount === 1) {
-            console.warn(`Helius host ${hostKey} returned 429 — entering short cooldown (${Math.round(cooldown/1000)}s)`);
+            console.warn(`[Helius] ${hostKey} responded 429 — entering cooldown ~${Math.round(cooldown/1000)}s`);
+          } else if (state.failureCount > 1 && state.failureCount % 5 === 0) {
+            // occasional periodic notice every N repeated failures to aid ops without flooding logs
+            console.warn(`[Helius] ${hostKey} still returning 429s (failures=${state.failureCount})`);
           }
           continue;
         }
@@ -562,8 +566,14 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         break;
       }
     }
-    // Final: if we are about to throw, emit a single concise error log
-    console.error('Helius HTTP failure after retries:', lastErr?.message || lastErr);
+    // Final: emit a concise single-line error (no stack) and throw
+    try {
+      const status = lastErr?.response?.status;
+      const host = hostKey || 'unknown-host';
+      console.error(`[Helius] HTTP failure for ${host} after retries (status=${status}): ${String(lastErr?.message || lastErr)}`);
+    } catch (e) {
+      console.error('[Helius] HTTP failure after retries');
+    }
     throw lastErr;
   }
 
@@ -576,11 +586,12 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         const pub = new PublicKey(address);
         const start = Date.now();
         enrichmentMetrics.heliusCalls++;
-        const sigs = await conn.getSignaturesForAddress(pub, { limit: 200 });
+  const sigLimit = Number(process.env.HELIUS_SIG_LIMIT || 20);
+  const sigs = await conn.getSignaturesForAddress(pub, { limit: sigLimit });
         if (sigs && sigs.length > 0) {
           let earliestMs: number | null = null;
           // fetch transactions in parallel but with small concurrency to avoid throttling
-          const concurrency = 8;
+          const concurrency = Number(process.env.HELIUS_RPC_CONCURRENCY || 2);
           for (let i = 0; i < sigs.length; i += concurrency) {
             const slice = sigs.slice(i, i + concurrency);
             const txs = await Promise.all(slice.map(s => conn.getTransaction(s.signature, { commitment: 'confirmed' } as any).catch(() => null)));
@@ -676,10 +687,116 @@ async function getFirstTxTimestampFromSolscan(address: string): Promise<number |
   }
 }
 
+// ----- On-chain activity quick checks -----
+export async function checkOnChainActivity(address: string): Promise<{ firstTxMs: number | null; found: boolean }> {
+  if (!address) return { firstTxMs: null, found: false };
+  try {
+    // Prefer Helius / RPC path since they tend to return parsed transactions or block times
+    let ts: number | null = null;
+    try {
+      ts = await getFirstTxTimestampFromHelius(address);
+    } catch (e) {
+      ts = null;
+    }
+    if (!ts) {
+      try {
+        ts = await getFirstTxTimestampFromSolscan(address);
+      } catch (e) {
+        ts = null;
+      }
+    }
+    if (!ts) {
+      try {
+        ts = await getFirstTxTimestampFromRpc(address);
+      } catch (e) {
+        ts = null;
+      }
+    }
+    return { firstTxMs: ts, found: !!ts };
+  } catch (err) {
+    return { firstTxMs: null, found: false };
+  }
+}
+
+/**
+ * computeFreshnessScore: lightweight multi-source corroboration score (0-100).
+ * Uses DexScreener / pair timestamps (token.poolOpenTimeMs, pairCreatedAt),
+ * on-chain first-tx timestamps, and simple liquidity/volume heuristics.
+ * Attaches token.freshnessScore and token.freshnessDetails for downstream use.
+ */
+export async function computeFreshnessScore(token: any): Promise<{ score: number; details: any }> {
+  const addr = token?.tokenAddress || token?.address || token?.mint || token?.pairAddress;
+  const now = Date.now();
+  // Candidate timestamps
+  const dsTs = token?.poolOpenTimeMs || token?.pairCreatedAt || token?.pairCreatedAtMs || null;
+  let dsTsMs: number | null = null;
+  if (typeof dsTs === 'number') {
+    dsTsMs = dsTs;
+    // normalize seconds -> ms if necessary
+    if (dsTsMs && dsTsMs < 1e12 && dsTsMs > 1e9) dsTsMs = Math.floor(dsTsMs * 1000);
+  }
+
+  let onChainTs: number | null = null;
+  // Allow env toggle to opt-out of extra on-chain calls
+  const enableOnchain = (process.env.ENABLE_ONCHAIN_FRESHNESS || 'true') === 'true';
+  if (enableOnchain && addr) {
+    try {
+      // Keep on-chain check short to avoid long blocking; use withTimeout utility
+      const res = await withTimeout(checkOnChainActivity(addr), Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000), 'onchain-freshness');
+      onChainTs = res.firstTxMs || null;
+    } catch (e) {
+      onChainTs = null;
+    }
+  }
+
+  // Base scoring
+  let score = 0;
+  const details: any = { dsTs: dsTsMs, onChainTs };
+
+  if (dsTsMs && onChainTs) {
+    const delta = Math.abs(dsTsMs - onChainTs);
+    // close agreement => high score
+    if (delta <= 5 * 60 * 1000) score += 60, details.corroboration = 'very_close';
+    else if (delta <= 60 * 60 * 1000) score += 45, details.corroboration = 'close';
+    else if (delta <= 24 * 60 * 60 * 1000) score += 30, details.corroboration = 'same_day';
+    else score += 15, details.corroboration = 'different_days';
+  } else if (onChainTs) {
+    score += 40; details.corroboration = 'onchain_only';
+  } else if (dsTsMs) {
+    score += 30; details.corroboration = 'dex_only';
+  } else {
+    score += 10; details.corroboration = 'no_timestamps';
+  }
+
+  // Liquidity / volume boosts (small boosts)
+  const liquidity = extractNumeric(getField(token, 'liquidity')) || 0;
+  const volume = extractNumeric(getField(token, 'volume')) || 0;
+  if (liquidity >= 1000) score += 10;
+  if (volume >= 100) score += 10;
+
+  // Penalize extremely old tokens (unless user explicitly allows old tokens)
+  const ageMinutes = typeof token.ageMinutes === 'number' ? token.ageMinutes : undefined;
+  if (typeof ageMinutes === 'number' && ageMinutes > Number(process.env.FRESHNESS_MAX_AGE_MINUTES || 60 * 24 * 7)) {
+    // older than default 1 week => low score
+    score = Math.min(score, 20);
+    details.agePenalty = true;
+  }
+
+  // Normalize to 0-100
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  // Attach to token for downstream decision making
+  try {
+    token.freshnessScore = score;
+    token.freshnessDetails = details;
+  } catch (e) { /* ignore */ }
+  return { score, details };
+}
+
+
 export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: number; delayMs?: number }) {
-  const batchSize = opts?.batchSize ?? Number(process.env.HELIUS_BATCH_SIZE || 8);
-  const delayMs = opts?.delayMs ?? Number(process.env.HELIUS_BATCH_DELAY_MS || 500);
-  const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 20);
+  const batchSize = opts?.batchSize ?? Number(process.env.HELIUS_BATCH_SIZE || 4);
+  const delayMs = opts?.delayMs ?? Number(process.env.HELIUS_BATCH_DELAY_MS || 400);
+  const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 8);
   // Build canonical address -> token map
   const addrMap = new Map<string, any>();
   for (const t of tokens) {
@@ -733,6 +850,14 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
       } else {
         skippedCount++;
       }
+        // Compute a lightweight freshness score for downstream filters/notifications
+        try {
+          // fire-and-wait with a short timeout to avoid blocking the batch too long
+          const scoreRes = await withTimeout(computeFreshnessScore(token), Number(process.env.FRESHNESS_SCORE_TIMEOUT_MS || 2000), 'freshness-score');
+          // token.freshnessScore and token.freshnessDetails are set by computeFreshnessScore
+        } catch (e) {
+          // If scoring fails, continue silently; don't block notifications
+        }
     }
     if (i + batchSize < toEnrich.length) await sleep(delayMs);
   }
@@ -1047,6 +1172,20 @@ export function autoFilterTokens(tokens: any[], strategy: Record<string, any>): 
           return false;
         }
       }
+    }
+    // Per-user freshness requirements (optional)
+    try {
+      const minFresh = strategy?.minFreshnessScore !== undefined ? Number(strategy.minFreshnessScore) : undefined;
+      if (!isNaN(Number(minFresh)) && typeof token.freshnessScore === 'number') {
+        if ((token.freshnessScore || 0) < Number(minFresh)) return false;
+      }
+      if (strategy?.requireOnchain) {
+        // require on-chain first tx evidence
+        const onChainTs = token?.freshnessDetails?.onChainTs || token?.freshnessDetails?.firstTxMs || null;
+        if (!onChainTs) return false;
+      }
+    } catch (e) {
+      // ignore scoring errors and proceed
     }
     return true;
   });
