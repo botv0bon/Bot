@@ -14,4 +14,8 @@ export interface Strategy {
   stopLossPercent?: number;
   // Extended fields for Jupiter / pump integration
   requirePool?: boolean;
+  // New tunables
+  skipOnchainEnrich?: boolean;
+  enrichTimeoutMs?: number;
+  explainFiltering?: boolean;
 }

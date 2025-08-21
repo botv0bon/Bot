@@ -247,6 +247,7 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
   }
 }
 import type { Strategy } from './types';
+import { HELIUS_BATCH_SIZE, HELIUS_BATCH_DELAY_MS, ONCHAIN_FRESHNESS_TIMEOUT_MS } from '../config';
 
 /**
  * Filters a list of tokens based on the user's strategy settings.
@@ -287,11 +288,11 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
         try { console.warn('[filterTokensByStrategy] failed to fetch realtime candidates', e && e.message ? e.message : e); } catch {}
       }
 
-      const enrichPromise = utils.enrichTokenTimestamps(tokens, {
-        batchSize: Number(process.env.HELIUS_BATCH_SIZE || 6),
-        delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 300)
-      });
-  const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 8000);
+    const enrichPromise = utils.enrichTokenTimestamps(tokens, {
+  batchSize: Number(HELIUS_BATCH_SIZE || 6),
+  delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
+    });
+  const timeoutMs = Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 8000);
       // Bound the enrichment so filtering remains responsive
       await utils.withTimeout(enrichPromise, timeoutMs, 'filter-enrich');
     } catch (e: any) {

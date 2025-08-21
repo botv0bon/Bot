@@ -85,6 +85,33 @@ try {
 } catch (e) {}
 import axios from 'axios';
 import { Connection, PublicKey } from '@solana/web3.js';
+import {
+  HELIUS_RPC_URL,
+  HELIUS_PARSE_HISTORY_URL,
+  HELIUS_API_KEY,
+  HELIUS_CACHE_TTL_MS,
+  HELIUS_RETRY_MAX_ATTEMPTS,
+  HELIUS_RETRY_BASE_MS,
+  HELIUS_RETRY_JITTER_MS,
+  HELIUS_FALLBACK_ENABLED,
+  HELIUS_SIG_LIMIT,
+  HELIUS_RPC_CONCURRENCY,
+  HELIUS_BATCH_SIZE,
+  HELIUS_BATCH_DELAY_MS,
+  HELIUS_ENRICH_LIMIT,
+} from '../config';
+
+// Additional config flags used in this module
+import {
+  HELIUS_USE_WEBSOCKET,
+  HELIUS_WS_URL_RAW,
+  SOLSCAN_API_URL,
+  SOLSCAN_FALLBACK_ENABLED,
+  ENABLE_ONCHAIN_FRESHNESS,
+  ONCHAIN_FRESHNESS_TIMEOUT_MS,
+  FRESHNESS_MAX_AGE_MINUTES,
+  FRESHNESS_SCORE_TIMEOUT_MS,
+} from '../config';
 
 
 // ========== General Constants ==========
@@ -99,6 +126,20 @@ const FIELD_MAP: Record<string, string[]> = {
 };
 
 const missingFieldsLog: Set<string> = new Set();
+
+// Simple in-memory cache for first-tx timestamps to reduce repeat RPC/HTTP calls
+const firstTxCache: Map<string, { ts: number; expiresAt: number }> = new Map();
+const FIRST_TX_CACHE_MS = Number(process.env.FIRST_TX_CACHE_MS || 10 * 60 * 1000);
+
+export function getCachedFirstTx(mint: string): number | null {
+  const v = firstTxCache.get(mint);
+  if (!v) return null;
+  if (v.expiresAt < Date.now()) { firstTxCache.delete(mint); return null; }
+  return v.ts;
+}
+export function setCachedFirstTx(mint: string, ts: number) {
+  try { firstTxCache.set(mint, { ts, expiresAt: Date.now() + FIRST_TX_CACHE_MS }); } catch {}
+}
 
 
 
@@ -508,9 +549,14 @@ const enrichmentMetrics: {
 async function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
 async function getFirstTxTimestampFromRpc(address: string): Promise<number | null> {
+  // Check lightweight global first-tx cache
+  try {
+    const cached = getCachedFirstTx(address);
+    if (cached) return cached;
+  } catch (e) {}
   try {
     const { Connection, PublicKey } = await import('@solana/web3.js');
-    const rpcUrl = process.env.HELIUS_RPC_URL || process.env.MAINNET_RPC;
+    const rpcUrl = HELIUS_RPC_URL || process.env.MAINNET_RPC;
     if (!rpcUrl) return null;
     const conn = new Connection(rpcUrl, { commitment: 'confirmed' } as any);
     const pub = new PublicKey(address);
@@ -536,8 +582,9 @@ async function getFirstTxTimestampFromRpc(address: string): Promise<number | nul
         // ignore individual tx failures
       }
     }
-    enrichmentMetrics.rpcTotalMs += (Date.now() - start);
-    return earliestMs;
+  enrichmentMetrics.rpcTotalMs += (Date.now() - start);
+  if (earliestMs) try { setCachedFirstTx(address, earliestMs); } catch (e) {}
+  return earliestMs;
   } catch (e) {
     enrichmentMetrics.rpcFailures++;
     return null;
@@ -546,19 +593,24 @@ async function getFirstTxTimestampFromRpc(address: string): Promise<number | nul
 
 async function getFirstTxTimestampFromHelius(address: string): Promise<number | null> {
   // Prefer Helius RPC (if provided) which is typically higher-rate for paid keys.
-  const heliusRpc = process.env.HELIUS_RPC_URL || process.env.MAINNET_RPC;
-  const apiUrlTemplate = process.env.HELIUS_PARSE_HISTORY_URL || process.env.HELIUS_PARSE_TX_URL;
-  // cache check
+  const heliusRpc = HELIUS_RPC_URL || process.env.MAINNET_RPC;
+  const apiUrlTemplate = HELIUS_PARSE_HISTORY_URL || '';
+  // cache check (global lightweight cache first)
+  try {
+    const gc = getCachedFirstTx(address);
+    if (gc) return gc;
+  } catch (e) {}
+  // module cache
   const cached = heliusTimestampCache[address];
-  const ttl = Number(process.env.HELIUS_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+  const ttl = Number(HELIUS_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
   if (cached && (Date.now() - cached.fetchedAt) < ttl) return cached.ts;
 
   // Helper: HTTP GET with retry/backoff honoring Retry-After
-  async function heliusHttpGetWithRetries(url: string, maxAttempts = Number(process.env.HELIUS_RETRY_MAX_ATTEMPTS || 1)) {
+  async function heliusHttpGetWithRetries(url: string, maxAttempts = Number(HELIUS_RETRY_MAX_ATTEMPTS || 1)) {
     const axios = (await import('axios')).default;
     let lastErr: any = null;
-    const baseMs = Number(process.env.HELIUS_RETRY_BASE_MS || 500);
-    const jitterMs = Number(process.env.HELIUS_RETRY_JITTER_MS || 300);
+    const baseMs = Number(HELIUS_RETRY_BASE_MS || 500);
+    const jitterMs = Number(HELIUS_RETRY_JITTER_MS || 300);
     // derive host key for simple circuit breaker / cooldown
     let hostKey: string | null = null;
     try { hostKey = new URL(url).host; } catch (e) { hostKey = null; }
@@ -584,9 +636,9 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
     for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt++) {
       const start = Date.now();
       try {
-        enrichmentMetrics.heliusCalls++;
-        const headers: Record<string,string> = { 'Accept': 'application/json' };
-        if (process.env.HELIUS_API_KEY) headers['x-api-key'] = process.env.HELIUS_API_KEY;
+  enrichmentMetrics.heliusCalls++;
+  const headers: Record<string,string> = { 'Accept': 'application/json' };
+  if (HELIUS_API_KEY) headers['x-api-key'] = HELIUS_API_KEY;
         const r = await axios.get(url, { timeout: 20000, headers });
         enrichmentMetrics.heliusTotalMs += (Date.now() - start);
         // on success, reset host failure count
@@ -648,11 +700,11 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
 
   try {
     // Optional: try Helius WebSocket RPC when configured (preferred for live parsed streams)
-    if ((process.env.HELIUS_USE_WEBSOCKET || 'false') === 'true' && process.env.HELIUS_WEBSOCKET_URL) {
+  if (HELIUS_USE_WEBSOCKET && HELIUS_WS_URL_RAW) {
       try {
   const wsMod = await import('ws');
   const WebSocketCtor: any = (wsMod && (wsMod.default || wsMod));
-  const wsUrl = process.env.HELIUS_WEBSOCKET_URL as string;
+  const wsUrl = HELIUS_WS_URL_RAW as string;
   const socket: any = new WebSocketCtor(wsUrl);
         // wait open
         await new Promise((resolve, reject) => {
@@ -660,7 +712,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
           socket.once('open', () => { clearTimeout(to); resolve(null); });
           socket.once('error', (err: any) => { clearTimeout(to); reject(err); });
         });
-        const sigLimit = Number(process.env.HELIUS_SIG_LIMIT || 20);
+  const sigLimit = Number(HELIUS_SIG_LIMIT || 20);
         const reqId = Math.floor(Math.random() * 1e9);
         const req = { jsonrpc: '2.0', id: reqId, method: 'getSignaturesForAddress', params: [address, { limit: sigLimit }] };
         socket.send(JSON.stringify(req));
@@ -712,7 +764,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
             } catch (e) { /* ignore per-tx failures */ }
           }
           try { socket.close(); } catch (e) {}
-          if (earliestMs) { heliusTimestampCache[address] = { ts: earliestMs, fetchedAt: Date.now() }; return earliestMs; }
+          if (earliestMs) { heliusTimestampCache[address] = { ts: earliestMs, fetchedAt: Date.now() }; try { setCachedFirstTx(address, earliestMs); } catch (e) {} return earliestMs; }
         } else {
           try { socket.close(); } catch (e) {}
         }
@@ -728,12 +780,12 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         const pub = new PublicKey(address);
         const start = Date.now();
         enrichmentMetrics.heliusCalls++;
-  const sigLimit = Number(process.env.HELIUS_SIG_LIMIT || 20);
+  const sigLimit = Number(HELIUS_SIG_LIMIT || 20);
   const sigs = await conn.getSignaturesForAddress(pub, { limit: sigLimit });
         if (sigs && sigs.length > 0) {
           let earliestMs: number | null = null;
           // fetch transactions in parallel but with small concurrency to avoid throttling
-          const concurrency = Number(process.env.HELIUS_RPC_CONCURRENCY || 2);
+          const concurrency = Number(HELIUS_RPC_CONCURRENCY || 2);
           for (let i = 0; i < sigs.length; i += concurrency) {
             const slice = sigs.slice(i, i + concurrency);
             const txs = await Promise.all(slice.map(s => conn.getTransaction(s.signature, { commitment: 'confirmed' } as any).catch(() => null)));
@@ -782,7 +834,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
   } catch (e) {
     // If HTTP / RPC failed: try Solscan then RPC fallback if enabled
     enrichmentMetrics.heliusFailures++;
-    if ((process.env.SOLSCAN_FALLBACK_ENABLED || 'true') === 'true') {
+  if (SOLSCAN_FALLBACK_ENABLED) {
       try {
         const ts = await getFirstTxTimestampFromSolscan(address);
         if (ts) return ts;
@@ -790,7 +842,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         // ignore
       }
     }
-    if ((process.env.HELIUS_FALLBACK_ENABLED || 'true') === 'true') {
+    if (HELIUS_FALLBACK_ENABLED) {
       const fallback = await getFirstTxTimestampFromRpc(address);
       return fallback;
     }
@@ -800,9 +852,9 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
 
 async function getFirstTxTimestampFromSolscan(address: string): Promise<number | null> {
   try {
-    const base = process.env.SOLSCAN_API_URL;
-    if (!base) return null;
-    const url = `${base.replace(/\/+$/,'')}/account/transactions?address=${encodeURIComponent(address)}&limit=50`;
+  const base = SOLSCAN_API_URL;
+  if (!base) return null;
+  const url = `${base.replace(/\/+$/,'')}/account/transactions?address=${encodeURIComponent(address)}&limit=50`;
     const axios = (await import('axios')).default;
     const start = Date.now();
     enrichmentMetrics.solscanCalls++;
@@ -883,11 +935,11 @@ export async function computeFreshnessScore(token: any): Promise<{ score: number
 
   let onChainTs: number | null = null;
   // Allow env toggle to opt-out of extra on-chain calls
-  const enableOnchain = (process.env.ENABLE_ONCHAIN_FRESHNESS || 'true') === 'true';
+  const enableOnchain = ENABLE_ONCHAIN_FRESHNESS;
   if (enableOnchain && addr) {
     try {
       // Keep on-chain check short to avoid long blocking; use withTimeout utility
-      const res = await withTimeout(checkOnChainActivity(addr), Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000), 'onchain-freshness');
+  const res = await withTimeout(checkOnChainActivity(addr), Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000), 'onchain-freshness');
       onChainTs = res.firstTxMs || null;
     } catch (e) {
       onChainTs = null;
@@ -921,7 +973,7 @@ export async function computeFreshnessScore(token: any): Promise<{ score: number
 
   // Penalize extremely old tokens (unless user explicitly allows old tokens)
   const ageMinutes = typeof token.ageMinutes === 'number' ? token.ageMinutes : undefined;
-  if (typeof ageMinutes === 'number' && ageMinutes > Number(process.env.FRESHNESS_MAX_AGE_MINUTES || 60 * 24 * 7)) {
+  if (typeof ageMinutes === 'number' && ageMinutes > Number(FRESHNESS_MAX_AGE_MINUTES || 60 * 24 * 7)) {
     // older than default 1 week => low score
     score = Math.min(score, 20);
     details.agePenalty = true;
@@ -939,9 +991,9 @@ export async function computeFreshnessScore(token: any): Promise<{ score: number
 
 
 export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: number; delayMs?: number }) {
-  const batchSize = opts?.batchSize ?? Number(process.env.HELIUS_BATCH_SIZE || 4);
-  const delayMs = opts?.delayMs ?? Number(process.env.HELIUS_BATCH_DELAY_MS || 400);
-  const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 8);
+  const batchSize = opts?.batchSize ?? Number(HELIUS_BATCH_SIZE || 4);
+  const delayMs = opts?.delayMs ?? Number(HELIUS_BATCH_DELAY_MS || 400);
+  const enrichLimit = Number(HELIUS_ENRICH_LIMIT || 8);
   // Build canonical address -> token map
   const addrMap = new Map<string, any>();
   for (const t of tokens) {
@@ -964,7 +1016,7 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
       try {
         // Prefer Solscan (lower rate) first if configured
         let ts = null as number | null;
-        if ((process.env.SOLSCAN_FALLBACK_ENABLED || 'true') === 'true' && process.env.SOLSCAN_API_URL) {
+  if (SOLSCAN_FALLBACK_ENABLED && SOLSCAN_API_URL) {
           try { ts = await getFirstTxTimestampFromSolscan(addr); } catch (e) { ts = null; }
         }
         // If Solscan didn't return, try Helius (RPC/parse)
@@ -972,7 +1024,7 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
           try { ts = await getFirstTxTimestampFromHelius(addr); } catch (e) { ts = null; }
         }
         // Last-resort RPC fallback
-        if (!ts && (process.env.HELIUS_FALLBACK_ENABLED || 'true') === 'true') {
+  if (!ts && HELIUS_FALLBACK_ENABLED) {
           try { ts = await getFirstTxTimestampFromRpc(addr); } catch (e) { ts = null; }
         }
         results.push(ts);
@@ -998,7 +1050,7 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
         // Compute a lightweight freshness score for downstream filters/notifications
         try {
           // fire-and-wait with a short timeout to avoid blocking the batch too long
-          const scoreRes = await withTimeout(computeFreshnessScore(token), Number(process.env.FRESHNESS_SCORE_TIMEOUT_MS || 2000), 'freshness-score');
+          const scoreRes = await withTimeout(computeFreshnessScore(token), Number(FRESHNESS_SCORE_TIMEOUT_MS || 2000), 'freshness-score');
           // token.freshnessScore and token.freshnessDetails are set by computeFreshnessScore
         } catch (e) {
           // If scoring fails, continue silently; don't block notifications
@@ -1243,104 +1295,84 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
 
 
 // Unified token filtering by strategy
-export function autoFilterTokens(tokens: any[], strategy: Record<string, any>): any[] {
-  return tokens.filter(token => {
+export function autoFilterTokensVerbose(tokens: any[], strategy: Record<string, any>): { passed: any[]; rejected: Array<{ token: any; reasons: string[] }> } {
+  const passed: any[] = [];
+  const rejected: Array<{ token: any; reasons: string[] }> = [];
+  for (const token of tokens) {
+    const reasons: string[] = [];
+    let ok = true;
     for (const field of STRATEGY_FIELDS) {
       if (!field.tokenField || !(field.key in strategy)) continue;
       const value = strategy[field.key];
       if (field.type === "number" && (value === undefined || value === null || Number(value) === 0)) continue;
       let tokenValue = getField(token, field.tokenField);
       // Special cases support
-      if (field.tokenField === 'liquidity' && tokenValue && typeof tokenValue === 'object' && typeof tokenValue.usd === 'number') {
-        tokenValue = tokenValue.usd;
-      }
-      if (field.tokenField === 'volume' && tokenValue && typeof tokenValue === 'object' && typeof tokenValue.h24 === 'number') {
-        tokenValue = tokenValue.h24;
-      }
-      // Handle age specially: prefer ageSeconds if present, else try tokenValue conversions
+      if (field.tokenField === 'liquidity' && tokenValue && typeof tokenValue === 'object' && typeof tokenValue.usd === 'number') tokenValue = tokenValue.usd;
+      if (field.tokenField === 'volume' && tokenValue && typeof tokenValue === 'object' && typeof tokenValue.h24 === 'number') tokenValue = tokenValue.h24;
+      // age handling
       if (field.tokenField === 'age') {
-        // Strategy value may be duration string like '30s' or number (legacy minutes)
         const minAgeSeconds = parseDuration(value) ?? undefined;
-        // token may have ageSeconds, or ageMinutes, or various timestamp formats
         let tokenAgeSeconds: number | undefined = undefined;
         if (typeof token.ageSeconds === 'number' && !isNaN(token.ageSeconds)) tokenAgeSeconds = token.ageSeconds;
         else if (typeof token.ageMinutes === 'number' && !isNaN(token.ageMinutes)) tokenAgeSeconds = Math.floor(token.ageMinutes * 60);
         else if (typeof tokenValue === 'number' && !isNaN(tokenValue)) {
-          // tokenValue might be a timestamp or minutes; try to detect
           if (tokenValue > 1e12) tokenAgeSeconds = Math.floor((Date.now() - tokenValue) / 1000);
           else if (tokenValue > 1e9) tokenAgeSeconds = Math.floor((Date.now() - tokenValue * 1000) / 1000);
           else tokenAgeSeconds = Math.floor(Number(tokenValue) * 60);
         }
-        // If user provided a duration (minAgeSeconds) and token age unknown, decide behavior:
-        // - If the user requested a very small minimum age (<= 1 minute), treat missing age as acceptable.
-        // - Otherwise, fail the filter for strict fields (or skip if optional).
         if (minAgeSeconds !== undefined && (tokenAgeSeconds === undefined || isNaN(tokenAgeSeconds))) {
-          // allow missing age for very small minAge (<= 60 seconds)
           if (minAgeSeconds <= 60) {
-            // consider this criterion satisfied when age is missing and user asked for <= 1 minute
+            // treat as ok for very small min age
             continue;
           }
-          if (!field.optional) return false;
-          else continue;
+          if (!field.optional) { reasons.push('missing_age'); ok = false; }
+          continue;
         }
-        // Attach tokenValue as seconds for subsequent comparisons
         tokenValue = tokenAgeSeconds;
       }
-      // تطبيع القيمة الرقمية دائماً
       tokenValue = extractNumeric(tokenValue);
       const numValue = Number(value);
       const numTokenValue = Number(tokenValue);
       if (isNaN(numTokenValue)) {
-        if (!field.optional) {
-          return false;
-        } else {
-          continue;
-        }
+        if (!field.optional) { reasons.push('missing_'+field.key); ok = false; }
+        continue;
       }
       if (field.type === "number") {
-        // For age fields, strategy values may be duration strings => parsed as seconds earlier
         let compareValue = numValue;
-        // If this is an age field and user specified string durations, parseDuration will convert; otherwise use number
         if (field.tokenField === 'age') {
           const parsed = parseDuration(value);
-          if (!isNaN(Number(parsed))) compareValue = parsed ?? numValue * 60; // legacy: numeric strategy considered minutes
+          if (!isNaN(Number(parsed))) compareValue = parsed ?? numValue * 60;
         }
         if (field.key.startsWith("min") && !isNaN(compareValue)) {
-          if (numTokenValue < compareValue) {
-            return false;
-          }
+          if (numTokenValue < compareValue) { reasons.push('below_'+field.key); ok = false; }
         }
         if (field.key.startsWith("max") && !isNaN(compareValue)) {
-          if (numTokenValue > compareValue) {
-            return false;
-          }
+          if (numTokenValue > compareValue) { reasons.push('above_'+field.key); ok = false; }
         }
       }
       if (field.type === "boolean" && typeof value === "boolean") {
-        if (value === true && !tokenValue) {
-          return false;
-        }
-        if (value === false && tokenValue) {
-          return false;
-        }
+        if (value === true && !tokenValue) { reasons.push('missing_boolean_'+field.key); ok = false; }
+        if (value === false && tokenValue) { reasons.push('boolean_'+field.key+'_mismatch'); ok = false; }
       }
     }
-    // Per-user freshness requirements (optional)
+    // freshness checks
     try {
       const minFresh = strategy?.minFreshnessScore !== undefined ? Number(strategy.minFreshnessScore) : undefined;
       if (!isNaN(Number(minFresh)) && typeof token.freshnessScore === 'number') {
-        if ((token.freshnessScore || 0) < Number(minFresh)) return false;
+        if ((token.freshnessScore || 0) < Number(minFresh)) { reasons.push('low_freshness'); ok = false; }
       }
       if (strategy?.requireOnchain) {
-        // require on-chain first tx evidence
         const onChainTs = token?.freshnessDetails?.onChainTs || token?.freshnessDetails?.firstTxMs || null;
-        if (!onChainTs) return false;
+        if (!onChainTs) { reasons.push('no_onchain_evidence'); ok = false; }
       }
-    } catch (e) {
-      // ignore scoring errors and proceed
-    }
-    return true;
-  });
+    } catch (e) {}
+    if (ok) passed.push(token); else rejected.push({ token, reasons });
+  }
+  return { passed, rejected };
+}
+
+export function autoFilterTokens(tokens: any[], strategy: Record<string, any>): any[] {
+  try { return autoFilterTokensVerbose(tokens, strategy).passed; } catch (e) { return tokens; }
 }
 
 // ========== Signing Key Utilities ==========

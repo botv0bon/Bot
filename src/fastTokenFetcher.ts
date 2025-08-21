@@ -7,7 +7,7 @@ import { registerBuyWithTarget } from './bot/strategy';
 import { extractTradeMeta } from './utils/tradeMeta';
 import { unifiedBuy } from './tradeSources';
 import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko } from './utils/tokenUtils';
-import { JUPITER_QUOTE_API } from './config';
+import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL } from './config';
 import { getCoinData as getPumpData } from './pump/api';
 import { existsSync, mkdirSync } from 'fs';
 import fs from 'fs';
@@ -247,7 +247,7 @@ async function getUnifiedCandidates(limit: number) {
         if (m) candidates.push(m);
         if (candidates.length >= limit) break;
       }
-    } catch (e) {}
+  } catch (e) {}
 
     // 3) fetchLatest5FromAllSources for extra corroboration
     try {
@@ -278,7 +278,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
     // use cache
   } else {
     try {
-      const limit = opts?.limit || 200;
+  const limit = opts?.limit || 200;
   // fetch unified candidates from multiple sources (DexScreener + Helius events/history + parse + RPC)
   __global_fetch_cache = await getUnifiedCandidates(limit).catch(async (e: any) => {
     try {
@@ -422,7 +422,7 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
 // Handle a new mint event: attempt quick enrichment (first signature => blockTime) and log
 // --- Helpers: lightweight helius/json-rpc wrapper and verification helpers
 async function heliusRpc(method: string, params: any[] = [], timeout = 4000, retries = 0): Promise<any> {
-  const heliusUrl = process.env.HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL;
+  const heliusUrl = HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL;
   if (!heliusUrl) return { __error: 'no-helius-url' };
   const payload = { jsonrpc: '2.0', id: 1, method, params };
   let attempt = 0;
@@ -473,7 +473,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
   if (!mint) return null;
   try {
     // get first signature/time via fast helius call
-    const heliusUrl = process.env.HELIUS_FAST_RPC_URL || process.env.HELIUS_RPC_URL;
+  const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
     if (!heliusUrl) {
       console.log('handleNewMintEvent: no helius url');
       return null;
@@ -560,7 +560,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
   const topN = opts?.topN ?? 10;
   const timeoutMs = opts?.timeoutMs ?? 3000;
   const concurrency = opts?.concurrency ?? 3;
-  const heliusUrl = process.env.HELIUS_FAST_RPC_URL || process.env.HELIUS_RPC_URL;
+  const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
 
   console.log(`Running fast discovery: topN=${topN} timeoutMs=${timeoutMs} concurrency=${concurrency}`);
   const raw = await fetchDexBoostsRaw(timeoutMs);
@@ -632,12 +632,12 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
           }
         }
         // fallback to HELIUS_RPC_URL if different and available
-        const alt = process.env.HELIUS_RPC_URL;
+  const alt = HELIUS_RPC_URL;
         if (alt && alt !== heliusUrl) {
           const r2 = await heliusGetSignaturesFast(t.mint, alt, timeoutMs, 0);
           if (r2 && r2.__error) {
             // try solscan fallback
-            const solscanUrl = `${process.env.SOLSCAN_API_URL}/token/${t.mint}/transactions`;
+              const solscanUrl = `${SOLSCAN_API_URL}/token/${t.mint}/transactions`;
             try {
               const sres = await axios.get(solscanUrl, { timeout: timeoutMs });
               const arr = sres.data ?? [];
@@ -712,7 +712,7 @@ export async function fetchLatest5FromAllSources(n = 5) {
   // Solana parse history approach: use HELIUS_PARSE_HISTORY_URL template if available
   const heliusHistory: string[] = [];
   try {
-    const parseUrlTemplate = process.env.HELIUS_PARSE_HISTORY_URL;
+  const parseUrlTemplate = HELIUS_PARSE_HISTORY_URL;
     if (parseUrlTemplate) {
       // if parseHistory supports an endpoint to query recent addresses, we try a small approach: query top dex list mints for their first tx
       const candidates = dex.slice(0, Math.max(n, 10));

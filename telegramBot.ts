@@ -45,6 +45,7 @@ console.log = (...args: any[]) => {
 console.log('--- Bot starting: Imports loaded ---');
 
 dotenv.config();
+import { HELIUS_BATCH_SIZE, HELIUS_BATCH_DELAY_MS, HELIUS_ENRICH_LIMIT, ONCHAIN_FRESHNESS_TIMEOUT_MS } from './src/config';
 
 console.log('--- dotenv loaded ---');
 
@@ -141,9 +142,9 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         const resolvedPrefiltered = Array.isArray(prefiltered) ? prefiltered : tokens;
         // enrich only top candidates (by liquidity then volume)
   // per-user overrides with env defaults
-  const enrichLimit = Number(strategy?.heliusEnrichLimit ?? process.env.HELIUS_ENRICH_LIMIT ?? 25);
-  const heliusBatchSize = Number(strategy?.heliusBatchSize ?? process.env.HELIUS_BATCH_SIZE ?? 8);
-  const heliusBatchDelayMs = Number(strategy?.heliusBatchDelayMs ?? process.env.HELIUS_BATCH_DELAY_MS ?? 250);
+  const enrichLimit = Number(strategy?.heliusEnrichLimit ?? HELIUS_ENRICH_LIMIT ?? 25);
+  const heliusBatchSize = Number(strategy?.heliusBatchSize ?? HELIUS_BATCH_SIZE ?? 8);
+  const heliusBatchDelayMs = Number(strategy?.heliusBatchDelayMs ?? HELIUS_BATCH_DELAY_MS ?? 250);
         // sort candidates by liquidity (fallback to volume or marketCap)
         const ranked = resolvedPrefiltered.slice().sort((a: any, b: any) => {
           const la = (a.liquidity || a.liquidityUsd || 0) as number;
@@ -156,7 +157,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         const toEnrich = ranked.slice(0, enrichLimit);
         const { enrichTokenTimestamps, withTimeout } = await import('./src/utils/tokenUtils');
         try {
-          const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
+          const timeoutMs = Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
           await withTimeout(enrichTokenTimestamps(toEnrich, { batchSize: heliusBatchSize, delayMs: heliusBatchDelayMs }), timeoutMs, 'getTokens-enrich');
         } catch (e: any) {
           // Keep a concise log and proceed with un-enriched token list to avoid blocking handlers

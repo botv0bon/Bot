@@ -69,8 +69,10 @@ export function exportSecretKey(keypair: any): string {
 }
 
 // Create a Solana connection (Mainnet or Devnet)
+import { MAINNET_RPC, HELIUS_RPC_URL } from './config';
+
 export function getConnection() {
   const network = process.env.NETWORK === 'devnet' ? 'devnet' : 'mainnet-beta';
-  const rpcUrl = process.env.HELIUS_RPC_URL || process.env.RPC_URL || clusterApiUrl(network);
+  const rpcUrl = HELIUS_RPC_URL || MAINNET_RPC || process.env.RPC_URL || clusterApiUrl(network);
   return new Connection(rpcUrl, 'confirmed');
 }

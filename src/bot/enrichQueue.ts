@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 const fsp = fs.promises;
+import { HELIUS_ENRICH_LIMIT } from '../config';
 
 // Lightweight background queue for expensive token enrichment requested by users.
 // Jobs are appended to an NDJSON file for audit and processed with a single-worker
@@ -107,7 +108,7 @@ export async function startEnrichQueue(telegram: any, users: Record<string, any>
           try { prefiltered = autoFilter(tokens, job.strategy); } catch {}
 
           // enrich only a small slice
-          const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 8);
+          const enrichLimit = Number(HELIUS_ENRICH_LIMIT || 8);
           const toEnrich = prefiltered.slice(0, enrichLimit);
           try { await enrichTokenTimestamps(toEnrich, { batchSize: 3, delayMs: 400 }); } catch (e) {}
 

@@ -1,15 +1,10 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
 // Minimal safe Helius WebSocket listener.
-// - Uses `HELIUS_WEBSOCKET_URL` and `HELIUS_API_KEY` from .env if available
-// - If `HELIUS_USE_WEBSOCKET` is not set or false, the module exports a no-op starter
-// - Designed to be imported and started from other services
-
-const HELIUS_WS_URL = process.env.HELIUS_WEBSOCKET_URL || process.env.HELIUS_FAST_RPC_URL || '';
-const USE_WS = (process.env.HELIUS_USE_WEBSOCKET || 'false').toLowerCase() === 'true';
-const SUBSCRIBE_METADATA = (process.env.HELIUS_SUBSCRIBE_METADATA || 'true').toLowerCase() === 'true';
-const SUBSCRIBE_SPLTOKEN = (process.env.HELIUS_SUBSCRIBE_SPLTOKEN || 'true').toLowerCase() === 'true';
+// Uses centralized config from `src/config.ts` so env parsing is in one place.
+import { HELIUS_USE_WEBSOCKET, getHeliusWebsocketUrl, HELIUS_SUBSCRIBE_METADATA, HELIUS_SUBSCRIBE_SPLTOKEN } from './config';
+const HELIUS_WS_URL = getHeliusWebsocketUrl();
+const USE_WS = HELIUS_USE_WEBSOCKET;
+const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
+const SUBSCRIBE_SPLTOKEN = HELIUS_SUBSCRIBE_SPLTOKEN;
 
 // Lazy import so project can run without ws installed when not used
 async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) => void; onOpen?: () => void; onClose?: () => void; onError?: (err: any) => void; }) {
