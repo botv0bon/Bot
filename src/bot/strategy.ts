@@ -248,6 +248,7 @@ export async function executeBatchTradesForUser(user: any, tokens: any[], mode: 
 }
 import type { Strategy } from './types';
 import { HELIUS_BATCH_SIZE, HELIUS_BATCH_DELAY_MS, ONCHAIN_FRESHNESS_TIMEOUT_MS } from '../config';
+import { autoFilterTokensVerbose } from '../utils/tokenUtils';
 
 /**
  * Filters a list of tokens based on the user's strategy settings.
@@ -303,8 +304,9 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
   const utils = require('../utils/tokenUtils');
   const { getField, autoFilterTokens, parseDuration } = utils;
 
-  // 1) Fast pass: use `autoFilterTokens` for the simple numeric checks (marketCap, liquidity, volume, basic age rules)
-  const prelim = autoFilterTokens(tokens, strategy);
+  // 1) Fast pass: use `autoFilterTokensVerbose` for the simple numeric checks (marketCap, liquidity, volume, basic age rules)
+  const prelimVerbose = autoFilterTokensVerbose(tokens, strategy);
+  const prelim = Array.isArray(prelimVerbose) ? prelimVerbose : (prelimVerbose && prelimVerbose.passed ? prelimVerbose.passed : tokens);
 
   // 2) Apply the remaining, more expensive or strict checks on the pre-filtered list
   const filtered = prelim.filter(token => {

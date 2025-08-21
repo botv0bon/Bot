@@ -85,6 +85,8 @@ try {
 } catch (e) {}
 import axios from 'axios';
 import { Connection, PublicKey } from '@solana/web3.js';
+import fs from 'fs';
+import path from 'path';
 import {
   HELIUS_RPC_URL,
   HELIUS_PARSE_HISTORY_URL,
@@ -130,15 +132,50 @@ const missingFieldsLog: Set<string> = new Set();
 // Simple in-memory cache for first-tx timestamps to reduce repeat RPC/HTTP calls
 const firstTxCache: Map<string, { ts: number; expiresAt: number }> = new Map();
 const FIRST_TX_CACHE_MS = Number(process.env.FIRST_TX_CACHE_MS || 10 * 60 * 1000);
+const FIRST_TX_CACHE_FILE = process.env.FIRST_TX_CACHE_FILE || path.join(process.cwd(), '.first_tx_cache.json');
+
+function saveFirstTxCacheToDisk() {
+  try {
+    const obj: Record<string, { ts: number; expiresAt: number }> = {};
+    for (const [k, v] of firstTxCache.entries()) obj[k] = v;
+    fs.writeFileSync(FIRST_TX_CACHE_FILE, JSON.stringify({ savedAt: Date.now(), data: obj }), { encoding: 'utf8' });
+  } catch (e) {
+    // don't fail the process for cache persistence errors
+  }
+}
+
+function loadFirstTxCacheFromDisk() {
+  try {
+    if (!fs.existsSync(FIRST_TX_CACHE_FILE)) return;
+    const raw = fs.readFileSync(FIRST_TX_CACHE_FILE, { encoding: 'utf8' });
+    const parsed = JSON.parse(raw || '{}');
+    const data = parsed && parsed.data ? parsed.data : parsed;
+    if (!data || typeof data !== 'object') return;
+    const now = Date.now();
+    for (const k of Object.keys(data)) {
+      try {
+        const v = data[k];
+        if (!v || typeof v.ts !== 'number' || typeof v.expiresAt !== 'number') continue;
+        if (v.expiresAt < now) continue;
+        firstTxCache.set(k, { ts: v.ts, expiresAt: v.expiresAt });
+      } catch (e) { continue; }
+    }
+  } catch (e) {
+    // ignore disk load errors
+  }
+}
+
+// Load persisted cache on module init (best-effort)
+try { loadFirstTxCacheFromDisk(); } catch (e) {}
 
 export function getCachedFirstTx(mint: string): number | null {
   const v = firstTxCache.get(mint);
   if (!v) return null;
-  if (v.expiresAt < Date.now()) { firstTxCache.delete(mint); return null; }
+  if (v.expiresAt < Date.now()) { firstTxCache.delete(mint); try { saveFirstTxCacheToDisk(); } catch {} return null; }
   return v.ts;
 }
 export function setCachedFirstTx(mint: string, ts: number) {
-  try { firstTxCache.set(mint, { ts, expiresAt: Date.now() + FIRST_TX_CACHE_MS }); } catch {}
+  try { firstTxCache.set(mint, { ts, expiresAt: Date.now() + FIRST_TX_CACHE_MS }); try { saveFirstTxCacheToDisk(); } catch {} } catch {}
 }
 
 
@@ -587,6 +624,11 @@ async function getFirstTxTimestampFromRpc(address: string): Promise<number | nul
   return earliestMs;
   } catch (e) {
     enrichmentMetrics.rpcFailures++;
+    try {
+      const status = (e as any)?.response?.status || (e as any)?.code || 'n/a';
+      const dataSnippet = (() => { try { const d = (e as any)?.response?.data; return d ? (typeof d === 'string' ? d.slice(0,200) : JSON.stringify(d).slice(0,200)) : ''; } catch { return ''; } })();
+      console.error(`[RPC] getFirstTxTimestampFromRpc failed for ${address}: status=${status} msg=${String((e as any)?.message || e)} data=${dataSnippet}`);
+    } catch(_) {}
     return null;
   }
 }
@@ -687,11 +729,13 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         break;
       }
     }
-    // Final: emit a concise single-line error (no stack) and throw
+    // Final: emit a concise single-line error (no stack) and throw, include headers/data snippets
     try {
-      const status = lastErr?.response?.status;
+      const status = lastErr?.response?.status || lastErr?.code || 'n/a';
+      const headersSnippet = (() => { try { return lastErr?.response?.headers ? Object.keys(lastErr.response.headers).slice(0,5).join(',') : ''; } catch { return ''; } })();
+      const dataSnippet = (() => { try { const d = lastErr?.response?.data; return d ? (typeof d === 'string' ? d.slice(0,200) : JSON.stringify(d).slice(0,200)) : ''; } catch { return ''; } })();
       const host = hostKey || 'unknown-host';
-      console.error(`[Helius] HTTP failure for ${host} after retries (status=${status}): ${String(lastErr?.message || lastErr)}`);
+      console.error(`[Helius] HTTP failure for ${host} after retries (status=${status}) headers=[${headersSnippet}] data=${dataSnippet} message=${String(lastErr?.message || lastErr)}`);
     } catch (e) {
       console.error('[Helius] HTTP failure after retries');
     }
@@ -700,7 +744,8 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
 
   try {
     // Optional: try Helius WebSocket RPC when configured (preferred for live parsed streams)
-  if (HELIUS_USE_WEBSOCKET && HELIUS_WS_URL_RAW) {
+  // NOTE: disabled per-address WS attempts to reduce 429s; use parse/history HTTP or RPC batch instead
+  if (false && HELIUS_USE_WEBSOCKET && HELIUS_WS_URL_RAW) {
       try {
   const wsMod = await import('ws');
   const WebSocketCtor: any = (wsMod && (wsMod.default || wsMod));
@@ -770,6 +815,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         }
       } catch (e) {
         // websocket attempt failed - continue to next methods
+        try { console.warn(`[Helius] WS attempt failed for ${address}: ${e?.message || e}`); } catch(_) {}
       }
     }
     // 1) Try Helius RPC endpoint via solana web3 (best for paid keys)
@@ -804,6 +850,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         }
       } catch (err) {
         // if RPC attempt fails, continue to parse API below
+        try { console.warn(`[Helius] RPC endpoint attempt failed for ${address}: ${err?.message || err}`); } catch(_) {}
       }
     }
 
@@ -833,7 +880,8 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
     return null;
   } catch (e) {
     // If HTTP / RPC failed: try Solscan then RPC fallback if enabled
-    enrichmentMetrics.heliusFailures++;
+  enrichmentMetrics.heliusFailures++;
+  try { console.error(`[Helius] getFirstTxTimestampFromHelius failed for ${address}: ${e?.message || e}`); } catch(_) {}
   if (SOLSCAN_FALLBACK_ENABLED) {
       try {
         const ts = await getFirstTxTimestampFromSolscan(address);
@@ -876,8 +924,13 @@ async function getFirstTxTimestampFromSolscan(address: string): Promise<number |
     const resultMs = (earliest === Number.MAX_SAFE_INTEGER) ? null : earliest;
     return resultMs;
   } catch (e) {
-    enrichmentMetrics.solscanFailures++;
-    return null;
+  enrichmentMetrics.solscanFailures++;
+  try {
+    const status = (e as any)?.response?.status || (e as any)?.code || 'n/a';
+    const dataSnippet = (() => { try { const d = (e as any)?.response?.data; return d ? (typeof d === 'string' ? d.slice(0,200) : JSON.stringify(d).slice(0,200)) : ''; } catch { return ''; } })();
+    console.error(`[Solscan] getFirstTxTimestampFromSolscan failed for ${address}: status=${status} data=${dataSnippet} msg=${String((e as any)?.message || e)}`);
+  } catch(_) {}
+  return null;
   }
 }
 
@@ -1260,8 +1313,9 @@ function progressBar(percent: number, size = 10, fill = '█', empty = '░') {
 export async function notifyUsers(bot: any, users: Record<string, any>, tokens: any[]) {
   for (const uid of Object.keys(users)) {
     const strategy: Record<string, any> = users[uid]?.strategy || {};
-    const filtered = autoFilterTokens(tokens, strategy);
-    if (filtered.length > 0 && bot) {
+    const filteredVerbose = autoFilterTokensVerbose(tokens, strategy);
+    const filtered = (filteredVerbose && filteredVerbose.passed) ? filteredVerbose.passed : (Array.isArray(filteredVerbose) ? filteredVerbose : tokens);
+    if (filtered && filtered.length > 0 && bot) {
       for (const token of filtered) {
         const chain = (token.chainId || token.chain || token.chainName || '').toString().toLowerCase();
         if (chain && !chain.includes('sol')) continue;

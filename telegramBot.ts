@@ -8,7 +8,7 @@ import { helpMessages } from './src/helpMessages';
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
-import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokens, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
+import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokensVerbose, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
 import { enqueueEnrichJob, startEnrichQueue } from './src/bot/enrichQueue';
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
@@ -136,10 +136,10 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         }
         // Use tokenUtils.autoFilterTokens for quick numeric filtering
         const tokenUtils = await import('./src/utils/tokenUtils');
-        const prefiltered = (() => {
-          try { return tokenUtils.autoFilterTokens(tokens, fastStrategy); } catch { return tokens; }
+        const prefilteredVerbose = (() => {
+          try { return tokenUtils.autoFilterTokensVerbose(tokens, fastStrategy); } catch { return { passed: tokens, rejected: [] }; }
         })();
-        const resolvedPrefiltered = Array.isArray(prefiltered) ? prefiltered : tokens;
+        const resolvedPrefiltered = Array.isArray(prefilteredVerbose) ? prefilteredVerbose : (prefilteredVerbose && prefilteredVerbose.passed ? prefilteredVerbose.passed : tokens);
         // enrich only top candidates (by liquidity then volume)
   // per-user overrides with env defaults
   const enrichLimit = Number(strategy?.heliusEnrichLimit ?? HELIUS_ENRICH_LIMIT ?? 25);
