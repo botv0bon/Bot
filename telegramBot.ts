@@ -15,6 +15,33 @@ import { normalizeStrategy } from './src/utils/strategyNormalizer';
 import { startFastTokenFetcher } from './src/fastTokenFetcher';
 import { generateKeypair, exportSecretKey, parseKey } from './src/wallet';
 
+// Install a small console filter to suppress noisy 429/retry messages coming from HTTP libs
+const _origWarn = console.warn.bind(console);
+const _origError = console.error.bind(console);
+const _origLog = console.log.bind(console);
+const _filterRegex = /(Server responded with 429 Too Many Requests|Retrying after|Too Many Requests|entering cooldown)/i;
+console.warn = (...args: any[]) => {
+  try {
+    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    if (_filterRegex.test(s)) return; // drop noisy retry/429 lines
+  } catch (e) {}
+  _origWarn(...args);
+};
+console.error = (...args: any[]) => {
+  try {
+    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    if (_filterRegex.test(s)) return;
+  } catch (e) {}
+  _origError(...args);
+};
+console.log = (...args: any[]) => {
+  try {
+    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    if (_filterRegex.test(s)) return;
+  } catch (e) {}
+  _origLog(...args);
+};
+
 console.log('--- Bot starting: Imports loaded ---');
 
 dotenv.config();
@@ -113,7 +140,10 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         })();
         const resolvedPrefiltered = Array.isArray(prefiltered) ? prefiltered : tokens;
         // enrich only top candidates (by liquidity then volume)
-        const enrichLimit = Number(process.env.HELIUS_ENRICH_LIMIT || 25);
+  // per-user overrides with env defaults
+  const enrichLimit = Number(strategy?.heliusEnrichLimit ?? process.env.HELIUS_ENRICH_LIMIT ?? 25);
+  const heliusBatchSize = Number(strategy?.heliusBatchSize ?? process.env.HELIUS_BATCH_SIZE ?? 8);
+  const heliusBatchDelayMs = Number(strategy?.heliusBatchDelayMs ?? process.env.HELIUS_BATCH_DELAY_MS ?? 250);
         // sort candidates by liquidity (fallback to volume or marketCap)
         const ranked = resolvedPrefiltered.slice().sort((a: any, b: any) => {
           const la = (a.liquidity || a.liquidityUsd || 0) as number;
@@ -127,7 +157,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         const { enrichTokenTimestamps, withTimeout } = await import('./src/utils/tokenUtils');
         try {
           const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
-          await withTimeout(enrichTokenTimestamps(toEnrich, { batchSize: Number(process.env.HELIUS_BATCH_SIZE || 8), delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 250) }), timeoutMs, 'getTokens-enrich');
+          await withTimeout(enrichTokenTimestamps(toEnrich, { batchSize: heliusBatchSize, delayMs: heliusBatchDelayMs }), timeoutMs, 'getTokens-enrich');
         } catch (e: any) {
           // Keep a concise log and proceed with un-enriched token list to avoid blocking handlers
           console.warn('[getTokensForUser] enrichment skipped/timeout:', e?.message || e);

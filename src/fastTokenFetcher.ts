@@ -220,6 +220,53 @@ let __global_fetch_cache: any[] = [];
 let __global_fetch_ts = 0;
 const __GLOBAL_FETCH_TTL = 1000 * 60 * 1; // 1 minute default
 
+// Aggregate quick candidate sources into a unified list of { mint }
+async function getUnifiedCandidates(limit: number) {
+  const candidates: string[] = [];
+  try {
+    // 1) Helius WS buffer + recent events
+    try {
+      const { getRecentHeliusEvents } = require('./heliusWsListener');
+      const evs = getRecentHeliusEvents();
+      if (Array.isArray(evs)) {
+        for (const e of evs) {
+          const m = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint));
+          if (m) candidates.push(m);
+          if (candidates.length >= limit) break;
+        }
+      }
+    } catch (e) {}
+
+    // 2) DexScreener boosts
+    try {
+      const raw = await fetchDexBoostsRaw(2000);
+      let data: any[] = [];
+      if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || raw.items || []);
+      for (const it of data) {
+        const m = extractMintFromItemLocal(it);
+        if (m) candidates.push(m);
+        if (candidates.length >= limit) break;
+      }
+    } catch (e) {}
+
+    // 3) fetchLatest5FromAllSources for extra corroboration
+    try {
+      const subs = await fetchLatest5FromAllSources(Math.max(5, limit));
+      for (const arr of [subs.heliusEvents || [], subs.dexTop || [], subs.heliusHistory || []]) {
+        for (const m of arr) {
+          if (m) candidates.push(m);
+          if (candidates.length >= limit) break;
+        }
+        if (candidates.length >= limit) break;
+      }
+    } catch (e) {}
+
+  } catch (e) {}
+
+  const uniq = Array.from(new Set(candidates)).slice(0, limit || 200);
+  return uniq.map(m => ({ mint: m }));
+}
+
 /**
  * Fetch tokens from common sources (DexScreener, CoinGecko fallback) once,
  * then filter tokens per user based on their normalized strategy.
@@ -232,9 +279,13 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
   } else {
     try {
       const limit = opts?.limit || 200;
-  // fetch unified tokens (DexScreener + Solana RPC + Jupiter enrichment)
-  const { fetchUnifiedTokens } = require('./utils/tokenUtils');
-  __global_fetch_cache = await fetchUnifiedTokens('solana', { limit: String(limit) } as any);
+  // fetch unified candidates from multiple sources (DexScreener + Helius events/history + parse + RPC)
+  __global_fetch_cache = await getUnifiedCandidates(limit).catch(async (e: any) => {
+    try {
+      const { fetchUnifiedTokens } = require('./utils/tokenUtils');
+      return await fetchUnifiedTokens('solana', { limit: String(limit) } as any);
+    } catch (ee) { return []; }
+  });
       __global_fetch_ts = Date.now();
     } catch (e) {
       // fallback: try coinGecko single fetch
@@ -276,14 +327,30 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
       if (needOfficial && Array.isArray(workCache) && workCache.length > 0) {
   const sampleSize = Number(process.env.FASTFETCH_SAMPLE_SIZE || 40);
   const sample = workCache.slice(0, sampleSize);
-  const { officialEnrich } = require('./utils/tokenUtils');
+  const { officialEnrich, checkOnChainActivity } = require('./utils/tokenUtils');
   const concurrency = Number(process.env.FASTFETCH_ENRICH_CONCURRENCY || 1);
         let idx = 0;
         async function worker() {
           while (idx < sample.length) {
             const i = idx++;
             const t = sample[i];
-            try { await officialEnrich(t, { amountUsd: Number(strat.buyAmount) || 50, timeoutMs: 4000 }); } catch (e) {}
+            try {
+              // Gate expensive officialEnrich calls by a lightweight on-chain activity check
+              // This avoids enriching memo-only/noise tokens and reduces 429s.
+              const addr = t.tokenAddress || t.address || t.mint || t.pairAddress;
+              if (!addr) continue;
+              try {
+                const oc = await checkOnChainActivity(addr);
+                if (!oc || !oc.found) {
+                  // skip heavy enrichment when no on-chain activity found
+                  continue;
+                }
+              } catch (e) {
+                // if on-chain check fails, skip to avoid extra load
+                continue;
+              }
+              await officialEnrich(t, { amountUsd: Number(strat.buyAmount) || 50, timeoutMs: 4000 });
+            } catch (e) {}
           }
         }
         const workers = Array.from({ length: Math.min(concurrency, sample.length) }, () => worker());

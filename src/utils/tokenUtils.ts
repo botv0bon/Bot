@@ -19,6 +19,70 @@ function fmtField(val: number | string | undefined | null, field: string): strin
       return num.toLocaleString(undefined, { maximumFractionDigits: 2 });
   }
 }
+// Suppress noisy 429/retry lines globally (guarded so we only patch once)
+try {
+  // @ts-ignore
+  if (!globalThis.__SUPPRESS_429_LOGS) {
+    // preserve originals
+    const _w = console.warn.bind(console);
+    const _e = console.error.bind(console);
+    const _l = console.log.bind(console);
+  const _filter = /(Server responded with 429 Too Many Requests|Retrying after|Too Many Requests|entering cooldown|HTTP failure for)/i;
+    console.warn = (...args: any[]) => {
+      try {
+        const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+        if (_filter.test(s)) return;
+      } catch (e) {}
+      _w(...args);
+    };
+    console.error = (...args: any[]) => {
+      try {
+        const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+        if (_filter.test(s)) return;
+      } catch (e) {}
+      _e(...args);
+    };
+    console.log = (...args: any[]) => {
+      try {
+        const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+        if (_filter.test(s)) return;
+      } catch (e) {}
+      _l(...args);
+    };
+    // @ts-ignore
+    globalThis.__SUPPRESS_429_LOGS = true;
+  }
+} catch (e) {}
+
+// Additionally filter raw stdout/stderr writes (some libs write directly) to hide noisy 429 retry lines
+try {
+  // @ts-ignore
+  if (!globalThis.__SUPPRESS_429_STDIO) {
+    const _stdoutWrite = process.stdout.write.bind(process.stdout);
+    const _stderrWrite = process.stderr.write.bind(process.stderr);
+  const _filterStd = /(Server responded with 429 Too Many Requests|Retrying after|Too Many Requests|entering cooldown|HTTP failure for)/i;
+    // @ts-ignore
+    process.stdout.write = (chunk: any, encoding?: any, cb?: any) => {
+      try {
+        const s = typeof chunk === 'string' ? chunk : chunk && chunk.toString ? chunk.toString() : '';
+        if (_filterStd.test(s)) return true;
+      } catch (e) {}
+      // @ts-ignore
+      return _stdoutWrite(chunk, encoding, cb);
+    };
+    // @ts-ignore
+    process.stderr.write = (chunk: any, encoding?: any, cb?: any) => {
+      try {
+        const s = typeof chunk === 'string' ? chunk : chunk && chunk.toString ? chunk.toString() : '';
+        if (_filterStd.test(s)) return true;
+      } catch (e) {}
+      // @ts-ignore
+      return _stderrWrite(chunk, encoding, cb);
+    };
+    // @ts-ignore
+    globalThis.__SUPPRESS_429_STDIO = true;
+  }
+} catch (e) {}
 import axios from 'axios';
 import { Connection, PublicKey } from '@solana/web3.js';
 
@@ -507,7 +571,17 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         throw err;
       }
     }
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Clamp attempts to 1 if host previously entered cooldown to avoid tight retry loops
+    let effectiveMaxAttempts = maxAttempts;
+    try {
+      const hostKeyTmp = new URL(url).host;
+      const st = heliusHostState[hostKeyTmp];
+      if (st && st.cooldownUntil && Date.now() < st.cooldownUntil) {
+        effectiveMaxAttempts = 1;
+      }
+    } catch (e) {}
+
+    for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt++) {
       const start = Date.now();
       try {
         enrichmentMetrics.heliusCalls++;
@@ -536,17 +610,12 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
           const cooldown = Math.min(baseMs * Math.pow(2, state.failureCount), 5 * 60 * 1000) + Math.floor(Math.random() * jitterMs);
           state.cooldownUntil = Date.now() + cooldown;
           heliusHostState[hostKey] = state;
-          // Wait a short time before next attempt but avoid tight loops
-          const wait = Math.min(cooldown, 15000);
-          await sleep(wait);
-          // Minimal, single-line notification when entering cooldown; avoid printing every retry or stack
+          // Avoid repeated 'Retrying...' style logging; only log when first entering cooldown
           if (state.failureCount === 1) {
             console.warn(`[Helius] ${hostKey} responded 429 — entering cooldown ~${Math.round(cooldown/1000)}s`);
-          } else if (state.failureCount > 1 && state.failureCount % 5 === 0) {
-            // occasional periodic notice every N repeated failures to aid ops without flooding logs
-            console.warn(`[Helius] ${hostKey} still returning 429s (failures=${state.failureCount})`);
           }
-          continue;
+          // Fail fast: do not spin retries for 429 — rely on cooldown
+          break;
         }
         // If server provided Retry-After, honor it
         if (retryAfter) {

@@ -36,7 +36,8 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
   const recentEvents: any[] = [];
   function pushEvent(ev: any) {
     try {
-      recentEvents.unshift(ev);
+  recentEvents.unshift(ev);
+  try { console.log('Helius detected event', ev && ev.mint, ev && ev.eventType); } catch {}
       if (recentEvents.length > 200) recentEvents.length = 200;
     } catch {}
   }
@@ -88,6 +89,70 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
           pushEvent(evt);
           try { options?.onMessage && options.onMessage(parsed); } catch {}
           try { if ((options as any)?.onNewMint) (options as any).onNewMint(evt); } catch (e) {}
+
+          // Only attempt automatic quick enrichment/validation for strict signals:
+          // - `eventType === 'metadata_or_initialize'`
+          // - OR parsed instructions (including innerInstructions) that contain an explicit `info.mint` field
+          // This tightens the previous heuristic to avoid enriching on noisy fallback/memo detections.
+          let shouldEnrich = false;
+          try {
+            if (evt.eventType === 'metadata_or_initialize') shouldEnrich = true;
+
+            if (!shouldEnrich) {
+              const raw = evt.raw || parsed;
+              const res = raw?.params?.result || raw?.result || raw;
+              const v = res?.value || res;
+
+              const checkInstructionsForMint = (instructions: any[]) => {
+                if (!Array.isArray(instructions)) return false;
+                for (const ins of instructions) {
+                  try {
+                    if (ins && ins.parsed && typeof ins.parsed === 'object') {
+                      const info = ins.parsed.info || ins.parsed;
+                      if (info && typeof info === 'object' && typeof info.mint === 'string' && info.mint.length >= 32 && info.mint.length <= 44) {
+                        return true;
+                      }
+                    }
+                  } catch (e) {}
+                }
+                return false;
+              };
+
+              if (v && v.meta && Array.isArray(v.meta.innerInstructions)) {
+                for (const block of v.meta.innerInstructions) {
+                  if (block && Array.isArray(block.instructions) && checkInstructionsForMint(block.instructions)) {
+                    shouldEnrich = true;
+                    break;
+                  }
+                }
+              }
+
+              if (!shouldEnrich && v && v.transaction && v.transaction.message && Array.isArray(v.transaction.message.instructions)) {
+                if (checkInstructionsForMint(v.transaction.message.instructions)) shouldEnrich = true;
+              }
+            }
+          } catch (e) {}
+
+          try {
+            const ff = require('./fastTokenFetcher');
+            const hf = ff && (ff.handleNewMintEvent || ff.default && ff.default.handleNewMintEvent);
+            if (typeof hf === 'function') {
+              // lazy-create enrichment manager singleton
+              try {
+                const mgrMod = require('./heliusEnrichmentQueue');
+                const mgr = (mgrMod && mgrMod._manager) || (mgrMod && mgrMod.createEnrichmentManager && (mgrMod._manager = mgrMod.createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 })));
+                if (shouldEnrich) {
+                  // enqueue with dedupe + concurrency control
+                  try { mgr.enqueue(evt, hf); } catch (e) { /* fallback */ hf(evt).catch(() => {}); }
+                } else {
+                  try { console.log('Helius skipping auto-enrich for', evt.eventType || 'fallback', evt.mint); } catch {};
+                }
+              } catch (e) {
+                // if manager fails for any reason, fallback to fire-and-forget when allowed
+                if (shouldEnrich) hf(evt).catch(() => {});
+              }
+            }
+          } catch (e) {}
         }
       } catch (e) {}
     } catch (err) {
@@ -140,44 +205,78 @@ function analyzeHeliusMessage(parsed: any) {
   try {
     const res = parsed.params?.result || parsed.result || parsed;
     const v = res.value || res; // sometimes nested
-    // Helius logsNotification: v.logs is array of program log strings
-    if (v && Array.isArray(v.logs)) {
-      // look for lines mentioning 'initialize_mint' or 'Create Metadata' or base58 pubkeys
-      for (const ln of v.logs) {
+    // Consolidate logs sources: top-level logs, meta.logMessages, value.logs
+    const logs: string[] = [];
+    if (v && Array.isArray(v.logs)) logs.push(...v.logs.filter((x: any) => typeof x === 'string'));
+    if (v && v.meta && Array.isArray(v.meta.logMessages)) logs.push(...v.meta.logMessages.filter((x: any) => typeof x === 'string'));
+
+    // Helius logsNotification: inspect logs for explicit patterns and memo content
+    if (logs.length) {
+      for (const ln of logs) {
         if (typeof ln !== 'string') continue;
-        // detect explicit instruction names
-        if (ln.toLowerCase().includes('initialize_mint') || ln.toLowerCase().includes('create_metadata')) {
-          // try to extract any base58-looking token after the log line
+        const low = ln.toLowerCase();
+        // common explicit patterns
+        if (low.includes('initialize_mint') || low.includes('create_metadata') || low.includes('create metadata account') || low.includes('create_metadata_account')) {
           const m = ln.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
-          if (m && m.length) {
-            return { mint: m[0], detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
-          }
+          if (m && m.length) return { mint: m[0], eventType: 'metadata_or_initialize', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+        }
+        // memo program may include a raw mint in memo text or label
+        if (low.includes('memo') || ln.includes('Memo') || ln.includes('memo:')) {
+          const m = ln.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
+          if (m && m.length) return { mint: m[0], eventType: 'memo', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+        }
+        // sometimes labels like 'name: <mint>' or 'mint: <addr>' appear
+        const labelMatch = ln.match(/(?:mint[:=]\s*|name[:=]\s*)([1-9A-HJ-NP-Za-km-z]{32,44})/i);
+        if (labelMatch && labelMatch[1]) return { mint: labelMatch[1], eventType: 'label', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+      }
+    }
+
+    // If Helius gives parsed inner instructions (meta.innerInstructions), search there first
+    if (v && v.meta && Array.isArray(v.meta.innerInstructions)) {
+      for (const block of v.meta.innerInstructions) {
+        if (!block || !Array.isArray(block.instructions)) continue;
+        for (const ins of block.instructions) {
+          try {
+            if (ins.parsed && typeof ins.parsed === 'object') {
+              const info = ins.parsed.info || ins.parsed;
+              if (info && typeof info === 'object') {
+                const cand = info.mint || info.token || info.mintAddress || info.account || info.destination || info.source || null;
+                if (typeof cand === 'string' && cand.length >= 32 && cand.length <= 44) return { mint: cand, eventType: 'inner_parsed', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+                // sometimes 'mint' appears nested inside other objects
+                if (info.postTokenBalances && Array.isArray(info.postTokenBalances)) {
+                  for (const b of info.postTokenBalances) {
+                    if (b && typeof b.mint === 'string' && b.mint.length >= 32 && b.mint.length <= 44) return { mint: b.mint, eventType: 'postTokenBalance', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+                  }
+                }
+              }
+            }
+          } catch (e) {}
         }
       }
     }
 
-    // If Helius gives parsed inner instructions, search there
+    // Broadened scan of transaction.message.instructions (incl. parsed forms)
     if (v && v.transaction && v.transaction.message && Array.isArray(v.transaction.message.instructions)) {
       for (const ins of v.transaction.message.instructions) {
         try {
-          // parsed instructions often have 'parsed' object with info
           if (ins.parsed && typeof ins.parsed === 'object') {
-            // SPL Token initializeMint sometimes in parsed.type
-            const t = ins.parsed.type || ins.parsed.instruction || '';
-            if (typeof t === 'string' && (t.toLowerCase().includes('initialize') || t.toLowerCase().includes('mint'))) {
-              // check accounts or info for mint
-              const info = ins.parsed.info || ins.parsed;
-              if (info && typeof info === 'object') {
-                const cand = info.mint || info.token || info.mintAddress || info.account || null;
-                if (typeof cand === 'string' && cand.length >= 32 && cand.length <= 44) return { mint: cand, detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+            const t = (ins.parsed.type || ins.parsed.instruction || '') + '';
+            const info = ins.parsed.info || ins.parsed;
+            if (info && typeof info === 'object') {
+              const cand = info.mint || info.token || info.mintAddress || info.account || info.destination || info.source || null;
+              if (typeof cand === 'string' && cand.length >= 32 && cand.length <= 44) return { mint: cand, eventType: 'parsed_instruction', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+              if (info.postTokenBalances && Array.isArray(info.postTokenBalances)) {
+                for (const b of info.postTokenBalances) {
+                  if (b && typeof b.mint === 'string' && b.mint.length >= 32 && b.mint.length <= 44) return { mint: b.mint, eventType: 'postTokenBalance', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+                }
               }
             }
           }
-          // otherwise try scanning instruction accounts for base58-like strings
+          // scan accounts field
           if (ins.accounts && Array.isArray(ins.accounts)) {
             for (const a of ins.accounts) {
               if (typeof a === 'string' && a.length >= 32 && a.length <= 44) {
-                return { mint: a, detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+                return { mint: a, eventType: 'account_ref', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
               }
             }
           }
@@ -188,26 +287,28 @@ function analyzeHeliusMessage(parsed: any) {
 
   // Fallback: recursive search for base58-like substrings anywhere in the message
   const found: Record<string, any> = {};
-  function walk(o: any) {
-    if (!o) return;
-    if (Array.isArray(o)) return o.forEach(walk);
+  function walk(o: any, depth = 0) {
+    if (!o || depth > 10) return;
+    if (Array.isArray(o)) return o.forEach((x) => walk(x, depth + 1));
     if (typeof o === 'object') {
       for (const k of Object.keys(o)) {
         try {
           const v2 = o[k];
-          if (k === 'mint' && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) found.mint = v2;
-          walk(v2);
+          if ((k === 'mint' || k === 'token' || k === 'mintAddress' || k === 'account') && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) found.mint = v2;
+          // try to detect token fields inside nested objects
+          if (k.toLowerCase().includes('mint') && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) found.mint = v2;
+          walk(v2, depth + 1);
         } catch (e) {}
       }
     } else if (typeof o === 'string') {
       const m = o.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
-      if (m && m.length) found.candidate = m[0];
+      if (m && m.length) found.candidate = found.candidate || m[0];
     }
   }
   walk(obj);
   const mint = found.mint || found.candidate || null;
   if (!mint) return null;
-  return { mint, detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
+  return { mint, eventType: 'fallback_recursive', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), raw: parsed };
 }
 
 // Helper to expose recent events without keeping the instance around

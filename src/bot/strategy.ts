@@ -260,11 +260,38 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
   if (tokens.length > 0) {
     try {
       const utils = await import('../utils/tokenUtils');
+      // Merge realtime sources (Helius WS buffer, DexScreener top, Helius parse-history) so filters
+      // operate on a richer, corroborated set. Use existing fastTokenFetcher helper to gather latest candidates.
+      try {
+        const ff = await import('../fastTokenFetcher');
+        const latest = await ff.fetchLatest5FromAllSources(10).catch(() => null);
+        if (latest) {
+          const extras: any[] = [];
+          const pushAddr = (a: any) => { if (!a) return; const s = String(a); if (!s) return; extras.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
+          (latest.heliusEvents || []).forEach(pushAddr);
+          (latest.dexTop || []).forEach(pushAddr);
+          (latest.heliusHistory || []).forEach(pushAddr);
+          // merge extras into tokens if not present
+          const seen = new Set(tokens.map(t => (t.tokenAddress || t.address || t.mint || '').toString()));
+          for (const ex of extras) {
+            const key = ex.tokenAddress || ex.address || ex.mint || '';
+            if (!key) continue;
+            if (!seen.has(key)) {
+              tokens.push(ex);
+              seen.add(key);
+            }
+          }
+          try { console.log('[filterTokensByStrategy] merged realtime sources; extraCandidates=', extras.length); } catch {}
+        }
+      } catch (e) {
+        try { console.warn('[filterTokensByStrategy] failed to fetch realtime candidates', e && e.message ? e.message : e); } catch {}
+      }
+
       const enrichPromise = utils.enrichTokenTimestamps(tokens, {
-        batchSize: Number(process.env.HELIUS_BATCH_SIZE || 4),
-        delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 400)
+        batchSize: Number(process.env.HELIUS_BATCH_SIZE || 6),
+        delayMs: Number(process.env.HELIUS_BATCH_DELAY_MS || 300)
       });
-      const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
+  const timeoutMs = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 8000);
       // Bound the enrichment so filtering remains responsive
       await utils.withTimeout(enrichPromise, timeoutMs, 'filter-enrich');
     } catch (e: any) {
@@ -328,11 +355,17 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
       ageSeconds = token.ageMinutes * 60;
     }
 
-    // If age is unknown and strategy requires strict minAge > 60s, fail; otherwise allow (keeps parity with autoFilterTokens permissive rule)
-    const minAgeSeconds = strategy.minAge !== undefined ? (typeof strategy.minAge === 'string' ? parseDuration(strategy.minAge) : Number(strategy.minAge) * 60) : undefined;
+    // If age is unknown and the strategy requires a minimum age, reject tokens
+    // that don't have a known on-chain age when the required min age is >= 60s
+    // (treat numeric strategy.minAge as minutes for backward compatibility).
+    const minAgeSeconds = strategy.minAge !== undefined
+      ? (typeof strategy.minAge === 'string' ? parseDuration(strategy.minAge) : Number(strategy.minAge) * 60)
+      : undefined;
     if (minAgeSeconds !== undefined) {
       if (ageSeconds === undefined || isNaN(ageSeconds)) {
-        if (minAgeSeconds > 60) return false; // strict requirement
+        // Require a known on-chain age for any minAge >= 60 seconds (1 minute).
+        if (minAgeSeconds >= 60) return false;
+        // For very small minAge (< 60s) remain permissive when age unknown.
       } else {
         if (ageSeconds < minAgeSeconds) return false;
       }
@@ -350,6 +383,13 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
       }
     } catch (e) {
       // ignore scoring errors and proceed
+    }
+
+    // Enforce strict onlyReal tokens when requested by strategy
+    if ((strategy as any)?.onlyReal === true) {
+      const hasOnchain = !!(token?.freshnessDetails?.onChainTs || token?.freshnessDetails?.firstTxMs || token.poolOpenTimeMs || token.firstBlockTime || token.metadataExists);
+      // If no on-chain evidence or metadata, reject as likely noise/memo
+      if (!hasOnchain) return false;
     }
 
     // Verification
