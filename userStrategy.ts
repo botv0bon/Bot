@@ -162,6 +162,13 @@ export async function executeHoneyStrategy(
     // Ignore tokens with missing essential data
     if (!token.address || !token.buyAmount || !Array.isArray(token.profitPercents) || !Array.isArray(token.soldPercents) || token.profitPercents.length === 0 || token.soldPercents.length === 0) {
       token.status = 'error';
+      console.warn('[executeHoneyStrategy] token missing required fields', token && token.address);
+      continue;
+    }
+    // Ensure profit and sold arrays align
+    if (token.profitPercents.length !== token.soldPercents.length) {
+      token.status = 'error';
+      await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Mismatched profit/sold arrays' });
       continue;
     }
     if (token.finished) {
@@ -175,7 +182,7 @@ export async function executeHoneyStrategy(
       token.status = 'error';
       continue; // Skip token if price fetch fails
     }
-    if (!token.lastEntryPrice) {
+  if (!token.lastEntryPrice) {
       // Initial buy
       try {
         // Normalize strategy for user's checks
@@ -185,40 +192,32 @@ export async function executeHoneyStrategy(
   // pump.fun is enrichment-only and will not be used as a blocking filter
   const needPump = false;
   if (needJupiter && token.address) {
-          try {
-            const { JUPITER_QUOTE_API } = require('./src/config');
-            const axios = require('axios');
-            const mint = token.address;
-            if (needJupiter && JUPITER_QUOTE_API) {
-              const amountUsd = finalStrategy.minJupiterUsd || 50;
-              const lamports = Math.floor((amountUsd / 1) * 1e9);
-              try {
-                const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${mint}&amount=${lamports}&slippage=1`;
-                const r = await axios.get(url, { timeout: 5000 });
-                (token as any).jupiter = r.data;
-                const swap = Number(r.data?.swapUsdValue || 0);
-                if (typeof finalStrategy.minJupiterUsd === 'number' && swap < finalStrategy.minJupiterUsd) {
-                  token.status = 'error';
-                  await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Jupiter liquidity below threshold' });
-                  continue;
-                }
-                if (finalStrategy.requireJupiterRoute === true && !(r.data?.routePlan || r.data?.data)) {
-                  token.status = 'error';
-                  await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'No Jupiter route' });
-                  continue;
-                }
-              } catch (e) {
-                // treat as not meeting requirements
-                token.status = 'error';
-                await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Jupiter check failed' });
-                continue;
-              }
-            }
-            // Optional pump enrichment (non-blocking)
-            try { const p = await require('./src/pump/api').getCoinData(token.address); (token as any).pump = p; } catch (e) {}
-          } catch (e) {}
-        }
-        const solBalance = await getSolBalance(user.secret);
+    try {
+      const tu = require('./src/utils/tokenUtils');
+      // prefer passing buyAmount as SOL for an accurate quote; fallback to minJupiterUsd if available
+      const jres = await tu.finalJupiterCheck(token.address, token.buyAmount || 0, { minJupiterUsd: finalStrategy.minJupiterUsd, requireRoute: finalStrategy.requireJupiterRoute, timeoutMs: 5000 });
+      (token as any).jupiter = jres.data || null;
+      if (!jres.ok) {
+        token.status = 'error';
+        await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Jupiter check failed: ' + (jres.reason || 'no-route') });
+        continue;
+      }
+      // If requireJupiterRoute requested but response lacks route details, fail
+      if (finalStrategy.requireJupiterRoute === true && !(jres.data?.data || jres.data?.routePlan)) {
+        token.status = 'error';
+        await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'No Jupiter route' });
+        continue;
+      }
+    } catch (e) {
+      token.status = 'error';
+      await recordUserTrade(userId, { mode: 'buy', token: token.address, amount: token.buyAmount, status: 'fail', error: 'Jupiter check exception: ' + (e instanceof Error ? e.message : String(e)) });
+      continue;
+    }
+    // Optional pump enrichment (non-blocking)
+    try { const p = await require('./src/pump/api').getCoinData(token.address); (token as any).pump = p; } catch (e) {}
+  }
+    const solBalance = await getSolBalance(user.secret);
+  // Ensure user has SOL for buy amount + fee
   if (solBalance < token.buyAmount + 0.002) { // 0.002 SOL estimated for fees
           token.status = 'error';
           await recordUserTrade(userId, {
@@ -267,8 +266,20 @@ export async function executeHoneyStrategy(
       ) {
         const sellAmount = token.buyAmount * (token.soldPercents[i] / 100);
         try {
-          const solBalance = await getSolBalance(user.secret);
-          if (solBalance < sellAmount + 0.002) {
+          // Check token SPL balance (if helper exists) and SOL fees separately.
+          let hasTokenBalance = true;
+          try {
+            const TokenService = require('./src/services/token.metadata').TokenService;
+            if (TokenService && typeof TokenService.getSPLBalance === 'function') {
+              const splbal = await TokenService.getSPLBalance(user.wallet || user.walletAddress || user.address || user.publicKey, token.address).catch(() => null);
+              // splbal may be object or number
+              const numeric = splbal && typeof splbal === 'object' && typeof splbal.uiAmount === 'number' ? splbal.uiAmount : (typeof splbal === 'number' ? splbal : null);
+              if (numeric === null || numeric < (sellAmount - 0.0000001)) {
+                hasTokenBalance = false;
+              }
+            }
+          } catch (e) { /* ignore service errors, assume balance exists */ }
+          if (!hasTokenBalance) {
             token.status = 'error';
             await recordUserTrade(userId, {
               mode: 'sell',
@@ -276,7 +287,20 @@ export async function executeHoneyStrategy(
               amount: sellAmount,
               sellPrice: currentPrice,
               status: 'fail',
-              error: 'Insufficient SOL balance for sell and fees',
+              error: 'Insufficient token balance for sell',
+            });
+            continue;
+          }
+          const solBalance = await getSolBalance(user.secret);
+          if (solBalance < 0.002) {
+            token.status = 'error';
+            await recordUserTrade(userId, {
+              mode: 'sell',
+              token: token.address,
+              amount: sellAmount,
+              sellPrice: currentPrice,
+              status: 'fail',
+              error: 'Insufficient SOL for transaction fees',
             });
             continue;
           }

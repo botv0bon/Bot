@@ -6,7 +6,7 @@ import { normalizeStrategy } from './utils/strategyNormalizer';
 import { registerBuyWithTarget } from './bot/strategy';
 import { extractTradeMeta } from './utils/tradeMeta';
 import { unifiedBuy } from './tradeSources';
-import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko } from './utils/tokenUtils';
+import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko, normalizeMintCandidate } from './utils/tokenUtils';
 import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL } from './config';
 import { getCoinData as getPumpData } from './pump/api';
 import { existsSync, mkdirSync } from 'fs';
@@ -267,6 +267,49 @@ async function getUnifiedCandidates(limit: number) {
   return uniq.map(m => ({ mint: m }));
 }
 
+// Return a list of candidates with source tags for diagnostics
+export async function fetchLatestWithSources(limit = 50) {
+  const out: Array<{ mint: string; source: string }> = [];
+  try {
+    const { getRecentHeliusEvents } = require('./heliusWsListener');
+    const evs = getRecentHeliusEvents() || [];
+    for (const e of evs) {
+      const m = normalizeMintCandidate(e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint)));
+      if (m) out.push({ mint: m, source: 'helius-ws' });
+      if (out.length >= limit) break;
+    }
+  } catch (e) {}
+
+  try {
+    const raw = await fetchDexBoostsRaw(2000);
+    let data: any[] = [];
+    if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || raw.items || []);
+    for (const it of data) {
+      const m = normalizeMintCandidate(extractMintFromItemLocal(it));
+      if (m) out.push({ mint: m, source: 'dexscreener' });
+      if (out.length >= limit) break;
+    }
+  } catch (e) {}
+
+  try {
+    const subs = await fetchLatest5FromAllSources(Math.max(5, limit));
+    for (const m of subs.heliusEvents || []) if (m) out.push({ mint: m, source: 'helius-history' });
+    for (const m of subs.dexTop || []) if (m) out.push({ mint: m, source: 'dex-top' });
+  } catch (e) {}
+
+  // dedupe preserve order
+  const seen = new Set<string>();
+  const final: Array<{ mint: string; source: string }> = [];
+  for (const it of out) {
+    if (!it || !it.mint) continue;
+    if (seen.has(it.mint)) continue;
+    seen.add(it.mint);
+    final.push(it);
+    if (final.length >= limit) break;
+  }
+  return final;
+}
+
 /**
  * Fetch tokens from common sources (DexScreener, CoinGecko fallback) once,
  * then filter tokens per user based on their normalized strategy.
@@ -386,16 +429,19 @@ function extractMintFromItemLocal(it: any): string | null {
   if (!it) return null;
   if (it.token && typeof it.token === 'object') {
     const t = it.token;
-    return t.address || t.mint || null;
+    return normalizeMintCandidate(t.address || t.mint || null);
   }
   if (it.pair && typeof it.pair === 'object') {
     const p = it.pair;
-    if (p.token && typeof p.token === 'object') return p.token.mint || p.token.address || null;
-    if (p.baseToken && typeof p.baseToken === 'object') return p.baseToken.mint || p.baseToken.address || null;
-    if (p.base && typeof p.base === 'object') return p.base.mint || p.base.address || null;
+    if (p.token && typeof p.token === 'object') return normalizeMintCandidate(p.token.mint || p.token.address || null);
+    if (p.baseToken && typeof p.baseToken === 'object') return normalizeMintCandidate(p.baseToken.mint || p.baseToken.address || null);
+    if (p.base && typeof p.base === 'object') return normalizeMintCandidate(p.base.mint || p.base.address || null);
   }
-  return it.tokenAddress || it.mint || it.address || null;
+  return normalizeMintCandidate(it.tokenAddress || it.mint || it.address || null);
 }
+
+// Normalize candidate mint strings: trim, remove common noise suffixes/prefixes, and validate base58 via PublicKey
+// normalizeMintCandidate is provided by ./utils/tokenUtils
 
 export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, timeout = 2500, retries = 0) {
   const payload = { jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [mint, { limit: 3 }] };
@@ -424,6 +470,11 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
 async function heliusRpc(method: string, params: any[] = [], timeout = 4000, retries = 0): Promise<any> {
   const heliusUrl = HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL;
   if (!heliusUrl) return { __error: 'no-helius-url' };
+  // host cooldown guard (global)
+  const hostStateKey = (() => { try { return new URL(heliusUrl).host; } catch { return heliusUrl; } })();
+  if ((globalThis as any).__hostCooldowns && (globalThis as any).__hostCooldowns[hostStateKey] && Date.now() < (globalThis as any).__hostCooldowns[hostStateKey].cooldownUntil) {
+    return { __error: 'host-cooldown' };
+  }
   const payload = { jsonrpc: '2.0', id: 1, method, params };
   let attempt = 0;
   while (attempt <= retries) {
@@ -432,6 +483,19 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
       return res.data?.result ?? res.data;
     } catch (e: any) {
       const status = e.response?.status;
+      // handle 429/5xx with cooldown/backoff
+      if (status && (status === 429 || (status >= 500 && status < 600))) {
+        // record in global host cooldowns
+        try {
+          const host = hostStateKey;
+          (globalThis as any).__hostCooldowns = (globalThis as any).__hostCooldowns || {};
+          const st = (globalThis as any).__hostCooldowns[host] = (globalThis as any).__hostCooldowns[host] || { recent429: 0, cooldownUntil: 0 };
+          st.recent429 = (st.recent429 || 0) + 1;
+          const base = 1000;
+          const backoffMs = Math.min(60_000, base * Math.pow(2, Math.min(6, st.recent429)) + Math.floor(Math.random() * 500));
+          st.cooldownUntil = Date.now() + backoffMs;
+        } catch (ee) {}
+      }
       if (status && (status === 429 || (status >= 500 && status < 600)) && attempt < retries) {
         const backoff = 200 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
         await new Promise((r) => setTimeout(r, backoff));
@@ -448,7 +512,7 @@ async function getParsedTransaction(signature: string) {
   return heliusRpc('getTransaction', [signature, { encoding: 'jsonParsed' }], 5000, 1);
 }
 
-async function getAccountInfo(pubkey: string) {
+export async function getAccountInfo(pubkey: string) {
   return heliusRpc('getAccountInfo', [pubkey, { encoding: 'base64' }], 4000, 1);
 }
 
@@ -484,7 +548,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     let earliestBlockTime: number | null = null;
     let firstSignature: string | null = null;
     for (const entry of arr) {
-      const sig = entry?.signature || entry?.txHash || entry?.tx_hash || null;
+  const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
       let btv: any = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
       if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
       if (btv) {
@@ -498,7 +562,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
 
     // fallback: if no blockTime in signatures, try parsed tx for the last (earliest) signature
     if (!earliestBlockTime) {
-      const sigTry = arr[arr.length - 1]?.signature || arr[arr.length - 1]?.txHash || null;
+  const sigTry = arr[arr.length - 1]?.signature || (arr[arr.length - 1] as any)?.txHash || (arr[arr.length - 1] as any)?.tx_hash || null;
       if (sigTry) {
         try {
           const parsed = await getParsedTransaction(sigTry);
@@ -645,7 +709,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
         if (!Array.isArray(arr) || arr.length === 0) break;
         out.push(...arr);
         if (arr.length < limit) break;
-        before = arr[arr.length - 1].signature || arr[arr.length - 1].txHash || null;
+  before = arr[arr.length - 1].signature || (arr[arr.length - 1] as any).txHash || (arr[arr.length - 1] as any).tx_hash || null;
       } catch (e) { break; }
     }
     return out.slice(0, maxCollect);
@@ -694,7 +758,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
                 const f3 = Array.isArray(arr3) && arr3[0] ? arr3[0] : null;
                 const bt3 = f3?.blockTime ?? f3?.block_time ?? f3?.blocktime ?? null;
                 if (bt3) {
-                    results.push({ mint: t.mint, firstBlockTime: Number(bt3), ageSeconds: nowSec - Number(bt3), source: 'helius-rpc', earliestSignature: (f3 && (f3.signature || f3.txHash || f3.tx_hash)) || null });
+                    results.push({ mint: t.mint, firstBlockTime: Number(bt3), ageSeconds: nowSec - Number(bt3), source: 'helius-rpc', earliestSignature: (f3 && (f3.signature || (f3 as any).txHash || (f3 as any).tx_hash)) || null });
                   hostState[hk] = state;
                   return;
                 }
@@ -710,7 +774,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
                 const first = Array.isArray(arr) ? arr[0] : null;
                 const bt = first?.blockTime || first?.time || first?.timestamp || null;
           if (bt) {
-            results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || first.txHash || first.tx_hash)) || null });
+            results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null });
                   hostState[hk] = state;
                   return;
                 }
@@ -742,11 +806,11 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
                   if (b && b < (min.blockTime ?? min.block_time ?? min.blocktime ?? Infinity)) min = it;
                 }
                 bt2 = min.blockTime ?? min.block_time ?? min.blocktime ?? null;
-                sig2 = min.signature || min.txHash || min.tx_hash || null;
+                sig2 = min.signature || (min as any).txHash || (min as any).tx_hash || null;
               } else {
                 const last = arr2[arr2.length - 1];
                 bt2 = last?.blockTime ?? last?.block_time ?? last?.blocktime ?? null;
-                sig2 = last?.signature || last?.txHash || last?.tx_hash || null;
+                sig2 = last?.signature || (last as any)?.txHash || (last as any)?.tx_hash || null;
               }
             } catch (e) {}
 
@@ -796,7 +860,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
           if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
           if (btv && (!minBt || Number(btv) < minBt)) {
             minBt = Number(btv);
-            earliestSig = s?.signature || s?.txHash || s?.tx_hash || null;
+            earliestSig = s?.signature || (s as any)?.txHash || (s as any)?.tx_hash || null;
           }
         }
 
@@ -811,7 +875,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
             }
           } catch (e) {}
         } else {
-          const sigTry = arr[arr.length - 1]?.signature || arr[arr.length - 1]?.txHash || null;
+          const sigTry = arr[arr.length - 1]?.signature || (arr[arr.length - 1] as any)?.txHash || (arr[arr.length - 1] as any)?.tx_hash || null;
           if (sigTry) {
             try {
               const parsed = await getParsedTransaction(sigTry);
@@ -839,7 +903,7 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
               for (const s of fullSigs) {
                 let btv = s?.blockTime ?? s?.block_time ?? s?.blocktime ?? s?.timestamp ?? null;
                 if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
-                if (btv && (!fullMin || Number(btv) < fullMin)) { fullMin = Number(btv); candidateSig = s?.signature || s?.txHash || s?.tx_hash || null; }
+                if (btv && (!fullMin || Number(btv) < fullMin)) { fullMin = Number(btv); candidateSig = s?.signature || (s as any)?.txHash || (s as any)?.tx_hash || null; }
               }
               if (candidateSig) {
                 try {
@@ -902,8 +966,9 @@ export async function fetchLatest5FromAllSources(n = 5) {
     let data: any[] = [];
     if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || []);
     for (const it of data) {
-      const m = extractMintFromItemLocal(it);
-      if (m && !dex.includes(m)) dex.push(m);
+  const m = extractMintFromItemLocal(it);
+  const norm = normalizeMintCandidate(m);
+  if (norm && !dex.includes(norm)) dex.push(norm);
       if (dex.length >= n) break;
     }
   } catch (e) {}
@@ -930,10 +995,34 @@ export async function fetchLatest5FromAllSources(n = 5) {
     }
   } catch (e) {}
 
+  // Optional validation via helius getAccountInfo to ensure the mint/account exists (reduce 404s)
+  const shouldValidate = (process.env.HELIUS_VALIDATE_ACCOUNTS || 'false').toLowerCase() === 'true';
+  async function maybeValidate(list: string[]) {
+    if (!shouldValidate) return list.slice(0, n);
+    const out: string[] = [];
+    const concurrency = Number(process.env.HELIUS_VALIDATE_CONCURRENCY || 3);
+    let idx = 0;
+    async function worker() {
+      while (idx < list.length) {
+        const i = idx++;
+        const a = list[i];
+        try {
+          const acct = await getAccountInfo(a);
+          if (acct && acct.value) out.push(a);
+        } catch (e) {}
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, () => worker()));
+    return out.slice(0, n);
+  }
+
+  const heliusEventsNorm = Array.from(new Set(heliusEvents)).map(x=>normalizeMintCandidate(x)).filter(Boolean) as string[];
+  const heliusHistoryNorm = Array.from(new Set(heliusHistory)).map(x=>normalizeMintCandidate(x)).filter(Boolean) as string[];
+
   return {
-    heliusEvents: Array.from(new Set(heliusEvents)).slice(0, n),
+    heliusEvents: await maybeValidate(heliusEventsNorm),
     dexTop: dex.slice(0, n),
-    heliusHistory: Array.from(new Set(heliusHistory)).slice(0, n),
+    heliusHistory: await maybeValidate(heliusHistoryNorm),
   };
 }
 

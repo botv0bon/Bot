@@ -239,6 +239,52 @@ export function parseDuration(v: string | number | undefined | null): number | u
   }
 }
 
+// Normalize candidate mint strings: extract base58 substrings and validate via PublicKey
+export function normalizeMintCandidate(raw: string | null | undefined): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  let s = raw.trim();
+  // Remove common wrappers and trailing separators but keep labels like pump/bonk
+  s = s.replace(/(?:\s+)?(?:\[?solana\]?|\(?sol\)?)/i, '');
+  s = s.replace(/^https?:\/\/.+\//i, '');
+  s = s.replace(/^chain:\w+\//i, '');
+  s = s.replace(/[^A-Za-z0-9\-\_]+$/i, '');
+
+  // If it's an obvious ethereum hex address, skip
+  if (s.startsWith('0x') || /^[0-9a-fA-F]{40}$/.test(s)) return null;
+
+  // If the whole string is a plausible base58 public key, validate via PublicKey
+  try {
+    if (s.length >= 32 && s.length <= 50) {
+      const pk = new PublicKey(s);
+      return pk.toBase58();
+    }
+  } catch (e) {}
+
+  // Otherwise, attempt to extract the first base58-like substring (32-44 chars) from the raw string
+  try {
+    const m = s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
+    if (m && m.length) {
+      for (const candidate of m) {
+        try {
+          const pk2 = new PublicKey(candidate);
+          return pk2.toBase58();
+        } catch (e) {
+          // try next
+        }
+      }
+    }
+  } catch (e) {}
+
+  // fallback: try bs58 decode to see if decodes to reasonable length
+  try {
+    const bs58 = require('bs58');
+    const dec = bs58.decode(s);
+    if (dec && dec.length >= 32) return s;
+  } catch (ee) {}
+
+  return null;
+}
+
 
 export async function retryAsync<T>(fn: () => Promise<T>, retries = 0, delayMs = 2000): Promise<T> {
   let lastErr;
@@ -599,29 +645,55 @@ async function getFirstTxTimestampFromRpc(address: string): Promise<number | nul
     const pub = new PublicKey(address);
     const start = Date.now();
     enrichmentMetrics.rpcCalls++;
-    // fetch signatures (most recent first) — we will pick the oldest found in this batch
-    const sigs = await conn.getSignaturesForAddress(pub, { limit: 50 });
+    // Page signatures to try to reach the earliest transaction available (may be slow)
+    const collectSignaturesFull = async (maxCollect = 2000) => {
+      const out: any[] = [];
+      let before: string | null = null;
+      const limit = 1000;
+      for (let i = 0; i < 5 && out.length < maxCollect; i++) {
+        try {
+          const params: any = { limit };
+          if (before) params.before = before;
+          const page = await conn.getSignaturesForAddress(pub, params as any);
+          if (!Array.isArray(page) || page.length === 0) break;
+          out.push(...page);
+          if (page.length < limit) break;
+          before = page[page.length - 1].signature || (page[page.length - 1] as any).txHash || (page[page.length - 1] as any).tx_hash || null;
+        } catch (e) {
+          break;
+        }
+      }
+      return out.slice(0, maxCollect);
+    };
+
+    const sigs = await collectSignaturesFull(Number(process.env.RPC_SIG_PAGE_MAX || 2000));
     if (!sigs || sigs.length === 0) {
       enrichmentMetrics.rpcTotalMs += (Date.now() - start);
       return null;
     }
-    // check transactions for blockTime; try to find earliest blockTime
+
+    // fetch transactions in bounded concurrency and compute earliest blockTime
     let earliestMs: number | null = null;
-    for (const s of sigs) {
-      try {
-        const tx = await conn.getTransaction(s.signature, { commitment: 'confirmed' } as any);
-        const bt = tx?.blockTime;
-        if (bt) {
+    const concurrency = 4;
+    for (let i = 0; i < sigs.length; i += concurrency) {
+      const slice = sigs.slice(i, i + concurrency);
+      const txs = await Promise.all(slice.map((s: any) => conn.getTransaction(s.signature, { commitment: 'confirmed' } as any).catch(() => null)));
+      for (const tx of txs) {
+        try {
+          const bt = tx?.blockTime;
+          if (!bt) continue;
           const ms = (bt > 1e9 && bt < 1e12) ? bt * 1000 : (bt > 1e12 ? bt : bt * 1000);
           if (!earliestMs || ms < earliestMs) earliestMs = ms;
+        } catch (e) {
+          // ignore per-tx errors
         }
-      } catch (e) {
-        // ignore individual tx failures
       }
+      // small pause to avoid RPC bursts
+      await sleep(50);
     }
-  enrichmentMetrics.rpcTotalMs += (Date.now() - start);
-  if (earliestMs) try { setCachedFirstTx(address, earliestMs); } catch (e) {}
-  return earliestMs;
+    enrichmentMetrics.rpcTotalMs += (Date.now() - start);
+    if (earliestMs) try { setCachedFirstTx(address, earliestMs); } catch (e) {}
+    return earliestMs;
   } catch (e) {
     enrichmentMetrics.rpcFailures++;
     try {
@@ -969,7 +1041,56 @@ export async function checkOnChainActivity(address: string): Promise<{ firstTxMs
 }
 
 /**
- * computeFreshnessScore: lightweight multi-source corroboration score (0-100).
+ * getFirstOnchainTimestamp: unified helper to return the earliest on-chain timestamp for a mint/address.
+ * - Uses in-memory + disk cache when available.
+ * - Tries Helius -> Solscan -> RPC fallbacks (configurable via environment flags in config.ts).
+ * - Returns an object with ts (ms) | null, source string and cached flag.
+ */
+export async function getFirstOnchainTimestamp(address: string, opts?: { timeoutMs?: number; prefer?: ('hel'|'solscan'|'rpc')[] }): Promise<{ ts: number | null; source?: string; cached?: boolean }> {
+  if (!address) return { ts: null };
+  try {
+    // check short-lived cache first
+    try {
+      const c = getCachedFirstTx(address);
+      if (c) return { ts: c, source: 'cache', cached: true };
+    } catch (e) {}
+
+    const timeoutMs = typeof opts?.timeoutMs === 'number' ? opts!.timeoutMs : Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000);
+
+    const order = opts?.prefer && opts.prefer.length ? opts.prefer : ['hel','solscan','rpc'];
+    let resultMs: number | null = null;
+    let source: string | undefined = undefined;
+
+    for (const o of order) {
+      try {
+        if (o === 'hel') {
+          const ts = await withTimeout(getFirstTxTimestampFromHelius(address), timeoutMs, 'firsttx-helius');
+          if (ts) { resultMs = ts; source = 'hel'; break; }
+        } else if (o === 'solscan') {
+          const ts = await withTimeout(getFirstTxTimestampFromSolscan(address), timeoutMs, 'firsttx-solscan');
+          if (ts) { resultMs = ts; source = 'solscan'; break; }
+        } else if (o === 'rpc') {
+          const ts = await withTimeout(getFirstTxTimestampFromRpc(address), timeoutMs, 'firsttx-rpc');
+          if (ts) { resultMs = ts; source = 'rpc'; break; }
+        }
+      } catch (e) {
+        // continue to next source on timeout/error
+      }
+    }
+
+    if (resultMs) {
+      try { setCachedFirstTx(address, resultMs); } catch (e) {}
+      return { ts: resultMs, source, cached: false };
+    }
+
+    // no timestamp found
+    return { ts: null, source: 'none', cached: false };
+  } catch (e) {
+    return { ts: null };
+  }
+}
+
+/**
  * Uses DexScreener / pair timestamps (token.poolOpenTimeMs, pairCreatedAt),
  * on-chain first-tx timestamps, and simple liquidity/volume heuristics.
  * Attaches token.freshnessScore and token.freshnessDetails for downstream use.
@@ -1487,13 +1608,31 @@ export async function finalJupiterCheck(mint: string, buyAmountSol: number, opts
     // If the environment does not provide a Jupiter quote API, allow by default
     if (!JUPITER_QUOTE_API) return { ok: true, reason: 'no-jupiter-api' };
     if (!mint) return { ok: false, reason: 'no-mint' };
-    // Amount: default to $50 if not specified
-    const amountUsd = opts?.minJupiterUsd || 50;
-    const lamports = Math.floor((amountUsd / 1) * 1e9);
+    // Compute lamports (amount param for Jupiter) correctly.
+    // If the caller provided buyAmountSol (SOL) use that. Otherwise try to convert opts.minJupiterUsd -> SOL via CoinGecko.
+    let lamports: number | null = null;
+    if (typeof buyAmountSol === 'number' && buyAmountSol > 0) {
+      lamports = Math.floor(buyAmountSol * 1e9);
+    } else if (typeof opts?.minJupiterUsd === 'number') {
+      // Convert USD -> SOL using a lightweight public price API (CoinGecko). If that fails, fall back to $50 ~ 1 SOL assumption (not ideal).
+      try {
+        const axios = (await import('axios')).default;
+        const cg = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 2000 });
+        const solUsd = Number(cg.data?.solana?.usd || 0);
+        const amountUsd = Number(opts.minJupiterUsd || 50);
+        const solEquivalent = solUsd > 0 ? (amountUsd / solUsd) : (amountUsd / 1);
+        lamports = Math.floor(solEquivalent * 1e9);
+      } catch (e) {
+        // fallback: assume 1 USD ~= 1 SOL (very rough) but ensure a minimal amount
+        const amountUsd = Number(opts.minJupiterUsd || 50);
+        lamports = Math.floor((amountUsd / 1) * 1e9);
+      }
+    }
+    if (!lamports) lamports = Math.floor((50 / 1) * 1e9);
     const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${encodeURIComponent(mint)}&amount=${lamports}&slippage=1`;
     const axios = (await import('axios')).default;
     const res = await axios.get(url, { timeout });
-    if (res && res.data) return { ok: true };
+    if (res && res.data) return { ok: true, data: res.data };
     return { ok: false, reason: 'no-data' };
   } catch (err: any) {
     // If the caller does not require Jupiter strictly, return ok=false but include reason

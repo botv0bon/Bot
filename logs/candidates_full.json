@@ -1,0 +1,8 @@
+Fetching candidates with sources (limit=200)
+Candidates fetched: 20
+Normalized valid mints: 20
+[Solscan] getFirstTxTimestampFromSolscan failed for PkTtsHH3rdLT8vEsXc6Ti2LbeSM1ShnPrr1muL9pump: status=404 data= msg=Request failed with status code 404
+[Solscan] getFirstTxTimestampFromSolscan failed for 4AQZS8pf2UaeUCHU446RKa176fzhjKch2sVSRFe1puMP: status=404 data= msg=Request failed with status code 404
+[Solscan] getFirstTxTimestampFromSolscan failed for AvsVPyxg3WNaX9mzn1eAw7kWLuH6AbEZJZa63z2Lpump: status=404 data= msg=Request failed with status code 404
+[Solscan] getFirstTxTimestampFromSolscan failed for 9fM5rJwGcbFFx96KnmogopkB11sn8TooPaggR6RPpump: status=404 data= msg=Request failed with status code 404
+[Solscan] getFirstTxTimestampFromSolscan failed for CiBciXynDyjZLmXfg7osFsmHBLiP2ybyRtsch5uKpump: status=404 data= msg=Request failed with status code 404
