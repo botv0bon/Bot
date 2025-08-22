@@ -4,11 +4,10 @@ import fs from 'fs';
 const fsp = fs.promises;
 import { Telegraf, Markup } from 'telegraf';
 import { loadUsers, loadUsersSync, saveUsers, walletKeyboard, getErrorMessage, limitHistory, hasWallet, writeJsonFile } from './src/bot/helpers';
-import { helpMessages } from './src/helpMessages';
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
-import { STRATEGY_FIELDS, buildTokenMessage, autoFilterTokensVerbose, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
+import { STRATEGY_FIELDS, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
 import { enqueueEnrichJob, startEnrichQueue } from './src/bot/enrichQueue';
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
@@ -45,7 +44,12 @@ console.log = (...args: any[]) => {
 console.log('--- Bot starting: Imports loaded ---');
 
 dotenv.config();
-import { HELIUS_BATCH_SIZE, HELIUS_BATCH_DELAY_MS, HELIUS_ENRICH_LIMIT, ONCHAIN_FRESHNESS_TIMEOUT_MS } from './src/config';
+// Configuration values (can be overridden via .env). Using environment variables
+// makes deployment/runtime configuration flexible per environment.
+const HELIUS_BATCH_SIZE = Number(process.env.HELIUS_BATCH_SIZE ?? 8);
+const HELIUS_BATCH_DELAY_MS = Number(process.env.HELIUS_BATCH_DELAY_MS ?? 250);
+const HELIUS_ENRICH_LIMIT = Number(process.env.HELIUS_ENRICH_LIMIT ?? 25);
+const ONCHAIN_FRESHNESS_TIMEOUT_MS = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS ?? 5000);
 
 console.log('--- dotenv loaded ---');
 

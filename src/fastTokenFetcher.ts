@@ -472,84 +472,103 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
   const mint = typeof mintOrObj === 'string' ? mintOrObj : (mintOrObj?.mint || null);
   if (!mint) return null;
   try {
-    // get first signature/time via fast helius call
-  const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
-    if (!heliusUrl) {
-      console.log('handleNewMintEvent: no helius url');
-      return null;
-    }
-  const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0);
-    if (!r || r.__error) { if (r?.__error) console.log(`Enrich ${mint} error: ${r.__error}`); return null; }
-    const arr = Array.isArray(r) ? r : (r.result ?? r);
-    const first = Array.isArray(arr) && arr[0] ? arr[0] : null;
-    const bt = first?.blockTime ?? first?.block_time ?? first?.blocktime ?? null;
-    const firstSig = first?.signature || first?.txHash || first?.signature?.toString?.() || null;
-    const nowSec = Math.floor(Date.now() / 1000);
-    const age = bt ? (nowSec - Number(bt)) : null;
+    const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
+    if (!heliusUrl) { console.log('handleNewMintEvent: no helius url'); return null; }
 
-    // verify metadata PDA existence and token supply
+    const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0);
+    if (!r || (r as any).__error) { if ((r as any)?.__error) console.log(`Enrich ${mint} error: ${(r as any).__error}`); return null; }
+    const arr = Array.isArray(r) ? r : ((r as any).result ?? r);
+    if (!arr || !Array.isArray(arr) || arr.length === 0) return null;
+
+    // compute earliest blockTime across signatures (Helius returns newest-first)
+    let earliestBlockTime: number | null = null;
+    let firstSignature: string | null = null;
+    for (const entry of arr) {
+      const sig = entry?.signature || entry?.txHash || entry?.tx_hash || null;
+      let btv: any = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
+      if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
+      if (btv) {
+        const num = Number(btv);
+        if (!earliestBlockTime || num < earliestBlockTime) {
+          earliestBlockTime = num;
+          firstSignature = sig;
+        }
+      }
+    }
+
+    // fallback: if no blockTime in signatures, try parsed tx for the last (earliest) signature
+    if (!earliestBlockTime) {
+      const sigTry = arr[arr.length - 1]?.signature || arr[arr.length - 1]?.txHash || null;
+      if (sigTry) {
+        try {
+          const parsed = await getParsedTransaction(sigTry);
+          const pbt = (parsed as any)?.blockTime ?? (parsed as any)?.result?.blockTime ?? (parsed as any)?.result?.block_time ?? (parsed as any)?.result?.blocktime ?? null;
+          if (pbt) earliestBlockTime = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+          firstSignature = sigTry;
+        } catch (e) {}
+      }
+    }
+
+    if (!earliestBlockTime) return null;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const ageSeconds = nowSec - Number(earliestBlockTime);
+
+    // verify metadata PDA and token supply
     const metadataPda = await metadataPdaForMint(mint);
     let metadataExists = false;
     if (metadataPda) {
       const acct = await getAccountInfo(metadataPda);
       if (acct && acct.value) metadataExists = true;
     }
-    let supply = null;
+    let supply: number | null = null;
     try {
       const sup = await getTokenSupply(mint);
       if (sup && sup.value && (sup.value.amount !== undefined)) supply = Number(sup.value.amount);
-    } catch {}
+    } catch (e) {}
 
     const validated = metadataExists || (supply !== null && supply > 0);
-    const detectedAtSec = mintOrObj?.detectedAtSec ?? Math.floor(Date.now() / 1000);
-    const detection = { mint, firstBlockTime: bt ? Number(bt) : null, ageSeconds: age, metadataExists, supply, firstSignature: firstSig, detectedAtSec };
+    const detectedAtSec = (mintOrObj as any)?.detectedAtSec ?? Math.floor(Date.now() / 1000);
+    const detection = { mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply, firstSignature, detectedAtSec };
 
-    if (validated) {
-      console.log(`ValidatedNewMint: ${mint} firstBlockTime=${bt} ageSeconds=${age} metadata=${metadataExists} supply=${supply}`);
-      // If users+telegram provided, route detection to per-user strategies
-      if (users && telegram) {
-        for (const uid of Object.keys(users)) {
-          try {
-            const u = users[uid];
-            if (!u || !u.strategy || u.strategy.enabled === false) continue;
-            const strat = normalizeStrategy(u.strategy);
-            // create minimal token object for strategy filter
-            const tokenObj = { mint, address: mint, metadataExists, supply, firstBlockTime: detection.firstBlockTime, ageSeconds: detection.ageSeconds };
-            const matches = await filterTokensByStrategy([tokenObj], strat);
-            if (Array.isArray(matches) && matches.length) {
-              // send notification and persist sent hash
+    if (validated && users && telegram) {
+      for (const uid of Object.keys(users)) {
+        try {
+          const u = users[uid];
+          if (!u || !u.strategy || u.strategy.enabled === false) continue;
+          const strat = normalizeStrategy(u.strategy);
+          const tokenObj = { mint, address: mint, metadataExists, supply, firstBlockTime: detection.firstBlockTime, ageSeconds: detection.ageSeconds };
+          const matches = await filterTokensByStrategy([tokenObj], strat);
+          if (Array.isArray(matches) && matches.length) {
+            try {
+              const h = hashTokenAddress(mint);
+              const msg = `🚀 New token for you: ${mint}\nAge(s): ${detection.ageSeconds ?? 'N/A'}\nMetadata: ${metadataExists}`;
+              await telegram.sendMessage(uid, msg);
+              await appendSentHash(uid, h);
+            } catch (e) {}
+
+            if (u.strategy.autoBuy !== false && Number(u.strategy.buyAmount) > 0) {
               try {
-                const h = hashTokenAddress(mint);
-                const msg = `🚀 New token for you: ${mint}\nAge(s): ${detection.ageSeconds ?? 'N/A'}\nMetadata: ${metadataExists}`;
-                await telegram.sendMessage(uid, msg);
-                await appendSentHash(uid, h);
+                const amount = Number(u.strategy.buyAmount);
+                const result = await unifiedBuy(mint, amount, u.secret);
+                if (result && ((result as any).tx || (result as any).success)) {
+                  try { await registerBuyWithTarget(u, { address: mint, price: (tokenObj as any).price || 0 }, result, u.strategy.targetPercent || 10); } catch {}
+                  const { fee, slippage } = extractTradeMeta(result, 'buy');
+                  u.history = u.history || [];
+                  const resTx = (result as any)?.tx ?? '';
+                  u.history.push(`AutoBuy: ${mint} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
+                  try { saveUsers(users); } catch {}
+                  try { await telegram.sendMessage(uid, `✅ AutoBuy executed for ${mint}\nTx: ${resTx}`); } catch {}
+                }
               } catch (e) {}
-
-              // optional autoBuy: replicate small subset of existing autoBuy flow
-              if (u.strategy.autoBuy !== false && Number(u.strategy.buyAmount) > 0) {
-                try {
-                  const amount = Number(u.strategy.buyAmount);
-                  const result = await unifiedBuy(mint, amount, u.secret);
-                  if (result && ((result as any).tx || (result as any).success)) {
-                    try { await registerBuyWithTarget(u, { address: mint, price: (tokenObj as any).price || 0 }, result, u.strategy.targetPercent || 10); } catch {}
-                    const { fee, slippage } = extractTradeMeta(result, 'buy');
-                    u.history = u.history || [];
-                    const resTx = (result as any)?.tx ?? '';
-                    u.history.push(`AutoBuy: ${mint} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
-                    try { saveUsers(users); } catch {}
-                    try { await telegram.sendMessage(uid, `✅ AutoBuy executed for ${mint}\nTx: ${resTx}`); } catch {}
-                  }
-                } catch (e) {}
-              }
             }
-          } catch (e) {}
-        }
+          }
+        } catch (e) {}
       }
-      return detection;
     }
 
-    // Not validated yet
-    console.log(`CandidateMint (unvalidated): ${mint} firstBlockTime=${bt} ageSeconds=${age} metadata=${metadataExists} supply=${supply}`);
+    // log and return detection
+    if (validated) console.log(`ValidatedNewMint: ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
+    else console.log(`CandidateMint (unvalidated): ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
     return detection;
   } catch (e) {
     return null;
@@ -611,68 +630,248 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
   }
 
   const nowSec = Math.floor(Date.now() / 1000);
+
+  // Helper: page getSignaturesForAddress via heliusRpc to collect up to max signatures (for deep verification)
+  async function collectSignaturesFull(address: string, maxCollect = 2000) {
+    const out: any[] = [];
+    let before: string | null = null;
+    const limit = 1000;
+    for (let i = 0; i < 5 && out.length < maxCollect; i++) {
+      try {
+        const params: any[] = [address, { limit }];
+        if (before) params[1].before = before;
+        const res = await heliusRpc('getSignaturesForAddress', params, 5000, 0);
+        const arr = Array.isArray(res) ? res : (res?.result ?? res);
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        out.push(...arr);
+        if (arr.length < limit) break;
+        before = arr[arr.length - 1].signature || arr[arr.length - 1].txHash || null;
+      } catch (e) { break; }
+    }
+    return out.slice(0, maxCollect);
+  }
   for (const batch of batches) {
     await Promise.all(batch.map(async (t: any) => {
-      if (!heliusUrl) { results.push({ mint: t.mint, error: 'no-helius-url' }); return; }
-      const hk = hostKey(heliusUrl);
-      const state = hostState[hk] || { recent429: 0, cooldownUntil: 0 };
-      if (Date.now() < (state.cooldownUntil || 0)) {
-        results.push({ mint: t.mint, error: 'host-cooldown' });
-        hostState[hk] = state;
-        return;
-      }
-  const r = await heliusGetSignaturesFast(t.mint, heliusUrl, timeoutMs, 0);
-      if (r && r.__error) {
-        // increment 429 counter if applicable
-        if (String(r.__error).includes('http-429')) {
-          state.recent429 = (state.recent429 || 0) + 1;
-          if (state.recent429 >= 3) {
-            state.cooldownUntil = Date.now() + 10_000; // 10s cooldown
-            state.recent429 = 0;
-          }
+      try {
+        if (!heliusUrl) { results.push({ mint: t.mint, error: 'no-helius-url' }); return; }
+        const hk = hostKey(heliusUrl);
+        const state = hostState[hk] || { recent429: 0, cooldownUntil: 0 };
+        if (Date.now() < (state.cooldownUntil || 0)) {
+          results.push({ mint: t.mint, error: 'host-cooldown' });
+          hostState[hk] = state;
+          return;
         }
-        // fallback to HELIUS_RPC_URL if different and available
-  const alt = HELIUS_RPC_URL;
-        if (alt && alt !== heliusUrl) {
-          const r2 = await heliusGetSignaturesFast(t.mint, alt, timeoutMs, 0);
-          if (r2 && r2.__error) {
-            // try solscan fallback
-              const solscanUrl = `${SOLSCAN_API_URL}/token/${t.mint}/transactions`;
+
+        // Prefer a full paged signatures collection for accuracy (may be slower)
+        let r: any = null;
+        try {
+          const full = await collectSignaturesFull(t.mint, 2000);
+          if (Array.isArray(full) && full.length) r = full;
+          else r = await heliusGetSignaturesFast(t.mint, heliusUrl, timeoutMs, 0);
+        } catch (e) {
+          r = await heliusGetSignaturesFast(t.mint, heliusUrl, timeoutMs, 0);
+        }
+
+        if (r && r.__error) {
+          // handle HTTP 429 counting
+          if (String(r.__error).includes('http-429')) {
+            state.recent429 = (state.recent429 || 0) + 1;
+            if (state.recent429 >= 3) {
+              state.cooldownUntil = Date.now() + 10_000;
+              state.recent429 = 0;
+            }
+          }
+
+          // try alternate helius rpc if available
+          const alt = HELIUS_RPC_URL;
+          if (alt && alt !== heliusUrl) {
+            const r2 = await heliusGetSignaturesFast(t.mint, alt, timeoutMs, 0);
+            if (r2 && r2.__error) {
+              // try direct rpc via heliusRpc
+              try {
+                const r3 = await heliusRpc('getSignaturesForAddress', [t.mint, { limit: 3 }], timeoutMs, 0);
+                const arr3 = Array.isArray(r3) ? r3 : (r3?.result ?? r3);
+                const f3 = Array.isArray(arr3) && arr3[0] ? arr3[0] : null;
+                const bt3 = f3?.blockTime ?? f3?.block_time ?? f3?.blocktime ?? null;
+                if (bt3) {
+                    results.push({ mint: t.mint, firstBlockTime: Number(bt3), ageSeconds: nowSec - Number(bt3), source: 'helius-rpc', earliestSignature: (f3 && (f3.signature || f3.txHash || f3.tx_hash)) || null });
+                  hostState[hk] = state;
+                  return;
+                }
+              } catch (e) {
+                // ignore
+              }
+
+              // final fallback to solscan if configured
+              try {
+                const solscanUrl = `${SOLSCAN_API_URL}/token/${t.mint}/transactions`;
+                const sres = await axios.get(solscanUrl, { timeout: timeoutMs });
+                const arr = sres.data ?? [];
+                const first = Array.isArray(arr) ? arr[0] : null;
+                const bt = first?.blockTime || first?.time || first?.timestamp || null;
+          if (bt) {
+            results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || first.txHash || first.tx_hash)) || null });
+                  hostState[hk] = state;
+                  return;
+                }
+              } catch (e) {
+                // ignore
+              }
+
+              results.push({ mint: t.mint, error: r.__error });
+              hostState[hk] = state;
+              return;
+            }
+
+            // r2 succeeded: compute earliest blockTime from r2
+            const arr2 = Array.isArray(r2) ? r2 : (r2.result ?? r2);
+            if (!arr2 || !Array.isArray(arr2) || arr2.length === 0) {
+              results.push({ mint: t.mint, error: 'no-signatures' });
+              hostState[hk] = state;
+              return;
+            }
+
+            let bt2: any = null;
+            let sig2: string | null = null;
             try {
-              const sres = await axios.get(solscanUrl, { timeout: timeoutMs });
-              const arr = sres.data ?? [];
-              const first = Array.isArray(arr) ? arr[0] : null;
-              const bt = first?.blockTime || first?.time || first?.timestamp || null;
-              if (bt) { results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan' }); return; }
+              const withBt2 = arr2.filter((x: any) => x && (x.blockTime || x.block_time || x.blocktime));
+              if (withBt2.length) {
+                let min = withBt2[0];
+                for (const it of withBt2) {
+                  const b = it.blockTime ?? it.block_time ?? it.blocktime ?? 0;
+                  if (b && b < (min.blockTime ?? min.block_time ?? min.blocktime ?? Infinity)) min = it;
+                }
+                bt2 = min.blockTime ?? min.block_time ?? min.blocktime ?? null;
+                sig2 = min.signature || min.txHash || min.tx_hash || null;
+              } else {
+                const last = arr2[arr2.length - 1];
+                bt2 = last?.blockTime ?? last?.block_time ?? last?.blocktime ?? null;
+                sig2 = last?.signature || last?.txHash || last?.tx_hash || null;
+              }
             } catch (e) {}
-            results.push({ mint: t.mint, error: r.__error });
+
+            // If we have a signature, always try parsed tx to get the most accurate (possibly earlier) blockTime.
+            if (sig2) {
+              try {
+                const parsed2 = await getParsedTransaction(sig2);
+                const pbt2 = parsed2?.blockTime ?? parsed2?.result?.blockTime ?? parsed2?.result?.block_time ?? parsed2?.result?.blocktime ?? null;
+                if (pbt2) {
+                  // prefer the earlier timestamp (smallest)
+                  const pnum = Number(pbt2 > 1e12 ? Math.floor(pbt2 / 1000) : pbt2);
+                  if (!bt2 || pnum < Number(bt2)) bt2 = pnum;
+                }
+              } catch (e) {}
+            }
+
+            if (bt2 && bt2 > 1e12) bt2 = Math.floor(Number(bt2) / 1000);
+            if (!bt2) {
+              results.push({ mint: t.mint, error: 'no-blockTime' });
+              hostState[hk] = state;
+              return;
+            }
+
+                  results.push({ mint: t.mint, firstBlockTime: Number(bt2), ageSeconds: nowSec - Number(bt2), source: 'helius-rpc', earliestSignature: sig2 || null });
             hostState[hk] = state;
             return;
           }
-          const arr2 = Array.isArray(r2) ? r2 : (r2.result ?? r2);
-          const f2 = Array.isArray(arr2) && arr2[0] ? arr2[0] : null;
-          const bt2 = f2?.blockTime ?? f2?.block_time ?? f2?.blocktime ?? null;
-          if (bt2) { results.push({ mint: t.mint, firstBlockTime: Number(bt2), ageSeconds: nowSec - Number(bt2), source: 'helius-rpc' }); hostState[hk] = state; return; }
+
+          // if no alt configured or alt equals heliusUrl, just emit the original error
+          results.push({ mint: t.mint, error: r.__error });
+          hostState[hk] = state;
+          return;
         }
-        results.push({ mint: t.mint, error: r.__error });
+
+        // success path: r contains signatures
+        const arr = Array.isArray(r) ? r : (r.result ?? r);
+        if (!arr || !Array.isArray(arr) || arr.length === 0) {
+          results.push({ mint: t.mint, error: 'no-signatures' });
+          return;
+        }
+
+        // compute earliest blockTime across signatures
+        let minBt: number | null = null;
+        let earliestSig: string | null = null;
+        for (const s of arr) {
+          let btv = s?.blockTime ?? s?.block_time ?? s?.blocktime ?? s?.timestamp ?? null;
+          if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
+          if (btv && (!minBt || Number(btv) < minBt)) {
+            minBt = Number(btv);
+            earliestSig = s?.signature || s?.txHash || s?.tx_hash || null;
+          }
+        }
+
+        // If we found an earliestSig from signatures, verify with getTransaction (it may be earlier or more accurate)
+        if (earliestSig) {
+          try {
+            const parsed = await getParsedTransaction(earliestSig);
+            const pbt = parsed?.blockTime ?? parsed?.result?.blockTime ?? parsed?.result?.block_time ?? parsed?.result?.blocktime ?? null;
+            if (pbt) {
+              const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+              if (!minBt || pnum < minBt) minBt = pnum;
+            }
+          } catch (e) {}
+        } else {
+          const sigTry = arr[arr.length - 1]?.signature || arr[arr.length - 1]?.txHash || null;
+          if (sigTry) {
+            try {
+              const parsed = await getParsedTransaction(sigTry);
+              const pbt = parsed?.blockTime ?? parsed?.result?.blockTime ?? parsed?.result?.block_time ?? parsed?.result?.blocktime ?? null;
+              if (pbt) minBt = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+              earliestSig = sigTry;
+            } catch (e) {}
+          }
+        }
+
+        if (!minBt) {
+          results.push({ mint: t.mint, error: 'no-blockTime' });
+          hostState[hk] = state;
+          return;
+        }
+
+        // If token looks very young (<=10min), deep-verify by paging full signature history to avoid false-youth
+        try {
+          const ageNow = nowSec - Number(minBt);
+          if (ageNow <= 600) {
+            const fullSigs = await collectSignaturesFull(t.mint, 2000);
+            if (Array.isArray(fullSigs) && fullSigs.length) {
+              let fullMin: number | null = null;
+              let candidateSig: string | null = null;
+              for (const s of fullSigs) {
+                let btv = s?.blockTime ?? s?.block_time ?? s?.blocktime ?? s?.timestamp ?? null;
+                if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
+                if (btv && (!fullMin || Number(btv) < fullMin)) { fullMin = Number(btv); candidateSig = s?.signature || s?.txHash || s?.tx_hash || null; }
+              }
+              if (candidateSig) {
+                try {
+                  const parsed = await getParsedTransaction(candidateSig);
+                  const pbt = parsed?.blockTime ?? parsed?.result?.blockTime ?? parsed?.result?.block_time ?? parsed?.result?.blocktime ?? null;
+                  if (pbt) {
+                    const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+                    if (!fullMin || pnum < fullMin) fullMin = pnum;
+                  }
+                } catch (e) {}
+              }
+              if (fullMin && (!minBt || fullMin < minBt)) minBt = fullMin;
+            }
+          }
+        } catch (e) {}
+
+  results.push({ mint: t.mint, firstBlockTime: Number(minBt), ageSeconds: nowSec - Number(minBt), source: 'helius-fast', earliestSignature: earliestSig || null });
         hostState[hk] = state;
         return;
+      } catch (e) {
+        results.push({ mint: t.mint, error: 'exception' });
+        return;
       }
-      const arr = Array.isArray(r) ? r : (r.result ?? r);
-      if (!arr || !Array.isArray(arr) || arr.length === 0) { results.push({ mint: t.mint, error: 'no-signatures' }); return; }
-      const first = arr[0];
-      const bt = first?.blockTime ?? first?.block_time ?? first?.blocktime ?? null;
-      if (!bt) { results.push({ mint: t.mint, error: 'no-blockTime' }); return; }
-      results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'helius-fast' });
-      hostState[hk] = state;
     }));
+
+    // small pause between batches
     await new Promise((r) => setTimeout(r, 300));
   }
 
-  console.log('\nFast enrichment results:');
+  console.log('\nFast enrichment results (JSON lines):');
   for (const r of results) {
-    if (r.error) console.log(`${r.mint} -> ERROR: ${r.error}`);
-    else console.log(`${r.mint} -> firstBlockTime=${r.firstBlockTime} ageSeconds=${r.ageSeconds}`);
+    console.log(JSON.stringify(r));
   }
 }
 
