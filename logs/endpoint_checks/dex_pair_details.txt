@@ -1,0 +1,17 @@
+HTTP/2 200 
+date: Fri, 22 Aug 2025 18:22:22 GMT
+content-type: application/json; charset=utf-8
+cf-ray: 9734652c5b5f06da-AMS
+access-control-allow-origin: *
+access-control-allow-credentials: true
+etag: W/"af0-HXgTpTkt89RT4a8ghpSbNnMT5Ms"
+vary: Accept-Encoding
+cf-cache-status: REVALIDATED
+expires: Fri, 22 Aug 2025 18:22:52 GMT
+cache-control: public, max-age=30
+set-cookie: __cf_bm=pGocPxTOJ89.wpM1cafKPSHELdhK.6UGJOljTMbMTqg-1755886942-1.0.1.1-NqO87BjYqP1s1vq9eUrB81Y0ixcervi4bmTZmmvVZ3QycgVp6z4C6R60LBSuojBerUDsxu8knzufl9_MJXtdGM.I6KkQdEdrUck7U82zrPh0pNgiuVoNfsLucRwVSi24; path=/; expires=Fri, 22-Aug-25 18:52:22 GMT; domain=.dexscreener.com; HttpOnly; Secure; SameSite=None
+server: cloudflare
+alt-svc: h3=":443"; ma=86400
+
+{"schemaVersion":"1.0.0","pairs":[{"chainId":"solana","dexId":"raydium","url":"https://dexscreener.com/solana/9ndjdvdyqybdx7kbh3hvp47ocuafadueb8xp1erehmvx","pairAddress":"9ndJDvDYQyBDx7KBH3hvp47oCUafAdUEb8xP1ERehmVx","baseToken":{"address":"fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP","name":"CatFrogDogShark","symbol":"SOLANA"},"quoteToken":{"address":"So11111111111111111111111111111111111111112","name":"Wrapped SOL","symbol":"SOL"},"priceNative":"0.0000004579","priceUsd":"0.00009012","txns":{"m5":{"buys":0,"sells":0},"h1":{"buys":0,"sells":2},"h6":{"buys":2,"sells":3},"h24":{"buys":2,"sells":4}},"volume":{"h24":662.67,"h6":654.82,"h1":6.26,"m5":0},"priceChange":{"h1":-0.02,"h6":5.12,"h24":5.12},"liquidity":{"usd":85028.7,"base":471118583,"quote":216.3063},"fdv":86720,"marketCap":86720,"pairCreatedAt":1716914136000,"info":{"imageUrl":"https://dd.dexscreener.com/ds-data/tokens/solana/fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP.png?key=43f513","header":"https://dd.dexscreener.com/ds-data/tokens/solana/fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP/header.png?key=43f513","openGraph":"https://cdn.dexscreener.com/token-images/og/solana/fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP?timestamp=1755886800000","websites":[{"label":"Website","url":"https://catfrogdogshark.xyz/"}],"socials":[{"type":"twitter","url":"https://x.com/CatFrogDogShark"},{"type":"telegram","url":"https://t.me/CatFrogDogShark"}]}}],"pair":{"chainId":"solana","dexId":"raydium","url":"https://dexscreener.com/solana/9ndjdvdyqybdx7kbh3hvp47ocuafadueb8xp1erehmvx","pairAddress":"9ndJDvDYQyBDx7KBH3hvp47oCUafAdUEb8xP1ERehmVx","baseToken":{"address":"fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP","name":"CatFrogDogShark","symbol":"SOLANA"},"quoteToken":{"address":"So11111111111111111111111111111111111111112","name":"Wrapped SOL","symbol":"SOL"},"priceNative":"0.0000004579","priceUsd":"0.00009012","txns":{"m5":{"buys":0,"sells":0},"h1":{"buys":0,"sells":2},"h6":{"buys":2,"sells":3},"h24":{"buys":2,"sells":4}},"volume":{"h24":662.67,"h6":654.82,"h1":6.26,"m5":0},"priceChange":{"h1":-0.02,"h6":5.12,"h24":5.12},"liquidity":{"usd":85028.7,"base":471118583,"quote":216.3063},"fdv":86720,"marketCap":86720,"pairCreatedAt":1716914136000,"info":{"imageUrl":"https://dd.dexscreener.com/ds-data/tokens/solana/fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP.png?key=43f513","header":"https://dd.dexscreener.com/ds-data/tokens/solana/fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP/header.png?key=43f513","openGraph":"https://cdn.dexscreener.com/token-images/og/solana/fESbUKjuMY6jzDH9VP8cy4p3pu2q5W2rK2XghVfNseP?timestamp=1755886800000","websites":[{"label":"Website","url":"https://catfrogdogshark.xyz/"}],"socials":[{"type":"twitter","url":"https://x.com/CatFrogDogShark"},{"type":"telegram","url":"https://t.me/CatFrogDogShark"}]}}}
+__HTTP_CODE__:200

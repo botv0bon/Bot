@@ -76,44 +76,57 @@ export function createEnrichmentManager(opts?: { ttlSeconds?: number; maxConcurr
 
   return {
     async enqueue(evt: any, hf: (e: any) => Promise<any>) {
+      // Return a Promise that resolves when the handler `hf` actually runs and completes,
+      // or resolves immediately with { skipped: true } if dedup prevents execution.
       try {
         const mint = evt && (evt.mint || evt.token || evt.address);
-        if (!mint || typeof mint !== 'string') {
-          // nothing to dedupe on; directly queue
-          queue.push({ evt, hf });
-          tryRunNext();
-          return;
-        }
+        // create a promise that will be resolved when work completes
+        return new Promise<any>(async (resolve) => {
+          try {
+            if (!mint || typeof mint !== 'string') {
+              // nothing to dedupe on; directly queue
+              queue.push({ evt, hf: async (e:any) => { const r = await hf(e); resolve(r); return r; } });
+              tryRunNext();
+              return;
+            }
 
-        const key = `helius:enrich:${mint}`;
-        const now = nowSec();
+            const key = `helius:enrich:${mint}`;
+            const now = nowSec();
 
-        // Prefer Redis dedupe when available
-        if (useRedis) {
-          const ok = await redisTrySetDedup(key, ttlSeconds);
-          if (!ok) {
-            try { console.log('Enrichment skipped (redis dedupe) for', mint); } catch {}
-            return;
+            // Prefer Redis dedupe when available
+            if (useRedis) {
+              const ok = await redisTrySetDedup(key, ttlSeconds);
+              if (!ok) {
+                try { console.log('Enrichment skipped (redis dedupe) for', mint); } catch {}
+                resolve({ skipped: true, reason: 'redis-dedupe' });
+                return;
+              }
+              // enqueue job and resolve when handler finishes
+              queue.push({ evt, hf: async (e:any) => { const r = await hf(e); resolve(r); return r; } });
+              tryRunNext();
+              return;
+            }
+
+            // In-memory fallback
+            const last = lastAttempt.get(mint) || 0;
+            if (now - last < ttlSeconds) {
+              try { console.log('Enrichment skipped (in-memory dedupe) for', mint); } catch {}
+              resolve({ skipped: true, reason: 'memory-dedupe' });
+              return;
+            }
+            // record attempt time immediately to avoid races
+            lastAttempt.set(mint, now);
+            queue.push({ evt, hf: async (e:any) => { const r = await hf(e); resolve(r); return r; } });
+            tryRunNext();
+          } catch (ee) {
+            try { console.warn('enrichment manager error', ee && ee.message ? ee.message : ee); } catch {}
+            resolve({ skipped: true, reason: 'manager-exception' });
           }
-          // enqueue job
-          queue.push({ evt, hf });
-          tryRunNext();
-          return;
-        }
-
-        // In-memory fallback
-        const last = lastAttempt.get(mint) || 0;
-        if (now - last < ttlSeconds) {
-          try { console.log('Enrichment skipped (in-memory dedupe) for', mint); } catch {}
-          return;
-        }
-        // record attempt time immediately to avoid races
-        lastAttempt.set(mint, now);
-        queue.push({ evt, hf });
-        tryRunNext();
+        });
       } catch (e) {
         // don't allow manager errors to escape
         try { console.warn('enrichment manager error', e && e.message ? e.message : e); } catch {}
+        return Promise.resolve({ skipped: true, reason: 'enqueue-exception' });
       }
     },
     // Useful for tests/metrics

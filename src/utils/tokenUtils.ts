@@ -114,6 +114,7 @@ import {
   FRESHNESS_MAX_AGE_MINUTES,
   FRESHNESS_SCORE_TIMEOUT_MS,
 } from '../config';
+import { getSolscanApiKey, getJupiterApiKey } from '../config';
 
 
 // ========== General Constants ==========
@@ -752,7 +753,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
       try {
   enrichmentMetrics.heliusCalls++;
   const headers: Record<string,string> = { 'Accept': 'application/json' };
-  if (HELIUS_API_KEY) headers['x-api-key'] = HELIUS_API_KEY;
+  try { const { getHeliusApiKey, maskKey } = await import('../config'); const _hk = getHeliusApiKey(); if (_hk) { headers['x-api-key'] = _hk; try { console.log(`[Helius] using key=${maskKey(_hk)}`); } catch (e) {} } } catch (e) {}
         const r = await axios.get(url, { timeout: 20000, headers });
         enrichmentMetrics.heliusTotalMs += (Date.now() - start);
         // on success, reset host failure count
@@ -975,10 +976,12 @@ async function getFirstTxTimestampFromSolscan(address: string): Promise<number |
   const base = SOLSCAN_API_URL;
   if (!base) return null;
   const url = `${base.replace(/\/+$/,'')}/account/transactions?address=${encodeURIComponent(address)}&limit=50`;
-    const axios = (await import('axios')).default;
-    const start = Date.now();
-    enrichmentMetrics.solscanCalls++;
-    const r = await axios.get(url, { timeout: 8000 });
+  const axios = (await import('axios')).default;
+  const start = Date.now();
+  enrichmentMetrics.solscanCalls++;
+  const headers: any = {};
+  try { const k = getSolscanApiKey(true); if (k) { headers['x-api-key'] = k; try { const { maskKey } = await import('../config'); console.log(`[Solscan] using key=${maskKey(k)}`); } catch (e) {} } } catch (e) {}
+  const r = await axios.get(url, { timeout: 8000, headers });
     enrichmentMetrics.solscanTotalMs += (Date.now() - start);
     const items: any[] = Array.isArray(r.data) ? r.data : (r.data?.data || []);
     if (!items || items.length === 0) {
@@ -1239,6 +1242,43 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
 
 export function getEnrichmentMetrics() {
   return { ...enrichmentMetrics };
+}
+
+/**
+ * officialEnrich: perform an authoritative enrichment for a single token object.
+ * - runs the existing on-chain + solscan enrichment paths (via enrichTokenTimestamps)
+ * - attempts a lightweight Jupiter route check and attaches results on token.jupiter
+ * - runs under the global onchainLimiter to avoid bursts
+ */
+export async function officialEnrich(token: any, opts?: { amountUsd?: number; timeoutMs?: number }) {
+  if (!token) return null;
+  return onchainLimiter.enqueue(async () => {
+    try {
+      // Ensure token has canonical address
+      const addr = token.tokenAddress || token.address || token.mint || token.pairAddress;
+      if (!addr) return token;
+      // Run the timestamp enrichment which will set poolOpenTimeMs/age fields
+      try {
+        await enrichTokenTimestamps([token], { batchSize: 1, delayMs: 0 });
+      } catch (e) {
+        // continue even if enrichment failed for this token
+      }
+      // Jupiter check: use minJupiterUsd when provided to avoid converting here
+      try {
+        const minJupiterUsd = typeof opts?.amountUsd === 'number' ? Number(opts!.amountUsd) : undefined;
+        const jres = await finalJupiterCheck(addr, 0, { minJupiterUsd, timeoutMs: opts?.timeoutMs || 3000 });
+        token.jupiter = jres.data || null;
+        token.jupiterCheck = { ok: jres.ok, reason: jres.reason || null };
+      } catch (e) {
+        token.jupiter = null;
+      }
+      // Recompute freshness score after enrichment
+      try { await computeFreshnessScore(token); } catch (e) {}
+      return token;
+    } catch (e) {
+      throw e;
+    }
+  });
 }
 
 // ========== Formatting and display functions ==========
@@ -1580,6 +1620,36 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, source: string):
   ]);
 }
 
+// Simple concurrency limiter used to throttle on-chain/enrichment calls to avoid API 429s.
+function createLimiter(maxConcurrent: number) {
+  let running = 0;
+  const q: Array<{ fn: () => Promise<any>; resolve: (v:any)=>void; reject: (e:any)=>void }> = [];
+  function runNext() {
+    if (running >= maxConcurrent) return;
+    const item = q.shift();
+    if (!item) return;
+    running++;
+    Promise.resolve()
+      .then(() => item.fn())
+      .then((res) => item.resolve(res))
+      .catch((err) => item.reject(err))
+      .finally(() => { running--; runNext(); });
+  }
+  return {
+    enqueue<T>(fn: () => Promise<T>): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        q.push({ fn, resolve, reject });
+        runNext();
+      });
+    },
+    stats() { return { running, queued: q.length, maxConcurrent }; }
+  };
+}
+
+// global limiter for on-chain enrichment calls; configurable via env
+const ONCHAIN_CONCURRENCY = Number(process.env.ONCHAIN_CONCURRENCY || process.env.HELIUS_ONCHAIN_CONCURRENCY || 2);
+const onchainLimiter = createLimiter(Math.max(1, ONCHAIN_CONCURRENCY));
+
 // ========== Logging Utility ==========
 export function logTrade(trade: {
   action: string;
@@ -1629,9 +1699,11 @@ export async function finalJupiterCheck(mint: string, buyAmountSol: number, opts
       }
     }
     if (!lamports) lamports = Math.floor((50 / 1) * 1e9);
-    const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${encodeURIComponent(mint)}&amount=${lamports}&slippage=1`;
-    const axios = (await import('axios')).default;
-    const res = await axios.get(url, { timeout });
+  const url = `${JUPITER_QUOTE_API}?inputMint=So11111111111111111111111111111111111111112&outputMint=${encodeURIComponent(mint)}&amount=${lamports}&slippage=1`;
+  const axios = (await import('axios')).default;
+  const headers: any = {};
+  try { const { maskKey } = await import('../config'); const k = getJupiterApiKey(true); if (k) { headers['x-api-key'] = k; try { console.log(`[Jupiter] using key=${maskKey(k)}`); } catch (e) {} } } catch (e) {}
+  const res = await axios.get(url, { timeout, headers });
     if (res && res.data) return { ok: true, data: res.data };
     return { ok: false, reason: 'no-data' };
   } catch (err: any) {

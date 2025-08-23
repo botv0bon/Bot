@@ -136,11 +136,27 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
               try {
                 const mgrMod = require('./heliusEnrichmentQueue');
                 const mgr = (mgrMod && mgrMod._manager) || (mgrMod && mgrMod.createEnrichmentManager && (mgrMod._manager = mgrMod.createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 })));
-                if (shouldEnrich) {
-                  // enqueue with dedupe + concurrency control
-                  try { mgr.enqueue(evt, hf); } catch (e) { /* fallback */ hf(evt).catch(() => {}); }
-                } else {
-                  try { console.log('Helius skipping auto-enrich for', evt.eventType || 'fallback', evt.mint); } catch {};
+                // Enqueue for enrichment for all detected events (previously some event types were skipped).
+                // This change intentionally removes the previous "skip auto-enrich" branch so more Helius events
+                // are processed by the enrichment manager. If the manager enqueue fails, fall back to fire-and-forget.
+                try {
+                  const p = mgr.enqueue(evt, hf);
+                  // attach terminal logging when enrichment completes so details are visible
+                  if (p && typeof p.then === 'function') {
+                    p.then((res: any) => {
+                      try {
+                        if (res && res.skipped) {
+                          console.log('Enrichment result skipped for', evt.mint || (evt as any).address || '(no-mint)', 'reason=', res.reason);
+                        } else if (res) {
+                          console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)', JSON.stringify(res).slice(0, 400));
+                        } else {
+                          console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)', 'result=null');
+                        }
+                      } catch (e) {}
+                    }).catch((err: any) => { try { console.warn('Enrichment promise rejected', err && err.message ? err.message : err); } catch {} });
+                  }
+                } catch (e) {
+                  try { hf(evt).catch(() => {}); } catch {}
                 }
               } catch (e) {
                 // if manager fails for any reason, fallback to fire-and-forget when allowed

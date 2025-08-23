@@ -32,10 +32,80 @@ export const RPC_WEBSOCKET_ENDPOINT = process.env.RPC_WEBSOCKET_ENDPOINT || proc
 export const JUPITER_QUOTE_API = process.env.JUPITER_QUOTE_API;
 export const JUPITER_SWAP_API = process.env.JUPITER_SWAP_API;
 
+// Support rotating keys for Solscan and Jupiter (comma-separated env vars)
+export const SOLSCAN_API_KEYS: string[] = (process.env.SOLSCAN_API_KEYS || '')
+	.split(',')
+	.map(s => s.trim())
+	.filter(Boolean);
+export const JUPITER_API_KEYS: string[] = (process.env.JUPITER_API_KEYS || '')
+	.split(',')
+	.map(s => s.trim())
+	.filter(Boolean);
+
+let __solscanKeyIndex = 0;
+let __jupiterKeyIndex = 0;
+
+export function getSolscanApiKey(rotate = true): string | null {
+	try {
+		if (SOLSCAN_API_KEYS && SOLSCAN_API_KEYS.length) {
+			const k = SOLSCAN_API_KEYS[__solscanKeyIndex % SOLSCAN_API_KEYS.length];
+			if (rotate) __solscanKeyIndex = (__solscanKeyIndex + 1) % SOLSCAN_API_KEYS.length;
+			return k;
+		}
+	} catch (e) {}
+	return null;
+}
+
+export function getJupiterApiKey(rotate = true): string | null {
+	try {
+		if (JUPITER_API_KEYS && JUPITER_API_KEYS.length) {
+			const k = JUPITER_API_KEYS[__jupiterKeyIndex % JUPITER_API_KEYS.length];
+			if (rotate) __jupiterKeyIndex = (__jupiterKeyIndex + 1) % JUPITER_API_KEYS.length;
+			return k;
+		}
+	} catch (e) {}
+	return null;
+}
+
 export const RESERVE_WALLET = process.env.RESERVE_WALLET || "11111111111111111111111111111111";
 
 // Helius specific envs
 export const HELIUS_API_KEY = process.env.HELIUS_API_KEY || process.env.HELIUS_KEY || '';
+// Support multiple Helius API keys via comma-separated env var HELIUS_API_KEYS
+export const HELIUS_API_KEYS: string[] = (process.env.HELIUS_API_KEYS || '')
+	.split(',')
+	.map((s) => s.trim())
+	.filter(Boolean);
+
+// Internal rotating index (module-scoped)
+let __heliusKeyIndex = 0;
+
+/**
+ * Get a Helius API key. If multiple keys are configured via HELIUS_API_KEYS,
+ * this function returns keys in a round-robin fashion. If no keys are
+ * configured, it falls back to HELIUS_API_KEY.
+ *
+ * @param rotate whether to advance the rotation index (default: true)
+ */
+export function getHeliusApiKey(rotate = true): string {
+	try {
+		if (Array.isArray(HELIUS_API_KEYS) && HELIUS_API_KEYS.length > 0) {
+			const key = HELIUS_API_KEYS[__heliusKeyIndex % HELIUS_API_KEYS.length];
+			if (rotate) __heliusKeyIndex = (__heliusKeyIndex + 1) % HELIUS_API_KEYS.length;
+			return key;
+		}
+	} catch (e) {}
+	return HELIUS_API_KEY;
+}
+// Utility to partially mask API keys for safe logging
+export function maskKey(k: string | null | undefined): string {
+	if (!k) return '';
+	try {
+		const s = String(k);
+		if (s.length <= 8) return s.replace(/.(?=.{2})/g, '*');
+		return s.slice(0, 4) + '...' + s.slice(-4);
+	} catch (e) { return '***'; }
+}
 export const HELIUS_WS_URL_RAW = process.env.HELIUS_WEBSOCKET_URL || process.env.HELIUS_FAST_RPC_URL || '';
 export const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL || process.env.MAINNET_RPC || '';
 export const HELIUS_PARSE_HISTORY_URL = process.env.HELIUS_PARSE_HISTORY_URL || process.env.HELIUS_PARSE_TX_URL || '';
@@ -68,8 +138,10 @@ export function getHeliusWebsocketUrl(): string {
 	try {
 		const u = new URL(base);
 		// If api key is not provided in query, append as x-api-key or api-key if present
-		if (HELIUS_API_KEY && !u.searchParams.get('api-key') && !u.searchParams.get('x-api-key') && !u.searchParams.get('key')) {
-			u.searchParams.set('x-api-key', HELIUS_API_KEY);
+		// prefer rotating key(s) when available
+		const heliusKey = getHeliusApiKey();
+		if (heliusKey && !u.searchParams.get('api-key') && !u.searchParams.get('x-api-key') && !u.searchParams.get('key')) {
+				u.searchParams.set('x-api-key', heliusKey);
 		}
 		return u.toString();
 	} catch (e) {

@@ -7,7 +7,7 @@ import { registerBuyWithTarget } from './bot/strategy';
 import { extractTradeMeta } from './utils/tradeMeta';
 import { unifiedBuy } from './tradeSources';
 import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko, normalizeMintCandidate } from './utils/tokenUtils';
-import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL } from './config';
+import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL, HELIUS_API_KEY, getHeliusApiKey, getSolscanApiKey } from './config';
 import { getCoinData as getPumpData } from './pump/api';
 import { existsSync, mkdirSync } from 'fs';
 import fs from 'fs';
@@ -220,9 +220,65 @@ let __global_fetch_cache: any[] = [];
 let __global_fetch_ts = 0;
 const __GLOBAL_FETCH_TTL = 1000 * 60 * 1; // 1 minute default
 
+// Helper: canonicalize and merge array of token-like objects into a deduped array keyed by normalized mint/address
+function mergeAndCanonicalizeCache(arr: any[]): any[] {
+  try {
+    const tu = require('./utils/tokenUtils');
+    const map: Record<string, any> = {};
+    const fieldsToCoerce = ['marketCap', 'liquidity', 'volume', 'priceUsd', 'ageMinutes', 'ageSeconds'];
+    for (const raw of arr || []) {
+      try {
+        const addrRaw = raw && (raw.tokenAddress || raw.address || raw.mint || raw.pairAddress || (raw.token && raw.token.address) || null);
+        const addr = tu.normalizeMintCandidate(addrRaw);
+        if (!addr) continue;
+        const existing = map[addr] || { tokenAddress: addr, address: addr, mint: addr, sourceTags: [] };
+        // merge conservative: prefer existing non-empty values, for numeric fields take max when both present
+        const preferList = ['name','symbol','url','imageUrl','logoURI','pairAddress'];
+        for (const k of preferList) {
+          if (!existing[k] && raw[k]) existing[k] = raw[k];
+          else if (!existing[k] && raw.token && raw.token[k]) existing[k] = raw.token[k];
+        }
+        // numeric fields: coerce and prefer max
+        for (const k of fieldsToCoerce) {
+          const v1 = existing[k];
+          let v2 = raw[k] !== undefined ? raw[k] : (raw.token && raw.token[k] !== undefined ? raw.token[k] : undefined);
+          if (typeof v2 === 'string' && !isNaN(Number(v2))) v2 = Number(v2);
+          if (typeof v1 === 'number' && typeof v2 === 'number') existing[k] = Math.max(v1, v2);
+          else if ((v1 === undefined || v1 === null) && (v2 !== undefined && v2 !== null)) existing[k] = v2;
+        }
+        // merge arbitrary remaining keys conservatively
+        for (const k of Object.keys(raw)) {
+          if (k === 'token' || k === 'pair') continue;
+          if (existing[k] === undefined || existing[k] === null || existing[k] === '') existing[k] = raw[k];
+        }
+        if (raw.token && typeof raw.token === 'object') {
+          for (const k of Object.keys(raw.token)) {
+            if (existing[k] === undefined || existing[k] === null || existing[k] === '') existing[k] = raw.token[k];
+          }
+        }
+        // unify sourceTags
+        existing.sourceTags = Array.isArray(existing.sourceTags) ? existing.sourceTags : (existing.sourceTags ? [existing.sourceTags] : []);
+        if (raw.sourceTags) {
+          const incoming = Array.isArray(raw.sourceTags) ? raw.sourceTags : [raw.sourceTags];
+          for (const s of incoming) if (s && !existing.sourceTags.includes(s)) existing.sourceTags.push(s);
+        }
+        // try to set poolOpenTimeMs/ageSeconds from known aliases
+        if (!existing.poolOpenTimeMs) existing.poolOpenTimeMs = raw.poolOpenTimeMs || raw.poolOpenTime || (raw.token && raw.token.poolOpenTime) || null;
+        if (!existing.ageSeconds) existing.ageSeconds = raw.ageSeconds || (existing.ageMinutes ? existing.ageMinutes * 60 : null) || null;
+
+        map[addr] = existing;
+      } catch (e) { continue; }
+    }
+    return Object.values(map);
+  } catch (e) {
+    return arr || [];
+  }
+}
+
 // Aggregate quick candidate sources into a unified list of { mint }
 async function getUnifiedCandidates(limit: number) {
   const candidates: string[] = [];
+  const seen: Set<string> = new Set();
   try {
     // 1) Helius WS buffer + recent events
     try {
@@ -230,8 +286,9 @@ async function getUnifiedCandidates(limit: number) {
       const evs = getRecentHeliusEvents();
       if (Array.isArray(evs)) {
         for (const e of evs) {
-          const m = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint));
-          if (m) candidates.push(m);
+          const raw = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint) || null);
+          const m = raw ? normalizeMintCandidate(raw) : null;
+          if (m && !seen.has(m)) { candidates.push(m); seen.add(m); }
           if (candidates.length >= limit) break;
         }
       }
@@ -243,8 +300,9 @@ async function getUnifiedCandidates(limit: number) {
       let data: any[] = [];
       if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || raw.items || []);
       for (const it of data) {
-        const m = extractMintFromItemLocal(it);
-        if (m) candidates.push(m);
+        const rawMint = extractMintFromItemLocal(it);
+        const m = rawMint ? normalizeMintCandidate(rawMint) : null;
+        if (m && !seen.has(m)) { candidates.push(m); seen.add(m); }
         if (candidates.length >= limit) break;
       }
   } catch (e) {}
@@ -253,8 +311,9 @@ async function getUnifiedCandidates(limit: number) {
     try {
       const subs = await fetchLatest5FromAllSources(Math.max(5, limit));
       for (const arr of [subs.heliusEvents || [], subs.dexTop || [], subs.heliusHistory || []]) {
-        for (const m of arr) {
-          if (m) candidates.push(m);
+        for (const raw of arr) {
+          const m = raw ? normalizeMintCandidate(raw) : null;
+          if (m && !seen.has(m)) { candidates.push(m); seen.add(m); }
           if (candidates.length >= limit) break;
         }
         if (candidates.length >= limit) break;
@@ -263,7 +322,7 @@ async function getUnifiedCandidates(limit: number) {
 
   } catch (e) {}
 
-  const uniq = Array.from(new Set(candidates)).slice(0, limit || 200);
+  const uniq = candidates.slice(0, limit || 200);
   return uniq.map(m => ({ mint: m }));
 }
 
@@ -330,6 +389,106 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
     } catch (ee) { return []; }
   });
       __global_fetch_ts = Date.now();
+      // Ensure cached items have canonical address fields for downstream filtering
+      try {
+        const tu = require('./utils/tokenUtils');
+        __global_fetch_cache = (__global_fetch_cache || []).map((t: any) => {
+          try {
+            const addr = t.tokenAddress || t.address || t.mint || t.pairAddress || t.token?.address || null;
+            const norm = addr ? tu.normalizeMintCandidate(addr) : null;
+            if (norm) { t.tokenAddress = norm; t.address = norm; t.mint = norm; }
+          } catch (e) {}
+          return t;
+        });
+      } catch (e) {}
+      // Canonicalize & merge the cache to reduce conflicting fields and attach sourceTags
+      try {
+        __global_fetch_cache = mergeAndCanonicalizeCache(__global_fetch_cache || []);
+      } catch (e) {}
+      // Proactively merge DexScreener token/pair data into the global cache so
+      // that downstream filtering has better chance of seeing marketCap/liquidity/volume/age
+      try {
+        const tu = require('./utils/tokenUtils');
+        try {
+          const ds = await fetchDexScreenerTokens('solana', { limit: String(limit) });
+          if (Array.isArray(ds) && ds.length) {
+            // Build map by normalized address from cache (ensure canonical keys)
+            const cacheMap: Record<string, any> = {};
+            for (const it of __global_fetch_cache || []) {
+              try {
+                const rawA = it.tokenAddress || it.address || it.mint || it.pairAddress || null;
+                const normA = rawA ? tu.normalizeMintCandidate(rawA) : null;
+                if (!normA) continue;
+                // ensure token has canonical address fields
+                it.tokenAddress = it.tokenAddress || normA;
+                it.address = it.address || normA;
+                it.mint = it.mint || normA;
+                it.sourceTags = Array.isArray(it.sourceTags) ? it.sourceTags : (it.sourceTags ? [it.sourceTags] : []);
+                cacheMap[String(normA)] = it;
+              } catch (e) { continue; }
+            }
+            for (const d of ds) {
+                try {
+                const addrRaw = d.address || d.tokenAddress || d.pairAddress || d.token?.address || d.token?.tokenAddress || null;
+                const addr = tu.normalizeMintCandidate(addrRaw);
+                if (!addr) continue;
+                // prepare canonical ds token object fields
+                const dsToken = d || {};
+                // If token exists in cache, merge missing fields conservatively and merge source tags
+                const existing = cacheMap[addr];
+                if (existing) {
+                  // list of fields to merge only if missing
+                  const fields = ['marketCap','liquidity','volume','priceUsd','name','symbol','pairAddress','poolOpenTime','poolOpenTimeMs','ageMinutes','ageSeconds','url','imageUrl','logoURI'];
+                  for (const f of fields) {
+                    try {
+                      const val = dsToken[f] !== undefined ? dsToken[f] : (dsToken.token && dsToken.token[f] !== undefined ? dsToken.token[f] : undefined);
+                      if ((existing[f] === undefined || existing[f] === null || existing[f] === '' ) && (val !== undefined && val !== null && val !== '')) {
+                        // coerce numeric-looking values to numbers
+                        if (typeof val === 'string' && !isNaN(Number(val))) existing[f] = Number(val);
+                        else existing[f] = val;
+                      }
+                    } catch (e) {}
+                  }
+                  // merge source tags
+                  existing.sourceTags = Array.isArray(existing.sourceTags) ? existing.sourceTags : (existing.sourceTags ? [existing.sourceTags] : []);
+                  if (!existing.sourceTags.includes('dexscreener')) existing.sourceTags.push('dexscreener');
+                  // ensure canonical address fields are present
+                  existing.tokenAddress = existing.tokenAddress || addr;
+                  existing.address = existing.address || addr;
+                  existing.mint = existing.mint || addr;
+                } else {
+                  // not in cache: add a lightweight normalized entry so filters can consider it
+                  const newEntry: any = {};
+                  newEntry.tokenAddress = addr;
+                  newEntry.address = addr;
+                  newEntry.mint = addr;
+                  // copy useful fields with safe coercion
+                  newEntry.name = d.name || d.tokenName || '';
+                  newEntry.symbol = d.symbol || d.ticker || '';
+                  newEntry.marketCap = d.marketCap ?? d.fdv ?? null;
+                  newEntry.liquidity = d.liquidity ?? d.liquidityUsd ?? null;
+                  newEntry.volume = d.volume ?? d.h24 ?? null;
+                  newEntry.priceUsd = d.priceUsd ?? d.price ?? null;
+                  newEntry.pairAddress = d.pairAddress || addr;
+                  newEntry.url = d.url || d.pairUrl || d.dexUrl || '';
+                  newEntry.imageUrl = d.imageUrl || d.logoURI || '';
+                  newEntry.sourceTags = ['dexscreener'];
+                  newEntry.poolOpenTimeMs = d.poolOpenTimeMs || d.poolOpenTime || null;
+                  if (newEntry.poolOpenTimeMs && typeof newEntry.poolOpenTimeMs === 'number' && newEntry.poolOpenTimeMs < 1e12 && newEntry.poolOpenTimeMs > 1e9) newEntry.poolOpenTimeMs *= 1000;
+                  if (newEntry.poolOpenTimeMs) {
+                    newEntry.ageSeconds = Math.floor((Date.now() - newEntry.poolOpenTimeMs) / 1000);
+                    newEntry.ageMinutes = Math.floor(newEntry.ageSeconds / 60);
+                  }
+                  __global_fetch_cache.push(newEntry);
+                  cacheMap[addr] = newEntry;
+                }
+              } catch (e) { continue; }
+            }
+          }
+        } catch (e) {
+          // DexScreener call failed; continue silently
+        }
+      } catch (e) {}
     } catch (e) {
       // fallback: try coinGecko single fetch
       try {
@@ -362,7 +521,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
       result[uid] = [];
       continue;
     }
-    try {
+  try {
       // Official enrichment: for safety, check a small sample using Solana RPC + Jupiter.
       // We do this when user has autoBuy enabled or buyAmount > 0 to avoid unnecessary calls.
       const needOfficial = (typeof strat.buyAmount === 'number' && strat.buyAmount > 0) || strat.autoBuy !== false;
@@ -401,6 +560,8 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
         await Promise.race([ Promise.all(workers), new Promise(res => setTimeout(res, globalTimeoutMs)) ]);
         workCache = [...sample, ...workCache.slice(sampleSize)];
       }
+  // Ensure workCache is canonicalized before filtering
+  try { workCache = mergeAndCanonicalizeCache(workCache || []); } catch (e) {}
   const matches = await (require('./bot/strategy').filterTokensByStrategy(workCache, strat));
   result[uid] = Array.isArray(matches) ? matches : [];
     } catch (e) {
@@ -448,7 +609,10 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
   let attempt = 0;
   while (attempt <= retries) {
     try {
-      const res = await axios.post(heliusUrl, payload, { headers: { 'Content-Type': 'application/json' }, timeout });
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
+    const res = await axios.post(heliusUrl, payload, { headers, timeout });
+    if (!res.data || !res.data.result) throw new Error('Invalid response');
       return res.data;
     } catch (e: any) {
       const status = e.response?.status;
@@ -479,7 +643,9 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
   let attempt = 0;
   while (attempt <= retries) {
     try {
-      const res = await axios.post(heliusUrl, payload, { headers: { 'Content-Type': 'application/json' }, timeout });
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
+  const res = await axios.post(heliusUrl, payload, { headers, timeout });
       return res.data?.result ?? res.data;
     } catch (e: any) {
       const status = e.response?.status;
@@ -769,7 +935,10 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
               // final fallback to solscan if configured
               try {
                 const solscanUrl = `${SOLSCAN_API_URL}/token/${t.mint}/transactions`;
-                const sres = await axios.get(solscanUrl, { timeout: timeoutMs });
+                const headers: any = {};
+                const sk = getSolscanApiKey(true);
+                if (sk) { headers['x-api-key'] = sk; try { const { maskKey } = await import('./config'); console.log(`[FastFetcher->Solscan] using key=${maskKey(sk)}`); } catch (e) {} }
+                const sres = await axios.get(solscanUrl, { timeout: timeoutMs, headers });
                 const arr = sres.data ?? [];
                 const first = Array.isArray(arr) ? arr[0] : null;
                 const bt = first?.blockTime || first?.time || first?.timestamp || null;

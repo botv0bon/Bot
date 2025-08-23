@@ -1,0 +1,13 @@
+HTTP/2 200 
+date: Fri, 22 Aug 2025 18:22:23 GMT
+content-type: application/json
+content-length: 38
+cf-ray: 97346532cc73f5e2-AMS
+access-control-allow-origin: *
+access-control-allow-headers: *
+access-control-allow-methods: GET, HEAD, POST, PUT, OPTIONS
+server: cloudflare
+alt-svc: h3=":443"; ma=86400
+
+{"id":1,"jsonrpc":"2.0","result":"ok"}
+__HTTP_CODE__:200
