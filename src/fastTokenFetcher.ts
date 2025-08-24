@@ -70,7 +70,18 @@ async function ensureSentDir() {
 
 export async function readSentHashes(userId: string): Promise<Set<string>> {
   try {
-  const sentDir = await ensureSentDir();
+    // Prefer Redis set when available for cross-process dedupe and performance
+    try {
+      const rc = await getRedisClient();
+      if (rc) {
+        const key = `sent_tokens:${userId}`;
+        const members = await rc.sMembers(key).catch(() => []);
+        return new Set((members || []).map((m: any) => String(m)));
+      }
+    } catch (e) {
+      // fall through to file-based fallback
+    }
+    const sentDir = await ensureSentDir();
     const file = path.join(sentDir, `${userId}.json`);
     const stat = await fsp.stat(file).catch(() => false);
     if (!stat) return new Set();
@@ -83,7 +94,23 @@ export async function readSentHashes(userId: string): Promise<Set<string>> {
 
 export async function appendSentHash(userId: string, hash: string) {
   try {
-  const sentDir = await ensureSentDir();
+    // Prefer Redis-backed set when available
+    try {
+      const rc = await getRedisClient();
+      if (rc) {
+        const key = `sent_tokens:${userId}`;
+        try {
+          await rc.sAdd(key, String(hash));
+          // set TTL if configured (default 30 days)
+          const ttl = Number(process.env.SENT_TOKENS_TTL_SEC || 60 * 60 * 24 * 30);
+          if (ttl > 0) await rc.expire(key, Math.max(1, Math.floor(ttl)) ).catch(() => {});
+        } catch (e) {}
+        return;
+      }
+    } catch (e) {
+      // fall through to file-based fallback
+    }
+    const sentDir = await ensureSentDir();
     const file = path.join(sentDir, `${userId}.json`);
     let arr: any[] = [];
     try {
@@ -1062,7 +1089,100 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
 }
 
 async function getParsedTransaction(signature: string) {
-  return heliusRpc('getTransaction', [signature, { encoding: 'jsonParsed' }], 5000, 1);
+  // try Helius RPC wrapper first
+  let heliusRes: any = null;
+  try {
+    heliusRes = await heliusRpc('getTransaction', [signature, { encoding: 'jsonParsed' }], 5000, 1);
+    if (heliusRes && !(heliusRes as any).__error) {
+      // If heliusRes contains result structure, return it
+      const candidate = heliusRes.result ?? heliusRes;
+      if (candidate) return candidate;
+    }
+  } catch (e) {}
+
+  // fallback: if Helius is unavailable or returned error, try MAINNET_RPC (Solana JSON-RPC)
+  try {
+    // prefer an explicit MAINNET RPC endpoint (do not reuse Helius RPC endpoint)
+    const rpc = process.env.MAINNET_RPC || 'https://api.mainnet-beta.solana.com';
+    if (!rpc) return { __error: 'no-rpc' };
+    const payload = { jsonrpc: '2.0', id: 1, method: 'getTransaction', params: [signature, { encoding: 'jsonParsed' }] };
+    const headers: Record<string,string> = { 'Content-Type': 'application/json' };
+    const r = await axios.post(rpc, payload, { headers, timeout: 6000 });
+    if (r && r.data) return r.data.result ?? r.data;
+    // fallthrough to connection attempt
+    // return { __error: 'no-response' };
+  } catch (e: any) {
+    const status = e?.response?.status;
+    // try connection fallback below
+  }
+
+  // final attempt via web3 Connection
+  try {
+    const connRes = await getParsedTransactionViaConnection(signature);
+    if (connRes && !(connRes as any).__error) return connRes;
+    return { __error: 'all-failed' };
+  } catch (e) {
+    return { __error: 'all-failed' };
+  }
+}
+
+// If HTTP RPCs fail, try using the existing web3 Connection as a last resort
+async function getParsedTransactionViaConnection(signature: string) {
+  try {
+    const cfg = require('./config');
+    const conn = cfg && cfg.connection;
+    if (!conn || typeof conn.getParsedTransaction !== 'function') return { __error: 'no-connection' };
+    const res = await conn.getParsedTransaction(signature, 'confirmed');
+    return res ?? { __error: 'no-result' };
+  } catch (e: any) {
+    return { __error: (e && e.message) || 'error' };
+  }
+}
+
+// Try to resolve blockTime for a slot with Redis caching to avoid repeated RPC calls
+async function getBlockTimeForSlotCached(slot: number): Promise<number | null> {
+  try {
+    const key = `slot_blocktime:${slot}`;
+    const rc = await getRedisClient().catch(() => null);
+    if (rc) {
+      try {
+        const v = await rc.get(key).catch(() => null);
+        if (v) return Number(v);
+      } catch (e) {}
+    }
+
+    // try web3 connection first
+    try {
+      const cfg = require('./config');
+      const conn = cfg && cfg.connection;
+      if (conn && typeof conn.getBlockTime === 'function') {
+        const bt = await conn.getBlockTime(Number(slot));
+        if (bt && typeof bt === 'number') {
+          try { if (rc) await rc.setEx(key, Math.max(1, Math.floor(Number(process.env.SLOT_BLOCKTIME_TTL_SEC || 60 * 60 * 24 * 7))), String(bt)).catch(() => {}); } catch (e) {}
+          return Number(bt);
+        }
+      }
+    } catch (e) {}
+
+    // fallback to MAINNET_RPC JSON-RPC getBlockTime
+    try {
+      const mainRpc = process.env.MAINNET_RPC || 'https://api.mainnet-beta.solana.com';
+      if (mainRpc) {
+        const payload = { jsonrpc: '2.0', id: 1, method: 'getBlockTime', params: [Number(slot)] };
+        const r = await axios.post(mainRpc, payload, { timeout: 4000 });
+        const val = r && r.data ? (r.data.result ?? r.data) : null;
+        if (val || val === 0) {
+          const num = Number(val);
+          try { if (rc) await rc.setEx(key, Math.max(1, Math.floor(Number(process.env.SLOT_BLOCKTIME_TTL_SEC || 60 * 60 * 24 * 7))), String(num)).catch(() => {}); } catch (e) {}
+          return num;
+        }
+      }
+    } catch (e) {}
+
+    return null;
+  } catch (e) {
+    return null;
+  }
 }
 
 export async function getAccountInfo(pubkey: string) {
@@ -1103,39 +1223,57 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
     if (!heliusUrl) { console.log('handleNewMintEvent: no helius url'); return null; }
 
-    const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0);
-    if (!r || (r as any).__error) { if ((r as any)?.__error) console.log(`Enrich ${mint} error: ${(r as any).__error}`); return null; }
-    const arr = Array.isArray(r) ? r : ((r as any).result ?? r);
-    if (!arr || !Array.isArray(arr) || arr.length === 0) return null;
-
-    // compute earliest blockTime across signatures (Helius returns newest-first)
+    // Prefer slot->getBlockTime when Helius WS provided a firstSlot (cheaper and more reliable for timestamps)
     let earliestBlockTime: number | null = null;
     let firstSignature: string | null = null;
-    for (const entry of arr) {
-  const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
-      let btv: any = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
-      if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
-      if (btv) {
-        const num = Number(btv);
-        if (!earliestBlockTime || num < earliestBlockTime) {
-          earliestBlockTime = num;
-          firstSignature = sig;
+    try {
+      const candidateSlot = (mintOrObj && (mintOrObj.firstSlot || (mintOrObj.raw && (mintOrObj.raw.params?.result?.context?.slot || mintOrObj.raw.result?.context?.slot)))) || null;
+      if (candidateSlot && Number(candidateSlot) > 0) {
+        try {
+          const bt = await getBlockTimeForSlotCached(Number(candidateSlot));
+          if (bt && typeof bt === 'number') earliestBlockTime = Number(bt);
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    // If slot->getBlockTime resolved timestamp, skip heavy signature/parsed tx calls
+    if (!earliestBlockTime) {
+      const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0);
+      if (!r || (r as any).__error) { if ((r as any)?.__error) console.log(`Enrich ${mint} error: ${(r as any).__error}`); return null; }
+      const arr = Array.isArray(r) ? r : ((r as any).result ?? r);
+      if (!arr || !Array.isArray(arr) || arr.length === 0) return null;
+
+      // compute earliest blockTime across signatures (Helius returns newest-first)
+      for (const entry of arr) {
+        const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
+        let btv: any = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
+        if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
+        if (btv) {
+          const num = Number(btv);
+          if (!earliestBlockTime || num < earliestBlockTime) {
+            earliestBlockTime = num;
+            firstSignature = sig;
+          }
+        }
+      }
+
+      // fallback: if no blockTime in signatures, try parsed tx for the last (earliest) signature
+      if (!earliestBlockTime) {
+        const sigTry = arr[arr.length - 1]?.signature || (arr[arr.length - 1] as any)?.txHash || (arr[arr.length - 1] as any)?.tx_hash || null;
+        if (sigTry) {
+          try {
+            const parsed = await getParsedTransaction(sigTry);
+            const pbt = (parsed as any)?.blockTime ?? (parsed as any)?.result?.blockTime ?? (parsed as any)?.result?.block_time ?? (parsed as any)?.result?.blocktime ?? null;
+            if (pbt) earliestBlockTime = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+            firstSignature = sigTry;
+          } catch (e) {}
         }
       }
     }
 
-    // fallback: if no blockTime in signatures, try parsed tx for the last (earliest) signature
-    if (!earliestBlockTime) {
-  const sigTry = arr[arr.length - 1]?.signature || (arr[arr.length - 1] as any)?.txHash || (arr[arr.length - 1] as any)?.tx_hash || null;
-      if (sigTry) {
-        try {
-          const parsed = await getParsedTransaction(sigTry);
-          const pbt = (parsed as any)?.blockTime ?? (parsed as any)?.result?.blockTime ?? (parsed as any)?.result?.block_time ?? (parsed as any)?.result?.blocktime ?? null;
-          if (pbt) earliestBlockTime = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
-          firstSignature = sigTry;
-        } catch (e) {}
-      }
-    }
+
+
+  // slot fallback already attempted via getBlockTimeForSlotCached earlier; no-op here
 
     if (!earliestBlockTime) return null;
     const nowSec = Math.floor(Date.now() / 1000);
