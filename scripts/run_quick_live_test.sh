@@ -13,5 +13,5 @@ else
 fi
 
 echo "Running quick live test with CAND_LIMIT=${CAND_LIMIT:-30}"
-# run with ts-node
-npx ts-node -T tmp_check_candidates.ts
+# run integrated fast discovery from src/fastTokenFetcher
+npx ts-node -T -e "(async ()=>{ const ff = require('./src/fastTokenFetcher'); if(!ff || typeof ff.runFastDiscoveryCli!=='function'){ console.error('runFastDiscoveryCli not available'); process.exit(2);} await ff.runFastDiscoveryCli({ topN: Number(process.env.CAND_LIMIT||10), timeoutMs: 3000, concurrency: 3 }); process.exit(0); })().catch(e=>{ console.error(e); process.exit(3); })"

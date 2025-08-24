@@ -695,11 +695,12 @@ async function getFirstTxTimestampFromRpc(address: string): Promise<number | nul
     enrichmentMetrics.rpcTotalMs += (Date.now() - start);
     if (earliestMs) try { setCachedFirstTx(address, earliestMs); } catch (e) {}
     return earliestMs;
-  } catch (e) {
-    enrichmentMetrics.rpcFailures++;
-    try {
-      const status = (e as any)?.response?.status || (e as any)?.code || 'n/a';
-      const dataSnippet = (() => { try { const d = (e as any)?.response?.data; return d ? (typeof d === 'string' ? d.slice(0,200) : JSON.stringify(d).slice(0,200)) : ''; } catch { return ''; } })();
+    } catch (e) {
+      enrichmentMetrics.rpcFailures++;
+      try {
+        const status = (e as any)?.response?.status || (e as any)?.code || 'n/a';
+        const safeSnippet = (v: any, n = 200) => { try { if (!v && v !== 0) return ''; if (typeof v === 'string') return v.slice(0,n); return JSON.stringify(v).slice(0,n); } catch { try { return String(v).slice(0,n); } catch { return ''; } } };
+        const dataSnippet = (() => { try { const d = (e as any)?.response?.data; return safeSnippet(d,200); } catch { return ''; } })();
       console.error(`[RPC] getFirstTxTimestampFromRpc failed for ${address}: status=${status} msg=${String((e as any)?.message || e)} data=${dataSnippet}`);
     } catch(_) {}
     return null;
@@ -805,8 +806,8 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
     // Final: emit a concise single-line error (no stack) and throw, include headers/data snippets
     try {
       const status = lastErr?.response?.status || lastErr?.code || 'n/a';
-      const headersSnippet = (() => { try { return lastErr?.response?.headers ? Object.keys(lastErr.response.headers).slice(0,5).join(',') : ''; } catch { return ''; } })();
-      const dataSnippet = (() => { try { const d = lastErr?.response?.data; return d ? (typeof d === 'string' ? d.slice(0,200) : JSON.stringify(d).slice(0,200)) : ''; } catch { return ''; } })();
+  const headersSnippet = (() => { try { return lastErr?.response?.headers ? Object.keys(lastErr.response.headers).slice(0,5).join(',') : ''; } catch { return ''; } })();
+  const dataSnippet = (() => { try { const d = lastErr?.response?.data; if (!d) return ''; if (typeof d === 'string') return d.slice(0,200); try { return JSON.stringify(d).slice(0,200); } catch { return String(d).slice(0,200); } } catch { return ''; } })();
       const host = hostKey || 'unknown-host';
       console.error(`[Helius] HTTP failure for ${host} after retries (status=${status}) headers=[${headersSnippet}] data=${dataSnippet} message=${String(lastErr?.message || lastErr)}`);
     } catch (e) {

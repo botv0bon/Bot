@@ -254,7 +254,7 @@ import { autoFilterTokensVerbose } from '../utils/tokenUtils';
  * Filters a list of tokens based on the user's strategy settings.
  * All comments and variable names are in English for clarity.
  */
-export async function filterTokensByStrategy(tokens: any[], strategy: Strategy): Promise<any[]> {
+export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, opts?: { preserveSources?: boolean }): Promise<any[]> {
   if (!strategy || !Array.isArray(tokens)) return [];
   // Integrated enrichment: attempt to enrich tokens with on-chain timestamps and freshness
   // using Helius (RPC/parse/websocket), Solscan and RPC fallbacks. This improves age
@@ -273,16 +273,18 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
           (latest.heliusEvents || []).forEach(pushAddr);
           (latest.dexTop || []).forEach(pushAddr);
           (latest.heliusHistory || []).forEach(pushAddr);
-          // merge extras into tokens if not present
-          const seen = new Set(tokens.map(t => (t.tokenAddress || t.address || t.mint || '').toString()));
+          // merge extras into a local copy so we don't mutate caller's array
+          const localTokens = tokens.slice();
+          const seen = new Set(localTokens.map(t => (t.tokenAddress || t.address || t.mint || '').toString()));
           for (const ex of extras) {
             const key = ex.tokenAddress || ex.address || ex.mint || '';
             if (!key) continue;
             if (!seen.has(key)) {
-              tokens.push(ex);
+              localTokens.push(ex);
               seen.add(key);
             }
           }
+          tokens = localTokens;
           try { console.log('[filterTokensByStrategy] merged realtime sources; extraCandidates=', extras.length); } catch {}
         }
       } catch (e) {
@@ -320,7 +322,11 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy):
     if (strategy.minHolders !== undefined && holders < strategy.minHolders) return false;
 
     // Age checks: compute age in seconds with no integer-flooring to preserve fractional minutes/seconds
-    let ageSeconds: number | undefined = undefined;
+  let ageSeconds: number | undefined = undefined;
+    // Prefer canonical age if present (set by merge/ensureCanonicalOnchainAges)
+    if (token && token._canonicalAgeSeconds !== undefined && token._canonicalAgeSeconds !== null) {
+      ageSeconds = Number(token._canonicalAgeSeconds);
+    }
     const ageVal = getField(token,
       'ageSeconds', 'ageMinutes', 'age', 'createdAt', 'created_at', 'creation_date', 'created',
       'poolOpenTime', 'poolOpenTimeMs', 'listed_at', 'listedAt', 'genesis_date', 'published_at',

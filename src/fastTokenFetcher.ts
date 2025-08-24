@@ -9,6 +9,8 @@ import { unifiedBuy } from './tradeSources';
 import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko, normalizeMintCandidate } from './utils/tokenUtils';
 import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL, HELIUS_API_KEY, getHeliusApiKey, getSolscanApiKey } from './config';
 import { getCoinData as getPumpData } from './pump/api';
+import { withTimeout, createLimiter, makeSourceMeta, SourceMeta, getHostLimiter, retryWithBackoff, TTLCache } from './utils/enrichHelpers';
+import { compareSourcesForCache, printEquivalenceReport } from './utils/sourceEquivalence';
 import { existsSync, mkdirSync } from 'fs';
 import fs from 'fs';
 const fsp = fs.promises;
@@ -213,6 +215,25 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
 
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
+// Defensive helpers
+function safeStringSnippet(v: any, n = 200) {
+  try {
+    if (v === undefined || v === null) return '';
+    if (typeof v === 'string') return v.slice(0, n);
+    const s = JSON.stringify(v);
+    return typeof s === 'string' ? s.slice(0, n) : String(s).slice(0, n);
+  } catch (e) { try { return String(v).slice(0, n); } catch { return ''; } }
+}
+function safeArraySlice<T>(arr: any, start?: number, end?: number): T[] {
+  try {
+    if (!arr) return [];
+    if (!Array.isArray(arr)) return [];
+    if (start === undefined && end === undefined) return arr.slice();
+    if (end === undefined) return arr.slice(start);
+    return arr.slice(start, end);
+  } catch (e) { return [] as T[]; }
+}
+
 // =========================
 // New: fetch and filter tokens per-user
 // =========================
@@ -226,7 +247,7 @@ function mergeAndCanonicalizeCache(arr: any[]): any[] {
     const tu = require('./utils/tokenUtils');
     const map: Record<string, any> = {};
     const fieldsToCoerce = ['marketCap', 'liquidity', 'volume', 'priceUsd', 'ageMinutes', 'ageSeconds'];
-    for (const raw of arr || []) {
+  for (const raw of arr || []) {
       try {
         const addrRaw = raw && (raw.tokenAddress || raw.address || raw.mint || raw.pairAddress || (raw.token && raw.token.address) || null);
         const addr = tu.normalizeMintCandidate(addrRaw);
@@ -262,6 +283,19 @@ function mergeAndCanonicalizeCache(arr: any[]): any[] {
           const incoming = Array.isArray(raw.sourceTags) ? raw.sourceTags : [raw.sourceTags];
           for (const s of incoming) if (s && !existing.sourceTags.includes(s)) existing.sourceTags.push(s);
         }
+        // preserve structured per-source raw objects (if present) under __sources for provenance
+        existing.__sources = Array.isArray(existing.__sources) ? existing.__sources : (existing.__sources ? [existing.__sources] : []);
+        if (raw.__sources) {
+          const incoming = Array.isArray(raw.__sources) ? raw.__sources : [raw.__sources];
+          for (const src of incoming) {
+            try {
+              // avoid duplicates by shallow comparing source name+host+type if available
+              const id = (src && (src.name || src.source || src.host || src.type)) || JSON.stringify(src || {});
+              const dup = existing.__sources.find((s: any) => { try { return (s && (s.name || s.source || s.host || s.type)) === (src && (src.name || src.source || src.host || src.type)); } catch (e) { return false; } });
+              if (!dup) existing.__sources.push(src);
+            } catch (e) {}
+          }
+        }
         // try to set poolOpenTimeMs/ageSeconds from known aliases
         if (!existing.poolOpenTimeMs) existing.poolOpenTimeMs = raw.poolOpenTimeMs || raw.poolOpenTime || (raw.token && raw.token.poolOpenTime) || null;
         if (!existing.ageSeconds) existing.ageSeconds = raw.ageSeconds || (existing.ageMinutes ? existing.ageMinutes * 60 : null) || null;
@@ -269,15 +303,53 @@ function mergeAndCanonicalizeCache(arr: any[]): any[] {
         map[addr] = existing;
       } catch (e) { continue; }
     }
-    return Object.values(map);
+    const out = Object.values(map);
+    // compute a canonical age field for downstream filters
+    const now = Date.now();
+    for (const e of out) {
+      try {
+        // prefer explicit poolOpenTimeMs / firstBlockTime / ageSeconds / ageMinutes
+        let secs: number | undefined = undefined;
+        if (e.poolOpenTimeMs && typeof e.poolOpenTimeMs === 'number' && !isNaN(e.poolOpenTimeMs)) {
+          // if value in seconds or ms
+          let v = Number(e.poolOpenTimeMs);
+          if (v > 1e12) v = Math.floor(v / 1000);
+          else if (v > 1e9) v = Math.floor(v);
+          else {
+            // treat as minutes
+            secs = v * 60;
+          }
+          if (secs === undefined) secs = Math.floor((Date.now() / 1000) - v);
+        }
+        if ((secs === undefined || isNaN(secs)) && typeof e.firstBlockTime === 'number') {
+          const fb = Number(e.firstBlockTime);
+          secs = Math.floor((Date.now() / 1000) - (fb > 1e12 ? Math.floor(fb / 1000) : fb));
+        }
+        if ((secs === undefined || isNaN(secs)) && typeof e.ageSeconds === 'number') secs = Number(e.ageSeconds);
+        if ((secs === undefined || isNaN(secs)) && typeof e.ageMinutes === 'number') secs = Math.floor(Number(e.ageMinutes) * 60);
+        // fallback: check common aliases
+        if ((secs === undefined || isNaN(secs)) && (e.poolOpenTime || e.firstSeenAtMs || e.firstSeenAt)) {
+          const candidate = e.poolOpenTime || e.firstSeenAtMs || e.firstSeenAt;
+          let v = Number(candidate);
+          if (!isNaN(v)) {
+            if (v > 1e12) v = Math.floor(v / 1000);
+            if (v > 1e9) secs = Math.floor((Date.now() / 1000) - v);
+            else secs = Math.floor(v * 60);
+          }
+        }
+        if (secs === undefined || isNaN(secs)) secs = null as any;
+        e._canonicalAgeSeconds = secs;
+      } catch (e) {}
+    }
+    return out;
   } catch (e) {
     return arr || [];
   }
 }
 
 // Aggregate quick candidate sources into a unified list of { mint }
-async function getUnifiedCandidates(limit: number) {
-  const candidates: string[] = [];
+export async function getUnifiedCandidates(limit: number) {
+  const candidates: any[] = [];
   const seen: Set<string> = new Set();
   try {
     // 1) Helius WS buffer + recent events
@@ -286,9 +358,19 @@ async function getUnifiedCandidates(limit: number) {
       const evs = getRecentHeliusEvents();
       if (Array.isArray(evs)) {
         for (const e of evs) {
-          const raw = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint) || null);
+          // prefer analyzer-provided mint field when available
+          const raw = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint) || e.address || null);
           const m = raw ? normalizeMintCandidate(raw) : null;
-          if (m && !seen.has(m)) { candidates.push(m); seen.add(m); }
+          if (m && !seen.has(m)) {
+            // attach structured provenance so Helius contributes to __sources in canonical cache
+            try {
+              const meta = makeSourceMeta('helius-ws', true, { raw: e });
+              candidates.push({ mint: m, __sources: [meta], sourceTags: ['helius-ws'] });
+            } catch (ee) {
+              candidates.push(m);
+            }
+            seen.add(m);
+          }
           if (candidates.length >= limit) break;
         }
       }
@@ -298,11 +380,17 @@ async function getUnifiedCandidates(limit: number) {
     try {
       const raw = await fetchDexBoostsRaw(2000);
       let data: any[] = [];
-      if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || raw.items || []);
+      const dexMeta = raw && (raw as any).__meta ? (raw as any).__meta as SourceMeta : null;
+      if (raw) data = Array.isArray(raw) ? raw as any[] : (raw.data || raw.pairs || raw.items || []);
       for (const it of data) {
         const rawMint = extractMintFromItemLocal(it);
         const m = rawMint ? normalizeMintCandidate(rawMint) : null;
-        if (m && !seen.has(m)) { candidates.push(m); seen.add(m); }
+        if (m && !seen.has(m)) {
+          const obj: any = { mint: m };
+          if (dexMeta) obj.__sources = [dexMeta];
+          candidates.push(obj.mint ? obj : m);
+          seen.add(m);
+        }
         if (candidates.length >= limit) break;
       }
   } catch (e) {}
@@ -323,7 +411,13 @@ async function getUnifiedCandidates(limit: number) {
   } catch (e) {}
 
   const uniq = candidates.slice(0, limit || 200);
-  return uniq.map(m => ({ mint: m }));
+  // candidates may contain strings or objects { mint, __sources }
+  return uniq.map((m: any) => {
+    if (!m) return { mint: null };
+    if (typeof m === 'string') return { mint: m };
+    if (typeof m === 'object' && m.mint) return { mint: m.mint, __sources: m.__sources || null, sourceTags: m.sourceTags || null };
+    return { mint: String(m) };
+  });
 }
 
 // Return a list of candidates with source tags for diagnostics
@@ -333,8 +427,9 @@ export async function fetchLatestWithSources(limit = 50) {
     const { getRecentHeliusEvents } = require('./heliusWsListener');
     const evs = getRecentHeliusEvents() || [];
     for (const e of evs) {
-      const m = normalizeMintCandidate(e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint)));
-      if (m) out.push({ mint: m, source: 'helius-ws' });
+      const raw = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint) || e.address || null);
+      const m = normalizeMintCandidate(raw);
+  if (m) out.push({ mint: m, source: 'helius-ws' });
       if (out.length >= limit) break;
     }
   } catch (e) {}
@@ -342,10 +437,15 @@ export async function fetchLatestWithSources(limit = 50) {
   try {
     const raw = await fetchDexBoostsRaw(2000);
     let data: any[] = [];
-    if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || raw.items || []);
+    const dexMeta = raw && (raw as any).__meta ? (raw as any).__meta as SourceMeta : null;
+    if (raw) data = Array.isArray(raw) ? raw as any[] : (raw.data || raw.pairs || raw.items || []);
     for (const it of data) {
       const m = normalizeMintCandidate(extractMintFromItemLocal(it));
-      if (m) out.push({ mint: m, source: 'dexscreener' });
+      if (m) {
+        const entry: any = { mint: m, source: 'dexscreener' };
+        if (dexMeta) entry.__meta = dexMeta;
+        out.push(entry);
+      }
       if (out.length >= limit) break;
     }
   } catch (e) {}
@@ -374,11 +474,43 @@ export async function fetchLatestWithSources(limit = 50) {
  * then filter tokens per user based on their normalized strategy.
  * Returns a map: { [userId]: tokens[] }
  */
-export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { limit?: number, force?: boolean }): Promise<Record<string, any[]>> {
+export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { limit?: number, force?: boolean, detail?: boolean, warmupHeliusMs?: number }): Promise<Record<string, any[]>> {
   const now = Date.now();
   if (!opts?.force && __global_fetch_cache.length && (now - __global_fetch_ts) < __GLOBAL_FETCH_TTL) {
-    // use cache
+    // cache is fresh; skip refetch but continue to per-user filtering using the existing __global_fetch_cache
   } else {
+    // Cold-start warm-up: if global cache is empty (cold) and this is not a forced full-refresh,
+    // perform a small seeded fetch first to warm TTL caches and rate-limiters to avoid request storms.
+    try {
+      // Optional warm-up: allow callers to request a Helius WS capture to populate events
+      if (opts?.warmupHeliusMs && Number(opts.warmupHeliusMs) > 0) {
+        try {
+          const ms = Number(opts.warmupHeliusMs);
+          console.log('[fetchAndFilterTokensForUsers] running helius warm-up for', ms, 'ms');
+          await captureHeliusAndVerify(ms).catch(() => {});
+        } catch (e) {}
+      }
+      const coldSeed = Number(process.env.COLD_START_SEED || 20);
+      const coldEnabled = (coldSeed > 0 && !opts?.force && (!__global_fetch_cache || __global_fetch_cache.length === 0));
+      if (coldEnabled) {
+        try {
+          const seedLimit = Math.max(5, Math.min(200, coldSeed));
+          // fetch a small set and attempt light validation to populate in-memory TTL caches
+          const seedCandidates = await getUnifiedCandidates(seedLimit).catch(() => []);
+          if (Array.isArray(seedCandidates) && seedCandidates.length) {
+            // light validate: call getAccountInfo for each seed but limit concurrency conservatively
+            const lim = Number(process.env.COLD_START_VALIDATE_CONCURRENCY || 3);
+            const runner = createLimiter(Math.max(1, lim));
+            await Promise.all(seedCandidates.slice(0, seedLimit).map((c: any) => runner(async () => {
+              try { if (typeof (globalThis as any).__fastTokenFetcher_getAccountInfo === 'function') return await (globalThis as any).__fastTokenFetcher_getAccountInfo(c.mint || c);
+                // fallback to local exported getAccountInfo if available
+                if (typeof (require('./src/fastTokenFetcher').getAccountInfo) === 'function') return await require('./src/fastTokenFetcher').getAccountInfo(c.mint || c);
+              } catch (e) {}
+            })));
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
     try {
   const limit = opts?.limit || 200;
   // fetch unified candidates from multiple sources (DexScreener + Helius events/history + parse + RPC)
@@ -389,7 +521,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
     } catch (ee) { return []; }
   });
       __global_fetch_ts = Date.now();
-      // Ensure cached items have canonical address fields for downstream filtering
+  // Ensure cached items have canonical address fields for downstream filtering
       try {
         const tu = require('./utils/tokenUtils');
         __global_fetch_cache = (__global_fetch_cache || []).map((t: any) => {
@@ -397,6 +529,13 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
             const addr = t.tokenAddress || t.address || t.mint || t.pairAddress || t.token?.address || null;
             const norm = addr ? tu.normalizeMintCandidate(addr) : null;
             if (norm) { t.tokenAddress = norm; t.address = norm; t.mint = norm; }
+            // if candidate was an object with provenance, preserve it
+            if (t && typeof t === 'object' && t.__sources) {
+              t.__sources = Array.isArray(t.__sources) ? t.__sources : [t.__sources];
+            }
+            if (t && typeof t === 'object' && t.sourceTags) {
+              t.sourceTags = Array.isArray(t.sourceTags) ? t.sourceTags : [t.sourceTags];
+            }
           } catch (e) {}
           return t;
         });
@@ -452,6 +591,12 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
                   // merge source tags
                   existing.sourceTags = Array.isArray(existing.sourceTags) ? existing.sourceTags : (existing.sourceTags ? [existing.sourceTags] : []);
                   if (!existing.sourceTags.includes('dexscreener')) existing.sourceTags.push('dexscreener');
+                  // attach structured source meta if present
+                  try {
+                    const meta = (d && (d.__meta || d.meta)) ? (d.__meta || d.meta) : null;
+                    existing.__sources = Array.isArray(existing.__sources) ? existing.__sources : (existing.__sources ? [existing.__sources] : []);
+                    if (meta) existing.__sources.push(meta);
+                  } catch (e) {}
                   // ensure canonical address fields are present
                   existing.tokenAddress = existing.tokenAddress || addr;
                   existing.address = existing.address || addr;
@@ -473,6 +618,7 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
                   newEntry.url = d.url || d.pairUrl || d.dexUrl || '';
                   newEntry.imageUrl = d.imageUrl || d.logoURI || '';
                   newEntry.sourceTags = ['dexscreener'];
+                  try { if (d && d.__meta) newEntry.__sources = [d.__meta]; } catch (e) {}
                   newEntry.poolOpenTimeMs = d.poolOpenTimeMs || d.poolOpenTime || null;
                   if (newEntry.poolOpenTimeMs && typeof newEntry.poolOpenTimeMs === 'number' && newEntry.poolOpenTimeMs < 1e12 && newEntry.poolOpenTimeMs > 1e9) newEntry.poolOpenTimeMs *= 1000;
                   if (newEntry.poolOpenTimeMs) {
@@ -488,14 +634,34 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
         } catch (e) {
           // DexScreener call failed; continue silently
         }
+        // After merging dexscreener data, run a quick equivalence report to detect discrepancies
+        try {
+          try { const eq = compareSourcesForCache(__global_fetch_cache || []); printEquivalenceReport(eq); } catch (e) {}
+          // Populate canonical on-chain ages (best-effort, bounded concurrency)
+          try { await ensureCanonicalOnchainAges(__global_fetch_cache || [], { timeoutMs: Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000), concurrency: Number(process.env.ONCHAIN_FILL_CONCURRENCY || 3) }); } catch (e) {}
+        } catch (e) {}
       } catch (e) {}
     } catch (e) {
       // fallback: try coinGecko single fetch
       try {
-        const cg = await fetchSolanaFromCoinGecko();
-        __global_fetch_cache = cg ? [cg] : [];
-        __global_fetch_ts = Date.now();
-      } catch {
+        const host = 'coingecko';
+        const limiter = getHostLimiter(host, Number(process.env.COINGECKO_CONCURRENCY || 1));
+        const startCg = Date.now();
+        try {
+          const cg = await limiter(async () => await retryWithBackoff(() => fetchSolanaFromCoinGecko(), { retries: Number(process.env.COINGECKO_RETRIES || 1), baseMs: 200 }));
+          if (cg) {
+            // attach meta for source tracing
+            const meta = makeSourceMeta('coingecko', true, { latencyMs: Date.now() - startCg, raw: cg });
+            if (cg && typeof cg === 'object') cg.__sources = Array.isArray(cg.__sources) ? cg.__sources.concat(meta) : [meta];
+            __global_fetch_cache = cg ? [cg] : [];
+            __global_fetch_ts = Date.now();
+          } else {
+            __global_fetch_cache = [];
+          }
+        } catch (ee) {
+          __global_fetch_cache = [];
+        }
+      } catch (e) {
         __global_fetch_cache = [];
       }
     }
@@ -536,23 +702,36 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
           while (idx < sample.length) {
             const i = idx++;
             const t = sample[i];
-            try {
-              // Gate expensive officialEnrich calls by a lightweight on-chain activity check
-              // This avoids enriching memo-only/noise tokens and reduces 429s.
-              const addr = t.tokenAddress || t.address || t.mint || t.pairAddress;
-              if (!addr) continue;
               try {
-                const oc = await checkOnChainActivity(addr);
-                if (!oc || !oc.found) {
-                  // skip heavy enrichment when no on-chain activity found
+                // Gate expensive officialEnrich calls by a lightweight on-chain activity check
+                const addr = t.tokenAddress || t.address || t.mint || t.pairAddress;
+                if (!addr) continue;
+                try {
+                  const oc = await checkOnChainActivity(addr);
+                  if (!oc || !oc.found) {
+                    // skip heavy enrichment when no on-chain activity found
+                    continue;
+                  }
+                } catch (e) {
                   continue;
                 }
-              } catch (e) {
-                // if on-chain check fails, skip to avoid extra load
-                continue;
-              }
-              await officialEnrich(t, { amountUsd: Number(strat.buyAmount) || 50, timeoutMs: 4000 });
-            } catch (e) {}
+
+                // run officialEnrich under limiter + timeout and attach __meta
+                const host = 'officialEnrich';
+                const limiter = getHostLimiter(host, Number(process.env.FASTFETCH_ENRICH_CONCURRENCY || 1));
+                const startE = Date.now();
+                try {
+                  await limiter(async () => {
+                    const wrap = await withTimeout(officialEnrich(t, { amountUsd: Number(strat.buyAmount) || 50, timeoutMs: 4000 }), 4500);
+                    if (!wrap.ok) throw new Error(String((wrap as any).error || 'timeout'));
+                  });
+                  t.__sources = Array.isArray(t.__sources) ? t.__sources : (t.__sources ? [t.__sources] : []);
+                  t.__sources.push(makeSourceMeta('officialEnrich', true, { latencyMs: Date.now() - startE }));
+                } catch (ee: any) {
+                  t.__sources = Array.isArray(t.__sources) ? t.__sources : (t.__sources ? [t.__sources] : []);
+                  t.__sources.push(makeSourceMeta('officialEnrich', false, { error: (ee && ee.message) || String(ee), latencyMs: Date.now() - startE }));
+                }
+              } catch (e) {}
           }
         }
         const workers = Array.from({ length: Math.min(concurrency, sample.length) }, () => worker());
@@ -562,8 +741,36 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
       }
   // Ensure workCache is canonicalized before filtering
   try { workCache = mergeAndCanonicalizeCache(workCache || []); } catch (e) {}
-  const matches = await (require('./bot/strategy').filterTokensByStrategy(workCache, strat));
-  result[uid] = Array.isArray(matches) ? matches : [];
+  const matches = await (require('./bot/strategy').filterTokensByStrategy(workCache, strat, { preserveSources: true }));
+  if (!Array.isArray(matches)) {
+    result[uid] = [];
+  } else if (opts && opts.detail) {
+    // return enriched detailed objects including provenance and canonical age
+    try {
+      const cache = getGlobalFetchCache() || [];
+      const tmap: Record<string, any> = {};
+      for (const c of cache) {
+        try {
+          const key = String(c.tokenAddress || c.address || c.mint || '').toLowerCase();
+          if (key) tmap[key] = c;
+        } catch (e) {}
+      }
+      const detailed: any[] = [];
+      for (const m of matches) {
+        try {
+          const key = String(m.tokenAddress || m.address || m.mint || m.pairAddress || '').toLowerCase();
+          const canon = key ? tmap[key] : null;
+          const merged = Object.assign({}, m);
+          if (canon && canon.__sources) merged.__sources = Array.isArray(canon.__sources) ? canon.__sources : [canon.__sources];
+          if (canon && canon._canonicalAgeSeconds !== undefined) merged._canonicalAgeSeconds = canon._canonicalAgeSeconds;
+          detailed.push(merged);
+        } catch (e) { detailed.push(m); }
+      }
+      result[uid] = detailed;
+    } catch (e) { result[uid] = matches; }
+  } else {
+    result[uid] = matches;
+  }
     } catch (e) {
       result[uid] = [];
     }
@@ -572,17 +779,169 @@ export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { lim
   return result;
 }
 
+// Expose internal global fetch cache for diagnostics and external reporters
+export function getGlobalFetchCache() {
+  return __global_fetch_cache || [];
+}
+
+// Ensure canonical on-chain ages are populated for cache entries that lack a canonical age.
+// This function queries the unified getFirstOnchainTimestamp helper with bounded concurrency
+// and annotates entries with firstBlockTime/poolOpenTimeMs and _canonicalAgeSeconds.
+export async function ensureCanonicalOnchainAges(cache: any[], opts?: { timeoutMs?: number; concurrency?: number }) {
+  if (!Array.isArray(cache) || cache.length === 0) return;
+  try {
+    const tu = require('./utils/tokenUtils');
+    const timeoutMs = typeof opts?.timeoutMs === 'number' ? opts!.timeoutMs : Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000);
+    const concurrency = typeof opts?.concurrency === 'number' ? opts!.concurrency : Number(process.env.ONCHAIN_FILL_CONCURRENCY || 3);
+    const limiter = createLimiter(Math.max(1, concurrency));
+    let idx = 0;
+    const work = Array.from({ length: Math.min(cache.length, Math.max(3, concurrency)) }).map(() => (async () => {
+      while (true) {
+        const i = idx++;
+        if (i >= cache.length) break;
+        const e = cache[i];
+        try {
+          if (!e) continue;
+          // skip if canonical age already present (including explicit null)
+          if (e._canonicalAgeSeconds !== undefined && e._canonicalAgeSeconds !== null) continue;
+          const addr = e.tokenAddress || e.address || e.mint || e.pairAddress;
+          if (!addr) { e._canonicalAgeSeconds = e._canonicalAgeSeconds === undefined ? null : e._canonicalAgeSeconds; continue; }
+          // Bound the external call by limiter + timeout
+          await limiter(async () => {
+            try {
+              const wrapped = await withTimeout(tu.getFirstOnchainTimestamp(addr, { timeoutMs }), timeoutMs + 200);
+              if (!wrapped.ok) {
+                // mark as missing so we don't retry aggressively
+                e._canonicalAgeSeconds = null as any;
+                return;
+              }
+              const res = wrapped.result as any;
+              const ts = res && res.ts ? res.ts : null;
+              if (ts) {
+                // store ms timestamps consistently
+                e.firstBlockTime = ts;
+                if (!e.poolOpenTimeMs) e.poolOpenTimeMs = ts;
+                e._canonicalAgeSeconds = Math.floor((Date.now() - ts) / 1000);
+                try {
+                  e.__sources = Array.isArray(e.__sources) ? e.__sources : (e.__sources ? [e.__sources] : []);
+                  e.__sources.push(makeSourceMeta('first-onchain', true, { raw: { source: res && res.source ? res.source : 'onchain', cached: !!res?.cached } }));
+                } catch (ignored) {}
+              } else {
+                // explicitly mark as missing to avoid repeated attempts in short-lived flows
+                e._canonicalAgeSeconds = null as any;
+              }
+            } catch (err) {
+              // continue on per-item failure
+            }
+          });
+        } catch (err) {}
+      }
+    })());
+    await Promise.all(work);
+  } catch (e) {}
+}
+
+// Diagnostic: analyze which sources are present in the global fetch cache
+export function analyzeFetchSources() {
+  const cache = getGlobalFetchCache() || [];
+  const perTokenCounts: Array<{ addr: string; sourceCount: number; sources: any[] }> = [];
+  const globalSourceSet = new Set<string>();
+  for (const it of cache) {
+    try {
+      const addr = it.tokenAddress || it.address || it.mint || it.pairAddress || '';
+      const srcs = Array.isArray(it.__sources) ? it.__sources : (it.__sources ? [it.__sources] : []);
+      // also include sourceTags as string markers
+      const tags = Array.isArray(it.sourceTags) ? it.sourceTags : (it.sourceTags ? [it.sourceTags] : []);
+      const normalized: any[] = [];
+      for (const s of srcs) {
+        try {
+          const name = s && (s.name || s.source || s.host || s.type) || JSON.stringify(s || {});
+          normalized.push(name);
+          globalSourceSet.add(name);
+        } catch (e) {}
+      }
+      for (const t of tags) {
+        try { normalized.push(String(t)); globalSourceSet.add(String(t)); } catch (e) {}
+      }
+      perTokenCounts.push({ addr: String(addr), sourceCount: normalized.length, sources: normalized });
+    } catch (e) {}
+  }
+  return { totalTokens: cache.length, distinctSources: Array.from(globalSourceSet), perTokenCounts };
+}
+
+// --- Utilities merged from temporary helper scripts ---
+// Populate cache (force) and inspect newest entries; perform on-chain checks for tokens <= windowMin minutes
+export async function runDeepCacheCheck(opts?: { windowMin?: number; limit?: number }) {
+  const windowMin = opts?.windowMin ?? 5;
+  const limit = opts?.limit ?? 200;
+  try {
+    // populate cache
+    await fetchAndFilterTokensForUsers({}, { limit, force: true }).catch(() => {});
+    const now = Date.now();
+    const global = getGlobalFetchCache() || [];
+    const mapped = (global || []).map((g: any) => ({ addr: g.tokenAddress || g.address || g.mint || '(no-addr)', poolOpenTimeMs: g.poolOpenTimeMs || g.firstSeenAtMs || null })).filter((x: any) => x.poolOpenTimeMs).map((x: any) => ({ ...x, ageMin: (now - Number(x.poolOpenTimeMs)) / 60000 })).sort((a: any, b: any) => a.poolOpenTimeMs - b.poolOpenTimeMs);
+    console.log('global cache size:', (global || []).length);
+    if (!mapped.length) { console.log('no entries with poolOpenTimeMs/firstSeenAtMs found in cache'); return; }
+    const newest = safeArraySlice(mapped, Math.max(0, (mapped || []).length - 40)).reverse();
+    console.log('Newest entries (up to 40):');
+  for (const it of safeArraySlice<any>(newest, 0, 40)) console.log(`- ${it.addr}  poolOpenTimeMs=${it.poolOpenTimeMs}  ageMin=${(it.ageMin || 0).toFixed(2)}`);
+    const recent = safeArraySlice(newest.filter((x: any) => (x && typeof x.ageMin === 'number' ? x.ageMin : -1) >= 0 && (x && typeof x.ageMin === 'number' ? x.ageMin : -1) <= windowMin), 0, 5);
+    console.log('\nentries with age <=', windowMin, 'minutes:', recent.length);
+    if (!recent.length) { console.log(`No tokens <=${windowMin}min found; increase window or capture live events.`); return; }
+    for (const it of recent) {
+      const item: any = it as any;
+      console.log('\n---\nChecking', item.addr, 'ageMin=', (item.ageMin || 0).toFixed(2));
+      try { const acct = await getAccountInfo(item.addr); console.log('getAccountInfo ok:', !!(acct && acct.value)); } catch (e) { console.log('getAccountInfo err', String(e)); }
+          try { const sigs = await heliusGetSignaturesFast(item.addr, process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL || '', 4000, Number(process.env.HELIUS_RETRIES || 0)); console.log('signatures:', Array.isArray(sigs) ? `count=${sigs.length}` : safeStringSnippet(sigs, 200)); } catch (e) { console.log('sigs err', String(e)); }
+    }
+  } catch (e) { console.error('runDeepCacheCheck error', e && e.message ? e.message : e); }
+}
+
+// Start Helius WS listener for durationMs milliseconds, then run getAccountInfo/helius signatures for captured events
+export async function captureHeliusAndVerify(durationMs = 60000) {
+  try {
+    const wsMod = require('./heliusWsListener');
+    console.log('Starting Helius WS listener for', durationMs, 'ms...');
+    const inst = await (wsMod.startHeliusWebsocketListener ? wsMod.startHeliusWebsocketListener({ onOpen: () => console.log('WS open'), onMessage: () => {}, onClose: () => console.log('WS closed'), onError: (e: any) => console.warn('WS error', e && e.message) }) : null);
+    await new Promise((r) => setTimeout(r, durationMs));
+    const ev = wsMod.getRecentHeliusEvents ? wsMod.getRecentHeliusEvents() : [];
+    console.log('captured events count:', Array.isArray(ev) ? ev.length : 0);
+    const limit = Math.min(20, Array.isArray(ev) ? ev.length : 0);
+    for (let i = 0; i < limit; i++) {
+      const e = ev[i];
+      const mint = e && (e.mint || e.address || (e.parsed && e.parsed.info && e.parsed.info.mint));
+      if (!mint) continue;
+      console.log('\n---\nEvent', i, 'mint=', mint, 'eventType=', e && e.eventType || 'unknown');
+      try { const acct = await getAccountInfo(mint); console.log('getAccountInfo.ok=', !!(acct && acct.value)); } catch (err) { console.log('getAccountInfo.err', String(err)); }
+  try { const sigs = await heliusGetSignaturesFast(mint, process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL || '', 4000, Number(process.env.HELIUS_RETRIES || 1)); if (!sigs) console.log('signatures: null'); else if (Array.isArray(sigs)) console.log('signatures count:', sigs.length, 'sample0:', safeStringSnippet(sigs[0], 200)); else if (sigs.result && Array.isArray(sigs.result)) console.log('signatures count:', sigs.result.length, 'sample0:', safeStringSnippet(sigs.result[0], 200)); else console.log('signatures:', safeStringSnippet(sigs, 200)); } catch (err) { console.log('sigs.err', String(err)); }
+    }
+    try { if (inst && inst.stop) await inst.stop(); } catch (e) {}
+    console.log('WS capture done');
+  } catch (e) { console.error('captureHeliusAndVerify err', e && e.message ? e.message : e); }
+}
+
 // =========================
 // Quick CLI: fast discovery + Helius_FAST enrichment
 // =========================
 
 async function fetchDexBoostsRaw(timeout = 3000) {
+  const url = DEXBOOSTS;
+  const start = Date.now();
   try {
-    const url = DEXBOOSTS;
-    const res = await axios.get(url, { timeout });
-    return res.data;
-  } catch (e) {
-    return null;
+    const host = (() => { try { return new URL(url).host; } catch { return url; } })();
+    const limiter = getHostLimiter(host, Number(process.env.DEXSCREENER_CONCURRENCY || 2));
+    const res = await limiter(async () => {
+      return await retryWithBackoff(async () => {
+        const p = axios.get(url, { timeout });
+        const wrap = await withTimeout(p, timeout + 200);
+        if (!wrap.ok) throw Object.assign(new Error(String((wrap as any).error || 'timeout')), { __metaErr: (wrap as any).error });
+        return (wrap.result as any);
+      }, { retries: Number(process.env.DEXSCREENER_RETRIES || 2), baseMs: 200 });
+    });
+    return { __meta: makeSourceMeta('dexscreener', true, { latencyMs: Date.now() - start, raw: res.data }), data: res.data } as any;
+  } catch (e: any) {
+    const errMsg = e && (e.__metaErr || e.message || String(e)) || 'error';
+    return { __meta: makeSourceMeta('dexscreener', false, { error: errMsg, latencyMs: Date.now() - start }) } as any;
   }
 }
 
@@ -605,19 +964,37 @@ function extractMintFromItemLocal(it: any): string | null {
 // normalizeMintCandidate is provided by ./utils/tokenUtils
 
 export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, timeout = 2500, retries = 0) {
+  // simple in-memory cache to avoid repeated signature queries within a short window
+  try {
+    (globalThis as any).__heliusSigCache = (globalThis as any).__heliusSigCache || new TTLCache<string, any>(Number(process.env.HELIUS_SIG_CACHE_MS || 30_000));
+    const sigCache: TTLCache<string, any> = (globalThis as any).__heliusSigCache;
+    const cacheKey = `${heliusUrl}::${mint}`;
+    const cached = sigCache.get(cacheKey);
+    if (cached) return cached;
+  } catch (e) {}
   const payload = { jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [mint, { limit: 3 }] };
   let attempt = 0;
   while (attempt <= retries) {
     try {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
-    const res = await axios.post(heliusUrl, payload, { headers, timeout });
-    if (!res.data || !res.data.result) throw new Error('Invalid response');
-      return res.data;
+      const host = (() => { try { return new URL(heliusUrl).host; } catch { return heliusUrl; } })();
+      const limiter = getHostLimiter(host, Number(process.env.HELIUS_CONCURRENCY || 2));
+      const res = await limiter(async () => {
+        return await retryWithBackoff(async () => {
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
+          const p = axios.post(heliusUrl, payload, { headers, timeout });
+          const wrap = await withTimeout(p, timeout + 200);
+          if (!wrap.ok) throw Object.assign(new Error(String((wrap as any).error || 'timeout')), { __metaErr: (wrap as any).error });
+          return (wrap.result as any);
+        }, { retries: Math.max(0, retries || Number(process.env.HELIUS_RETRIES || 1)), baseMs: 200 });
+      });
+      const resData = res as any;
+      if (!resData.data || !resData.data.result) throw new Error('Invalid response');
+      return resData.data;
     } catch (e: any) {
       const status = e.response?.status;
       // If 429 or 5xx, consider retrying
-      if (status && (status === 429 || (status >= 500 && status < 600)) && attempt < retries) {
+  if (status && (status === 429 || (status >= 500 && status < 600)) && attempt < retries) {
         const backoff = 200 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
         await new Promise((r) => setTimeout(r, backoff));
         attempt++;
@@ -643,9 +1020,19 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
   let attempt = 0;
   while (attempt <= retries) {
     try {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
-  const res = await axios.post(heliusUrl, payload, { headers, timeout });
+      const host = (() => { try { return new URL(heliusUrl).host; } catch { return heliusUrl; } })();
+      const limiter = getHostLimiter(host, Number(process.env.HELIUS_CONCURRENCY || 2));
+      const resp = await limiter(async () => {
+        return await retryWithBackoff(async () => {
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
+          const p = axios.post(heliusUrl, payload, { headers, timeout });
+          const wrap = await withTimeout(p, timeout + 200);
+          if (!wrap.ok) throw Object.assign(new Error(String((wrap as any).error || 'timeout')), { __metaErr: (wrap as any).error });
+          return (wrap.result as any);
+        }, { retries: Math.max(0, retries || Number(process.env.HELIUS_RETRIES || 1)), baseMs: 200 });
+      });
+      const res = resp as any;
       return res.data?.result ?? res.data;
     } catch (e: any) {
       const status = e.response?.status;
@@ -679,7 +1066,18 @@ async function getParsedTransaction(signature: string) {
 }
 
 export async function getAccountInfo(pubkey: string) {
-  return heliusRpc('getAccountInfo', [pubkey, { encoding: 'base64' }], 4000, 1);
+  try {
+    (globalThis as any).__heliusAccountCache = (globalThis as any).__heliusAccountCache || new TTLCache<string, any>(Number(process.env.HELIUS_ACCOUNT_CACHE_MS || 30_000));
+    const cache: TTLCache<string, any> = (globalThis as any).__heliusAccountCache;
+    const key = String(pubkey);
+    const hit = cache.get(key);
+    if (hit) return hit;
+    const res = await heliusRpc('getAccountInfo', [pubkey, { encoding: 'base64' }], 4000, 1);
+    try { cache.set(key, res, Number(process.env.HELIUS_ACCOUNT_CACHE_MS || 30_000)); } catch (e) {}
+    return res;
+  } catch (e) {
+    return heliusRpc('getAccountInfo', [pubkey, { encoding: 'base64' }], 4000, 1);
+  }
 }
 
 async function getTokenSupply(pubkey: string) {
@@ -938,14 +1336,20 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
                 const headers: any = {};
                 const sk = getSolscanApiKey(true);
                 if (sk) { headers['x-api-key'] = sk; try { const { maskKey } = await import('./config'); console.log(`[FastFetcher->Solscan] using key=${maskKey(sk)}`); } catch (e) {} }
-                const sres = await axios.get(solscanUrl, { timeout: timeoutMs, headers });
-                const arr = sres.data ?? [];
-                const first = Array.isArray(arr) ? arr[0] : null;
-                const bt = first?.blockTime || first?.time || first?.timestamp || null;
-          if (bt) {
-            results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null });
-                  hostState[hk] = state;
-                  return;
+                const sresWrap = await withTimeout(axios.get(solscanUrl, { timeout: timeoutMs, headers }), timeoutMs + 200);
+                if (!sresWrap.ok) {
+                  // mark as solscan failure
+                } else {
+                  const sres = sresWrap.result as any;
+                  const arr = sres.data ?? [];
+                  const first = Array.isArray(arr) ? arr[0] : null;
+                  const bt = first?.blockTime || first?.time || first?.timestamp || null;
+                  if (bt) {
+                    const meta = makeSourceMeta('solscan', true, { latencyMs: Date.now() - nowSec * 1000, raw: first });
+                    results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null, __meta: meta });
+                    hostState[hk] = state;
+                    return;
+                  }
                 }
               } catch (e) {
                 // ignore
@@ -1128,16 +1532,20 @@ export async function fetchLatest5FromAllSources(n = 5) {
     }
   } catch (e) {}
 
-  // DexScreener top N
+  // DexScreener top N (use limiter + structured meta)
   const dex: string[] = [];
   try {
-    const raw = await fetchDexBoostsRaw(3000);
+    const dsRaw = await fetchDexBoostsRaw(3000);
     let data: any[] = [];
-    if (raw) data = Array.isArray(raw) ? raw : (raw.data || raw.pairs || []);
+    if (dsRaw) {
+      if ((dsRaw as any).data) data = (dsRaw as any).data;
+      else if (Array.isArray(dsRaw)) data = dsRaw as any[];
+      else if ((dsRaw as any).__meta && (dsRaw as any).data) data = (dsRaw as any).data;
+    }
     for (const it of data) {
-  const m = extractMintFromItemLocal(it);
-  const norm = normalizeMintCandidate(m);
-  if (norm && !dex.includes(norm)) dex.push(norm);
+      const m = extractMintFromItemLocal(it);
+      const norm = normalizeMintCandidate(m);
+      if (norm && !dex.includes(norm)) dex.push(norm);
       if (dex.length >= n) break;
     }
   } catch (e) {}
@@ -1170,18 +1578,13 @@ export async function fetchLatest5FromAllSources(n = 5) {
     if (!shouldValidate) return list.slice(0, n);
     const out: string[] = [];
     const concurrency = Number(process.env.HELIUS_VALIDATE_CONCURRENCY || 3);
-    let idx = 0;
-    async function worker() {
-      while (idx < list.length) {
-        const i = idx++;
-        const a = list[i];
-        try {
-          const acct = await getAccountInfo(a);
-          if (acct && acct.value) out.push(a);
-        } catch (e) {}
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, () => worker()));
+    const limiter = createLimiter(concurrency);
+    await Promise.all(list.map((a) => limiter(async () => {
+      try {
+        const acct = await getAccountInfo(a);
+        if (acct && acct.value) out.push(a);
+      } catch (e) {}
+    })));
     return out.slice(0, n);
   }
 

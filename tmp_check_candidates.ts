@@ -10,7 +10,7 @@
   function cleanRawCandidate(s: string) {
     if (!s || typeof s !== 'string') return s;
     // remove obvious labels/suffixes (pump, bonk, moon, 777, etc.) at end
-    s = s.replace(/(?:[-_]?\b(pump|bonk|moon|777|moon|pm|am)\b)$/i, '');
+    s = s.replace(/(?:[-_]?\b(|pm|am)\b)$/i, '');
     // trim trailing non-alphanum
     s = s.replace(/[^A-Za-z0-9]+$/i, '');
     return s.trim();
@@ -66,10 +66,24 @@
 
     // derive liquidity/volume and pairCreatedAt from pairs if available
     let liquidity = null, volume = null, pairCreatedAtISO = null;
+    // normalize volume: prefer 24h numeric (volume.h24 or volume.h24Usd or volumeUsd)
   if (Array.isArray(dexPairs) && dexPairs.length) {
       const p = dexPairs[0];
       liquidity = p?.liquidity?.usd ?? p?.liquidity ?? null;
-      volume = p?.volume ?? p?.volumeUsd ?? null;
+      // volume field from different sources may be a number or an object with h24/h6/h1/m5
+      const rawVol = p?.volume ?? p?.volumeUsd ?? null;
+      if (rawVol && typeof rawVol === 'object') {
+        // try common keys
+        volume = rawVol.h24 ?? rawVol['24h'] ?? rawVol.h1 ?? rawVol.h6 ?? rawVol.m5 ?? null;
+        // if nested numeric strings, coerce
+        if (typeof volume === 'string' && !isNaN(Number(volume))) volume = Number(volume);
+      } else if (typeof rawVol === 'string' && !isNaN(Number(rawVol))) {
+        volume = Number(rawVol);
+      } else if (typeof rawVol === 'number') {
+        volume = rawVol;
+      } else {
+        volume = null;
+      }
       let pc = p?.pairCreatedAt || p?.createdAt || p?.baseToken?.createdAt || null;
       if (typeof pc === 'number' && pc < 1e12 && pc > 1e9) pc = pc * 1000;
       if (typeof pc === 'string' && !isNaN(Date.parse(pc))) pc = Date.parse(pc);
@@ -110,15 +124,28 @@
   await Promise.all(workers);
 
   // Pretty print: JSON array + table summary
+  // Print full JSON with provenance where available
+  const ffmod = require('./src/fastTokenFetcher');
+  try {
+    const globalCache = ffmod.getGlobalFetchCache ? ffmod.getGlobalFetchCache() : [];
+    const eq = require('./src/utils/sourceEquivalence').compareSourcesForCache(globalCache);
+    require('./src/utils/sourceEquivalence').printEquivalenceReport(eq);
+  } catch (e) {}
   console.log(JSON.stringify(out, null, 2));
   console.log('\nSummary table:');
   for (const r of out) {
+    // show per-source short provenance if present
+    const prov = (r && r.__sources) ? (Array.isArray(r.__sources) ? r.__sources : [r.__sources]) : null;
+    if (prov && prov.length) {
+      console.log(`   provenance (${prov.length}): ${prov.map(p => p.source || p.name || JSON.stringify(p).slice(0,30)).join(', ')}`);
+    }
     const name = r.dexProfile?.name || '';
     const sym = r.dexProfile?.symbol || '';
     const acct = r.acctExists ? 'YES' : (r.acct && r.acct.__error ? `ERR:${r.acct.__error}` : 'NO');
-    const first = r.firstOnchainISO || 'N/A';
-    const liq = r.liquidity !== null ? String(r.liquidity) : 'N/A';
-    const vol = r.volume !== null ? String(r.volume) : 'N/A';
-    console.log(`- ${r.mint} | src=${r.source} | acct=${acct} | created=${first} | liq=${liq} | vol=${vol} | name=${name} ${sym}`);
+    // prefer pair-created ISO (on-chain pair creation) then first onchain tx timestamp
+    const created = r.pairCreatedAtISO || r.firstOnchainISO || 'N/A';
+    const liq = (r.liquidity !== null && r.liquidity !== undefined) ? String(r.liquidity) : 'N/A';
+    const vol = (r.volume !== null && r.volume !== undefined) ? (typeof r.volume === 'number' ? r.volume.toString() : JSON.stringify(r.volume)) : 'N/A';
+    console.log(`- ${r.mint} | src=${r.source} | acct=${acct} | created=${created} | liq=${liq} | vol=${vol} | name=${name} ${sym}`);
   }
 })();

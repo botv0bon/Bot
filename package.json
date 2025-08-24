@@ -42,11 +42,14 @@
     "@types/bn.js": "^5.1.5",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^20.11.30",
     "@types/node-cron": "^3.0.11",
     "@types/node-telegram-bot-api": "^0.64.6",
     "@types/promise-retry": "^1.1.6",
+    "jest": "^30.0.5",
+    "ts-jest": "^29.4.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.2"
   }

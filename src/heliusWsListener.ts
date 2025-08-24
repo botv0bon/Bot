@@ -142,19 +142,23 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
                 try {
                   const p = mgr.enqueue(evt, hf);
                   // attach terminal logging when enrichment completes so details are visible
-                  if (p && typeof p.then === 'function') {
-                    p.then((res: any) => {
-                      try {
-                        if (res && res.skipped) {
-                          console.log('Enrichment result skipped for', evt.mint || (evt as any).address || '(no-mint)', 'reason=', res.reason);
-                        } else if (res) {
-                          console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)', JSON.stringify(res).slice(0, 400));
-                        } else {
-                          console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)', 'result=null');
-                        }
-                      } catch (e) {}
-                    }).catch((err: any) => { try { console.warn('Enrichment promise rejected', err && err.message ? err.message : err); } catch {} });
-                  }
+                          if (p && typeof p.then === 'function') {
+                            const safeString = (v: any, n = 400) => { try { if (!v && v !== 0) return ''; if (typeof v === 'string') return v.slice(0,n); return JSON.stringify(v).slice(0,n); } catch { try { return String(v).slice(0,n); } catch { return ''; } } };
+                            p.then((res: any) => {
+                              try {
+                                if (res && res.skipped) {
+                                  console.log('Enrichment result skipped for', evt.mint || (evt as any).address || '(no-mint)', 'reason=', res.reason);
+                                } else if (res) {
+                                  try {
+                                    const s = safeString(res, 400);
+                                    console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)', s);
+                                  } catch (e) { console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)'); }
+                                } else {
+                                  console.log('Enrichment completed for', evt.mint || (evt as any).address || '(no-mint)', 'result=null');
+                                }
+                              } catch (e) {}
+                            }).catch((err: any) => { try { console.warn('Enrichment promise rejected', err && err.message ? err.message : err); } catch {} });
+                          }
                 } catch (e) {
                   try { hf(evt).catch(() => {}); } catch {}
                 }
@@ -198,7 +202,7 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
   const api = {
     ws,
     stop,
-    getRecentEvents: () => recentEvents.slice(),
+    getRecentEvents: () => Array.isArray(recentEvents) ? recentEvents.slice() : [],
   };
   // save instance for global getter
   try { saveLastInstance(api); } catch {}
@@ -333,7 +337,7 @@ if (require.main === module) {
   (async () => {
     const instance = await startHeliusWebsocketListener({
       onOpen: () => console.log('Listener started (direct run)'),
-      onMessage: (m) => console.log('WS message sample:', JSON.stringify(m).slice(0, 120)),
+  onMessage: (m) => { try { const s = typeof m === 'string' ? m.slice(0,120) : JSON.stringify(m || '').slice(0,120); console.log('WS message sample:', s); } catch (e) { console.log('WS message sample: <unserializable>'); } },
       onClose: () => process.exit(0),
       onError: (e) => {
         console.error('WS error (direct run):', e?.message || e);
