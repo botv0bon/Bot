@@ -136,3 +136,10 @@ export class TTLCache<K, V> {
   del(key: K) { this.map.delete(key); }
   clear() { this.map.clear(); }
 }
+
+// Simple in-memory metrics for quick diagnostics (non-persistent)
+const __enrichMetrics: Record<string, number> = { enrichment_queue_len: 0, enrichment_dedupe_skips: 0 };
+export function enrichMetricInc(key: string, by = 1) {
+  try { __enrichMetrics[key] = (Number(__enrichMetrics[key] || 0) + Number(by)); } catch(e){}
+}
+export function enrichMetricsSnapshot() { return { ...__enrichMetrics }; }

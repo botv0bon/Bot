@@ -250,6 +250,13 @@ import type { Strategy } from './types';
 import { HELIUS_BATCH_SIZE, HELIUS_BATCH_DELAY_MS, ONCHAIN_FRESHNESS_TIMEOUT_MS } from '../config';
 import { autoFilterTokensVerbose } from '../utils/tokenUtils';
 
+// Enrichment metrics for selective enrichment
+const __strategy_enrich_metrics: { attempts: number; successes: number; failures: number; enrichedTokens: number } = { attempts: 0, successes: 0, failures: 0, enrichedTokens: 0 };
+
+export function getStrategyEnrichMetrics() {
+  return { ...__strategy_enrich_metrics };
+}
+
 /**
  * Filters a list of tokens based on the user's strategy settings.
  * All comments and variable names are in English for clarity.
@@ -292,12 +299,14 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       }
 
     const enrichPromise = utils.enrichTokenTimestamps(tokens, {
-  batchSize: Number(HELIUS_BATCH_SIZE || 6),
-  delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
+      batchSize: Number(HELIUS_BATCH_SIZE || 6),
+      delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
     });
-  const timeoutMs = Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 8000);
-      // Bound the enrichment so filtering remains responsive
-      await utils.withTimeout(enrichPromise, timeoutMs, 'filter-enrich');
+    // Start enrichment in background (non-blocking) so filtering remains responsive.
+    // Log outcome for diagnostics but do not block the caller.
+    enrichPromise
+      .then(() => { try { console.log('[filterTokensByStrategy] background enrichment completed'); } catch (_) {} })
+      .catch((err: any) => { try { console.warn('[filterTokensByStrategy] background enrichment failed:', err && err.message ? err.message : err); } catch (_) {} });
     } catch (e: any) {
       console.warn('[filterTokensByStrategy] enrichment failed or timed out:', e?.message || e);
     }
@@ -309,6 +318,63 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
   // 1) Fast pass: use `autoFilterTokensVerbose` for the simple numeric checks (marketCap, liquidity, volume, basic age rules)
   const prelimVerbose = autoFilterTokensVerbose(tokens, strategy);
   const prelim = Array.isArray(prelimVerbose) ? prelimVerbose : (prelimVerbose && prelimVerbose.passed ? prelimVerbose.passed : tokens);
+
+  // Selective enrichment: when the strategy requires strict numeric/on-chain checks,
+  // enrich a small set of top candidates (bounded concurrency) to obtain liquidity/volume/age fields
+  try {
+    const needStrictNumeric = (strategy.minLiquidity !== undefined || strategy.minVolume !== undefined || strategy.minAge !== undefined || (strategy as any).requireOnchain === true);
+    if (needStrictNumeric && Array.isArray(prelim) && prelim.length > 0) {
+      const tu = require('../utils/tokenUtils');
+      const candidateLimit = Number(process.env.STRATEGY_ENRICH_CANDIDATES || 8);
+      const concurrency = Math.max(1, Number(process.env.STRATEGY_ENRICH_CONCURRENCY || 3));
+      const timeoutMs = Number(process.env.STRATEGY_ENRICH_TIMEOUT_MS || 2000);
+      const candidates = prelim.slice(0, Math.min(candidateLimit, prelim.length));
+      if (candidates.length) {
+        let idx = 0;
+        const worker = async () => {
+          while (true) {
+            const i = idx++;
+            if (i >= candidates.length) break;
+            const tok = candidates[i];
+            try {
+              __strategy_enrich_metrics.attempts++;
+              // officialEnrich mutates the token in-place with poolOpenTimeMs, liquidity, volume, freshnessScore
+              await tu.officialEnrich(tok, { amountUsd: Number(strategy.buyAmount) || undefined, timeoutMs });
+              // heuristics: consider enrichment successful if we obtained any of these fields
+              if (tok && (tok.poolOpenTimeMs || tok.liquidity || tok.volume || tok._canonicalAgeSeconds)) {
+                __strategy_enrich_metrics.successes++;
+                __strategy_enrich_metrics.enrichedTokens++;
+              } else {
+                __strategy_enrich_metrics.failures++;
+              }
+            } catch (e) {
+              __strategy_enrich_metrics.failures++;
+              // ignore per-token enrichment errors
+            }
+          }
+        };
+        const workers = Array.from({ length: Math.min(concurrency, candidates.length) }, () => worker());
+        try { await Promise.all(workers); } catch (e) {}
+        // merge enriched candidates back into prelim by canonical address
+        try {
+          const keyOf = (t: any) => String(t && (t.tokenAddress || t.address || t.mint || t.pairAddress || '')).toLowerCase();
+          const enrichedMap: Record<string, any> = {};
+          for (const e of candidates) {
+            const k = keyOf(e);
+            if (k) enrichedMap[k] = e;
+          }
+          for (let i = 0; i < prelim.length; i++) {
+            try {
+              const k = keyOf(prelim[i]);
+              if (k && enrichedMap[k]) prelim[i] = enrichedMap[k];
+            } catch (e) {}
+          }
+        } catch (e) {}
+      }
+    }
+  } catch (e) {
+    // non-fatal: continue with existing prelim if enrichment fails
+  }
 
   // 2) Apply the remaining, more expensive or strict checks on the pre-filtered list
   const filtered = prelim.filter(token => {

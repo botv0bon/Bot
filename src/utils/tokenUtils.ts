@@ -900,22 +900,43 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
         const pub = new PublicKey(address);
         const start = Date.now();
         enrichmentMetrics.heliusCalls++;
-  const sigLimit = Number(HELIUS_SIG_LIMIT || 20);
-  const sigs = await conn.getSignaturesForAddress(pub, { limit: sigLimit });
-        if (sigs && sigs.length > 0) {
+        // Page signatures to try to reach the earliest transaction available (may be slow)
+        const collectSignaturesFull = async (maxCollect = Number(process.env.HELIUS_RPC_SIG_PAGE_MAX || 2000)) => {
+          const out: any[] = [];
+          let before: string | null = null;
+          const limit = Number(HELIUS_SIG_LIMIT || 1000);
+          for (let page = 0; page < 10 && out.length < maxCollect; page++) {
+            try {
+              const params: any = { limit };
+              if (before) params.before = before;
+              const pageSigs = await conn.getSignaturesForAddress(pub, params as any);
+              if (!Array.isArray(pageSigs) || pageSigs.length === 0) break;
+              out.push(...pageSigs);
+              if (pageSigs.length < limit) break;
+              before = pageSigs[pageSigs.length - 1].signature || (pageSigs[pageSigs.length - 1] as any).txHash || (pageSigs[pageSigs.length - 1] as any).tx_hash || null;
+            } catch (e) {
+              break;
+            }
+          }
+          return out.slice(0, maxCollect);
+        };
+
+        const sigs = await collectSignaturesFull(Number(process.env.HELIUS_RPC_SIG_PAGE_MAX || 2000));
+        if (!sigs || sigs.length === 0) {
+          enrichmentMetrics.heliusTotalMs += (Date.now() - start);
+          // no signatures found via Helius RPC
+        } else {
           let earliestMs: number | null = null;
-          // fetch transactions in parallel but with small concurrency to avoid throttling
-          const concurrency = Number(HELIUS_RPC_CONCURRENCY || 2);
+          const concurrency = Math.max(1, Number(HELIUS_RPC_CONCURRENCY || 2));
           for (let i = 0; i < sigs.length; i += concurrency) {
             const slice = sigs.slice(i, i + concurrency);
-            const txs = await Promise.all(slice.map(s => conn.getTransaction(s.signature, { commitment: 'confirmed' } as any).catch(() => null)));
+            const txs = await Promise.all(slice.map((s: any) => conn.getTransaction(s.signature, { commitment: 'confirmed' } as any).catch(() => null)));
             for (const tx of txs) {
               const bt = tx?.blockTime;
               if (!bt) continue;
               const ms = (bt > 1e9 && bt < 1e12) ? bt * 1000 : (bt > 1e12 ? bt : bt * 1000);
               if (!earliestMs || ms < earliestMs) earliestMs = ms;
             }
-            // small delay to avoid bursts
             await sleep(50);
           }
           enrichmentMetrics.heliusTotalMs += (Date.now() - start);
@@ -923,7 +944,6 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
           return earliestMs;
         }
       } catch (err) {
-        // if RPC attempt fails, continue to parse API below
         try { console.warn(`[Helius] RPC endpoint attempt failed for ${address}: ${err?.message || err}`); } catch(_) {}
       }
     }
@@ -956,15 +976,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
     // If HTTP / RPC failed: try Solscan then RPC fallback if enabled
   enrichmentMetrics.heliusFailures++;
   try { console.error(`[Helius] getFirstTxTimestampFromHelius failed for ${address}: ${e?.message || e}`); } catch(_) {}
-  if (SOLSCAN_FALLBACK_ENABLED) {
-      try {
-        const ts = await getFirstTxTimestampFromSolscan(address);
-        if (ts) return ts;
-      } catch (err) {
-        // ignore
-      }
-    }
-    if (HELIUS_FALLBACK_ENABLED) {
+  if (HELIUS_FALLBACK_ENABLED) {
       const fallback = await getFirstTxTimestampFromRpc(address);
       return fallback;
     }
@@ -1011,7 +1023,7 @@ async function getFirstTxTimestampFromSolscan(address: string): Promise<number |
 }
 
 // --- Debug exports (temporary): expose internal helpers for diagnosis
-export { getFirstTxTimestampFromHelius, getFirstTxTimestampFromSolscan, getFirstTxTimestampFromRpc };
+export { getFirstTxTimestampFromHelius, getFirstTxTimestampFromRpc };
 
 // ----- On-chain activity quick checks -----
 export async function checkOnChainActivity(address: string): Promise<{ firstTxMs: number | null; found: boolean }> {
@@ -1024,12 +1036,11 @@ export async function checkOnChainActivity(address: string): Promise<{ firstTxMs
     } catch (e) {
       ts = null;
     }
+    // If Helius did not yield a result, fall back to RPC (skip Solscan per config)
     if (!ts) {
       try {
-        ts = await getFirstTxTimestampFromSolscan(address);
-      } catch (e) {
-        ts = null;
-      }
+        ts = await getFirstTxTimestampFromRpc(address);
+      } catch (e) { ts = null; }
     }
     if (!ts) {
       try {
@@ -1061,7 +1072,8 @@ export async function getFirstOnchainTimestamp(address: string, opts?: { timeout
 
     const timeoutMs = typeof opts?.timeoutMs === 'number' ? opts!.timeoutMs : Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 3000);
 
-    const order = opts?.prefer && opts.prefer.length ? opts.prefer : ['hel','solscan','rpc'];
+  // Prefer Helius first, then RPC. Solscan fallback disabled per operator request.
+  const order = opts?.prefer && opts.prefer.length ? opts.prefer : ['hel','rpc'];
     let resultMs: number | null = null;
     let source: string | undefined = undefined;
 
@@ -1070,9 +1082,6 @@ export async function getFirstOnchainTimestamp(address: string, opts?: { timeout
         if (o === 'hel') {
           const ts = await withTimeout(getFirstTxTimestampFromHelius(address), timeoutMs, 'firsttx-helius');
           if (ts) { resultMs = ts; source = 'hel'; break; }
-        } else if (o === 'solscan') {
-          const ts = await withTimeout(getFirstTxTimestampFromSolscan(address), timeoutMs, 'firsttx-solscan');
-          if (ts) { resultMs = ts; source = 'solscan'; break; }
         } else if (o === 'rpc') {
           const ts = await withTimeout(getFirstTxTimestampFromRpc(address), timeoutMs, 'firsttx-rpc');
           if (ts) { resultMs = ts; source = 'rpc'; break; }
@@ -1192,17 +1201,10 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
     const results: Array<number | null> = [];
     for (const addr of batch) {
       try {
-        // Prefer Solscan (lower rate) first if configured
+        // Prefer Helius first, then RPC fallback. Solscan disabled per operator request.
         let ts = null as number | null;
-  if (SOLSCAN_FALLBACK_ENABLED && SOLSCAN_API_URL) {
-          try { ts = await getFirstTxTimestampFromSolscan(addr); } catch (e) { ts = null; }
-        }
-        // If Solscan didn't return, try Helius (RPC/parse)
+        try { ts = await getFirstTxTimestampFromHelius(addr); } catch (e) { ts = null; }
         if (!ts) {
-          try { ts = await getFirstTxTimestampFromHelius(addr); } catch (e) { ts = null; }
-        }
-        // Last-resort RPC fallback
-  if (!ts && HELIUS_FALLBACK_ENABLED) {
           try { ts = await getFirstTxTimestampFromRpc(addr); } catch (e) { ts = null; }
         }
         results.push(ts);

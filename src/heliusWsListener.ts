@@ -1,6 +1,56 @@
 // Minimal safe Helius WebSocket listener.
 // Uses centralized config from `src/config.ts` so env parsing is in one place.
 import { HELIUS_USE_WEBSOCKET, getHeliusWebsocketUrl, HELIUS_SUBSCRIBE_METADATA, HELIUS_SUBSCRIBE_SPLTOKEN } from './config';
+// optional blockTime lookup helpers from fastTokenFetcher
+let _getBlockTimeForSlotCached: ((slot: number) => Promise<number | null>) | null = null;
+let _getCachedBlockTimeForSlot: ((slot: number) => Promise<number | null>) | null = null;
+try {
+  const ft = require('./fastTokenFetcher');
+  _getBlockTimeForSlotCached = ft && ft.getBlockTimeForSlotCached ? ft.getBlockTimeForSlotCached : null;
+  _getCachedBlockTimeForSlot = ft && ft.getCachedBlockTimeForSlot ? ft.getCachedBlockTimeForSlot : null;
+} catch (e) { _getBlockTimeForSlotCached = null; _getCachedBlockTimeForSlot = null; }
+
+// Background warmer: periodically prefill recent slot_blocktime entries using the
+// existing getBlockTimeForSlotCached helper. This runs best-effort and uses an
+// in-memory dedupe set to avoid parallel lookups for the same slot.
+let _slotBlocktimeWarmerHandle: any = null;
+function startSlotBlocktimeWarmer(opts?: { intervalMs?: number, lookbackSlots?: number }) {
+  try {
+    if (!(_getBlockTimeForSlotCached || _getCachedBlockTimeForSlot)) return;
+    if (_slotBlocktimeWarmerHandle) return;
+    const intervalMs = Number(opts?.intervalMs ?? process.env.SLOT_BLOCKTIME_WARMER_INTERVAL_MS ?? 30000);
+    const lookback = Number(opts?.lookbackSlots ?? process.env.SLOT_BLOCKTIME_WARMER_LOOKBACK ?? 300);
+    const inFlight: Set<number> = new Set();
+    _slotBlocktimeWarmerHandle = setInterval(async () => {
+      try {
+        // determine a recent tip slot from fastTokenFetcher if available, else skip
+        const ff = require('./fastTokenFetcher');
+        let tipSlot: number | null = null;
+        try { if (ff && typeof ff.getRecentSlot === 'function') { tipSlot = await ff.getRecentSlot().catch(() => null); } } catch (e) {}
+        // fallback: if no tip, just use Date-based estimation (no-op)
+        if (!tipSlot) return;
+        const from = Math.max(0, tipSlot - lookback);
+        const to = tipSlot;
+        for (let s = to; s >= from; s--) {
+          if (inFlight.has(s)) continue;
+          inFlight.add(s);
+          try {
+            // use cache-only first to avoid RPCs in warm loop; if missing, call full helper
+            const cached = _getCachedBlockTimeForSlot ? await _getCachedBlockTimeForSlot(s).catch(() => null) : null;
+            if (cached || cached === 0) {
+              // already cached
+            } else if (_getBlockTimeForSlotCached) {
+              // call full helper which will write cache on success
+              try { await _getBlockTimeForSlotCached(s).catch(() => null); } catch (e) {}
+            }
+          } catch (e) {}
+          try { inFlight.delete(s); } catch (e) {}
+        }
+      } catch (e) {}
+    }, intervalMs);
+  } catch (e) {}
+}
+function stopSlotBlocktimeWarmer() { try { if (_slotBlocktimeWarmerHandle) { clearInterval(_slotBlocktimeWarmerHandle); _slotBlocktimeWarmerHandle = null; } } catch (e) {} }
 const HELIUS_WS_URL = getHeliusWebsocketUrl();
 const USE_WS = HELIUS_USE_WEBSOCKET;
 const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
@@ -8,9 +58,39 @@ const SUBSCRIBE_SPLTOKEN = HELIUS_SUBSCRIBE_SPLTOKEN;
 
 // Confidence threshold for automatic enrichment (0.0 - 1.0). Can be tuned via env.
 const HELIUS_ENRICH_SCORE_THRESHOLD = Number(process.env.HELIUS_ENRICH_SCORE_THRESHOLD ?? 0.6);
+// Known program/account IDs that should never be treated as mint addresses
+const HELIUS_KNOWN_PROGRAM_IDS = new Set([
+  '11111111111111111111111111111111',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'SysvarRent111111111111111111111111111111111',
+  'ComputeBudget111111111111111111111111111111',
+  'Stake11111111111111111111111111111111111111',
+  'Vote111111111111111111111111111111111111111'
+]);
 
 // Simple in-memory stats for listener (useful for quick diagnostics)
-const _heliusListenerStats = { processed: 0, enriched: 0, skippedLowConfidence: 0, parseErrors: 0 };
+const _heliusListenerStats: Record<string, number> = {
+  processed: 0,
+  enriched: 0,
+  skippedLowConfidence: 0,
+  parseErrors: 0,
+  // quick-path telemetry
+  cacheHit: 0,
+  cacheMiss: 0,
+  // background resolution telemetry
+  bgResolved: 0,
+  bgNull: 0,
+  bgInFlight: 0,
+  bgSkippedDueToDedupe: 0,
+  // per-mint background enrichment telemetry
+  bgMintInFlight: 0,
+  bgMintResolved: 0,
+  bgMintNull: 0,
+  bgMintFailed: 0,
+  bgMintSkippedDueToDedupe: 0,
+};
 
 export function getHeliusListenerStats() { try { return { ..._heliusListenerStats }; } catch { return null; } }
 export function resetHeliusListenerStats() { try { _heliusListenerStats.processed = 0; _heliusListenerStats.enriched = 0; _heliusListenerStats.skippedLowConfidence = 0; _heliusListenerStats.parseErrors = 0; } catch {} }
@@ -38,6 +118,10 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
   let closed = false;
   // recent events buffer (in-memory) to allow polling latest events
   const recentEvents: any[] = [];
+  // in-memory set to dedupe background slot->blockTime resolutions
+  const _backgroundSlotLookupsInFlight: Set<number> = new Set();
+  // in-memory set to dedupe background per-mint officialEnrich resolutions
+  const _backgroundMintEnrichInFlight: Set<string> = new Set();
   function pushEvent(ev: any) {
     try {
   recentEvents.unshift(ev);
@@ -46,9 +130,26 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
     } catch {}
   }
 
+  // periodic diagnostics logger for telemetry
+  let _diagInterval: any = null;
+  function startDiagInterval() {
+    try {
+      if (_diagInterval) return;
+      _diagInterval = setInterval(() => {
+        try {
+          const s = { ..._heliusListenerStats };
+          console.log('HELIUS-LISTENER-STATS:', JSON.stringify(s));
+        } catch (e) {}
+      }, Number(process.env.HELIUS_DIAG_INTERVAL_MS || 15000));
+    } catch (e) {}
+  }
+  function stopDiagInterval() { try { if (_diagInterval) { clearInterval(_diagInterval); _diagInterval = null; } } catch (e) {} }
+
   ws.on('open', () => {
     options?.onOpen && options.onOpen();
     console.log('HELIUS WebSocket connected');
+  startDiagInterval();
+  try { startSlotBlocktimeWarmer({ intervalMs: Number(process.env.SLOT_BLOCKTIME_WARMER_INTERVAL_MS || 30000), lookbackSlots: Number(process.env.SLOT_BLOCKTIME_WARMER_LOOKBACK || 400) }); } catch (e) {}
     try {
       // automatic subscriptions for common programs
       const subscriptions: Record<number, string> = {};
@@ -82,7 +183,7 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
     }
   });
 
-  ws.on('message', (data) => {
+  ws.on('message', async (data) => {
     try {
       const parsed = typeof data === 'string' ? JSON.parse(data) : JSON.parse(data.toString());
       // Single onMessage callback
@@ -96,10 +197,225 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
         _heliusListenerStats.processed = (_heliusListenerStats.processed || 0) + 1;
         const score = computeEventConfidence(evt, parsed);
         if (typeof score !== 'number' || Number.isNaN(score) || score < HELIUS_ENRICH_SCORE_THRESHOLD) {
-          _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
-          try { console.log('Skipping enrichment due to low confidence', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
-          return;
+          // Before skipping, try a lightweight quick-check against the global fetch cache
+          try {
+            const ff = require('./fastTokenFetcher');
+            const tu = require('./utils/tokenUtils');
+            const globalCache = ff.getGlobalFetchCache ? ff.getGlobalFetchCache() : [];
+            const addrKey = String(evt.mint || '').toLowerCase();
+            let quickHintFound = false;
+            if (Array.isArray(globalCache) && addrKey) {
+              for (const item of globalCache) {
+                try {
+                  const key = String(item.tokenAddress || item.address || item.mint || '').toLowerCase();
+                  if (!key) continue;
+                  if (key === addrKey) {
+                    const liq = tu.getField(item, 'liquidity');
+                    const vol = tu.getField(item, 'volume');
+                    if ((liq && Number(liq) > 0) || (vol && Number(vol) > 0)) {
+                      quickHintFound = true;
+                      break;
+                    }
+                  }
+                } catch (e) {}
+              }
+            }
+            if (quickHintFound) {
+              // If cache hints liquidity/volume, schedule a non-blocking quick officialEnrich for this mint
+              try {
+                const tuMod = require('./utils/tokenUtils');
+                const ff = require('./fastTokenFetcher');
+                const tokenAddr = evt.mint;
+                // schedule background enrichment (do not await). If it fills useful fields, emit a followup.
+                // dedupe background enrich for same mint
+                if (!_backgroundMintEnrichInFlight.has(String(tokenAddr).toLowerCase())) {
+                  _backgroundMintEnrichInFlight.add(String(tokenAddr).toLowerCase());
+                  _heliusListenerStats.bgMintInFlight = (_heliusListenerStats.bgMintInFlight || 0) + 1;
+                  (async () => {
+                    try {
+                      const tokenObj: any = { tokenAddress: tokenAddr };
+                      // run officialEnrich with a short timeout wrapper
+                      await Promise.race([
+                        tuMod.officialEnrich(tokenObj, { timeoutMs: Number(process.env.HELIUS_QUICK_OFFICIAL_ENRICH_TIMEOUT_MS || 2000) }),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error('enrich-timeout')), Number(process.env.HELIUS_QUICK_OFFICIAL_ENRICH_TIMEOUT_MS || 2000)))
+                      ]).catch(() => null);
+                      // If enrichment retrieved useful fields, persist snapshot via fastTokenFetcher if available
+                      if (tokenObj && (tokenObj.poolOpenTimeMs || tokenObj.liquidity || tokenObj.volume)) {
+                        try {
+                          if (ff && typeof ff.updateMintStatsFromEvent === 'function') {
+                            // best-effort: update mint stats cache so future quick-emits include numeric fields
+                            const slotForUpdate = (evt && (evt.firstSlot !== undefined ? evt.firstSlot : null));
+                            await ff.updateMintStatsFromEvent(tokenAddr, 0, slotForUpdate, Date.now() / 1000).catch(() => {});
+                          }
+                        } catch (e) {}
+                        // emit follow-up so downstream parsers see enriched data
+                        try {
+                          const follow = { mint: tokenAddr, eventType: evt.eventType || null, detectedAt: evt.detectedAt || null, enriched: true, _diag: { quickOfficialEnrich: true } };
+                          console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                        } catch (e) {}
+                        _heliusListenerStats.bgMintResolved = (_heliusListenerStats.bgMintResolved || 0) + 1;
+                      } else {
+                        _heliusListenerStats.bgMintNull = (_heliusListenerStats.bgMintNull || 0) + 1;
+                      }
+                    } catch (e) {
+                      _heliusListenerStats.bgMintFailed = (_heliusListenerStats.bgMintFailed || 0) + 1;
+                    } finally {
+                      try { _backgroundMintEnrichInFlight.delete(String(tokenAddr).toLowerCase()); } catch (e) {}
+                      try { _heliusListenerStats.bgMintInFlight = Math.max(0, (_heliusListenerStats.bgMintInFlight || 1) - 1); } catch (e) {}
+                    }
+                  })();
+                } else {
+                  _heliusListenerStats.bgMintSkippedDueToDedupe = (_heliusListenerStats.bgMintSkippedDueToDedupe || 0) + 1;
+                }
+                // allow original flow to continue (do not block)
+              } catch (e) {
+                _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+                try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 10 === 1) console.log('Skipping enrichment due to low confidence (sampled)', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
+                return;
+              }
+            } else {
+              _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+              try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 50 === 1) console.log('Skipping enrichment due to low confidence (sampled)', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
+              return;
+            }
+          } catch (e) {
+            _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+            try { console.log('Skipping enrichment due to low confidence', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
+            return;
+          }
         }
+
+        // Emit a compact, single-line structured JSON for quick observation / terminal-only workflows.
+        try {
+          const sig = parsed?.params?.result?.value?.signature ?? parsed?.result?.value?.signature ?? null;
+          const slot = evt.firstSlot ?? parsed?.params?.result?.context?.slot ?? parsed?.result?.context?.slot ?? null;
+          const _slotForMintStats = slot ? Number(slot) : undefined;
+          // attempt a small cached blockTime lookup (race with timeout)
+          let blockTime: number | null = null;
+          let blockTimeReason: string | null = null;
+          let quickDebug: Record<string, any> | null = null;
+          if (slot) {
+            try {
+              // First do a cache-only fast lookup (must not perform RPCs)
+        if (_getCachedBlockTimeForSlot) {
+                const start = Date.now();
+                const cached = await _getCachedBlockTimeForSlot(Number(slot)).catch(() => null);
+                const elapsed = Date.now() - start;
+                if (cached || cached === 0) {
+                  blockTime = cached;
+                  blockTimeReason = 'cache-hit';
+          _heliusListenerStats.cacheHit = (_heliusListenerStats.cacheHit || 0) + 1;
+          (quickDebug as any) ??= {};
+          (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsed };
+                } else {
+                  blockTimeReason = 'cache-miss';
+          _heliusListenerStats.cacheMiss = (_heliusListenerStats.cacheMiss || 0) + 1;
+          (quickDebug as any) ??= {};
+          (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsed };
+                }
+              }
+
+              // If cache missed, launch a background resolution using the full helper
+              // and emit a follow-up single-line JSON when it resolves (best-effort).
+              if ((blockTime === null || blockTime === undefined) && _getBlockTimeForSlotCached) {
+                // Avoid scheduling duplicate background resolutions for the same slot.
+                const slotNum = Number(slot);
+                if (!_backgroundSlotLookupsInFlight.has(slotNum)) {
+                  _backgroundSlotLookupsInFlight.add(slotNum);
+                  _heliusListenerStats.bgInFlight = (_heliusListenerStats.bgInFlight || 0) + 1;
+                  // schedule but don't await
+                  (async () => {
+                    try {
+                      const start2 = Date.now();
+                      const bt = await _getBlockTimeForSlotCached(slotNum);
+                      const elapsed2 = Date.now() - start2;
+                      if (bt || bt === 0) {
+                        _heliusListenerStats.bgResolved = (_heliusListenerStats.bgResolved || 0) + 1;
+                        // emit follow-up JSON indicating resolved blockTime
+                        const follow = {
+                          mint: evt.mint || null,
+                          eventType: evt.eventType || null,
+                          detectedAt: evt.detectedAt || null,
+                          slot: slotNum,
+                          signature: sig,
+                          blockTime: bt,
+                          score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
+                          _diag: { blockTimeDiag: { reason: 'background-resolved', elapsedMs: elapsed2 } }
+                        };
+                        try { console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime=', bt, 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
+                        console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                      } else {
+                        _heliusListenerStats.bgNull = (_heliusListenerStats.bgNull || 0) + 1;
+                        // optionally emit that background resolution returned null
+                        const follow = { mint: evt.mint || null, slot: slotNum, blockTime: null, _diag: { blockTimeDiag: { reason: 'background-null', elapsedMs: elapsed2 } } };
+                        try { console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime= null', 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
+                        console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                      }
+                    } catch (e) {
+                      // background resolution failed; emit nothing (best-effort)
+                    } finally {
+            try { _backgroundSlotLookupsInFlight.delete(slotNum); } catch (e) {}
+            try { _heliusListenerStats.bgInFlight = Math.max(0, (_heliusListenerStats.bgInFlight || 1) - 1); } catch (e) {}
+                    }
+                  })();
+                } else {
+          // already resolving this slot in background; skip duplicate work
+          _heliusListenerStats.bgSkippedDueToDedupe = (_heliusListenerStats.bgSkippedDueToDedupe || 0) + 1;
+                }
+              }
+            } catch (e) {
+              blockTime = null; blockTimeReason = 'exception';
+            }
+          }
+
+            // Attempt to attach a per-mint snapshot from cache (must be fast and cache-only)
+            let mintSnapshot: Record<string, any> | null = null;
+            let mintSnapshotDiag: Record<string, any> | null = null;
+            try {
+              if (evt && evt.mint) {
+                const ftf = require('./fastTokenFetcher');
+                if (ftf && typeof ftf.getMintSnapshotCached === 'function') {
+                  const startMs = Date.now();
+                  const snap = await ftf.getMintSnapshotCached(evt.mint).catch(() => null);
+                  const elapsedMs = Date.now() - startMs;
+                  if (snap) {
+                    mintSnapshot = snap;
+                    mintSnapshotDiag = { reason: 'cache-hit', elapsedMs };
+                  } else {
+                    mintSnapshotDiag = { reason: 'cache-miss', elapsedMs };
+                  }
+                }
+              }
+            } catch (e) { mintSnapshot = null; mintSnapshotDiag = { reason: 'exception' }; }
+
+          const quick: any = {
+            mint: evt.mint || null,
+            eventType: evt.eventType || null,
+            detectedAt: evt.detectedAt || null,
+            slot: slot,
+            signature: sig,
+            blockTime: blockTime,
+            score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
+          };
+          // attach mintSnapshot if available
+          try { if (mintSnapshot) (quick as any).mintSnapshot = mintSnapshot; if (mintSnapshotDiag) (quick as any)._diag = (quick as any)._diag || {}; (quick as any)._diag.mintSnapshotDiag = mintSnapshotDiag; } catch (e) {}
+          // best-effort: lift numeric snapshot fields into quick top-level for easier parsing/filters
+          try {
+            if (mintSnapshot) {
+              if (typeof mintSnapshot.approxLiquidity === 'number') quick.approxLiquidity = mintSnapshot.approxLiquidity;
+              if (typeof mintSnapshot.volume_60s === 'number') quick.volume_60s = mintSnapshot.volume_60s;
+              if (typeof mintSnapshot.volume_3600s === 'number') quick.volume_3600s = mintSnapshot.volume_3600s;
+            }
+          } catch (e) {}
+          // include optional debug diagnostics
+          try { if (!(quickDebug as any)) quickDebug = {}; if (Object.keys((quickDebug as any)).length) (quick as any)._diag = quickDebug; } catch {}
+          // concise human-readable diagnostic alongside single-line JSON to aid terminal debugging
+          try {
+            const diagShort = (quick as any)._diag ? `diag=${JSON.stringify((quick as any)._diag)}` : '';
+            console.log('helius_quick_enrich:', evt.mint || '(no-mint)', 'slot=', slot, 'blockTime=', blockTime, diagShort);
+          } catch (e) {}
+          console.log(JSON.stringify({ helius_quick_enrich: quick }));
+        } catch (e) {}
 
         // proceed with enrichment
         try {
@@ -110,6 +426,31 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
               const mgrMod = require('./heliusEnrichmentQueue');
               const mgr = (mgrMod && mgrMod._manager) || (mgrMod && mgrMod.createEnrichmentManager && (mgrMod._manager = mgrMod.createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 })));
               const p = mgr.enqueue(evt, hf);
+              // best-effort background stats update: update mint snapshot volumes/eventCount (non-blocking)
+              try {
+                const ftf = require('./fastTokenFetcher');
+                if (ftf && typeof ftf.updateMintStatsFromEvent === 'function') {
+                  // try to extract a numeric amount from parsed innerInstructions/postTokenBalances if present
+                  (async () => {
+                    try {
+                      let amt = 0;
+                      try {
+                        const res = parsed?.params?.result?.value || parsed?.result?.value || parsed?.result || parsed;
+                        // search postTokenBalances for lamports changes (amount fields may be string w/ decimals)
+                        if (res && res.meta && Array.isArray(res.meta.postTokenBalances)) {
+                          for (const b of res.meta.postTokenBalances) {
+                            try { if (b && b.mint === evt.mint && b.uiTokenAmount && b.uiTokenAmount.uiAmount) { amt = Math.max(amt, Number(b.uiTokenAmount.uiAmount)); } } catch (e) {}
+                          }
+                        }
+                      } catch (e) {}
+            try {
+                      const capturedSlotLocal = evt.firstSlot ?? parsed?.params?.result?.context?.slot ?? parsed?.result?.context?.slot ?? null;
+                      await ftf.updateMintStatsFromEvent(evt.mint, amt || 0, capturedSlotLocal ? Number(capturedSlotLocal) : undefined, undefined);
+                    } catch (e) {}
+                    } catch (e) {}
+          })();
+                }
+              } catch (e) {}
               _heliusListenerStats.enriched = (_heliusListenerStats.enriched || 0) + 1;
               if (p && typeof p.then === 'function') {
                 const safeString = (v: any, n = 400) => { try { if (!v && v !== 0) return ''; if (typeof v === 'string') return v.slice(0,n); return JSON.stringify(v).slice(0,n); } catch { try { return String(v).slice(0,n); } catch { return ''; } } };
@@ -136,6 +477,8 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
     closed = true;
     options?.onClose && options.onClose();
     console.log('HELIUS WebSocket closed', code, reason?.toString());
+  stopDiagInterval();
+  try { stopSlotBlocktimeWarmer(); } catch (e) {}
   });
 
   ws.on('error', (err) => {
@@ -154,6 +497,9 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
       }
     });
   }
+
+  // ensure diag interval cleaned up when stop called
+  const origStop = api => {};
 
   // Public API
   const api = {
@@ -259,28 +605,54 @@ function analyzeHeliusMessage(parsed: any) {
     }
   } catch (e) {}
 
-  // Fallback: recursive search for base58-like substrings anywhere in the message
-  const found: Record<string, any> = {};
-  function walk(o: any, depth = 0) {
+  // Fallback: perform a restricted recursive search for base58-like substrings but only
+  // accept them when they appear inside account lists, postTokenBalances, instruction accounts
+  // or when a nearby log/message explicitly references 'mint' (reduces false positives).
+  const found: { mint?: string, candidate?: string, context?: string } = {};
+  function walk(o: any, depth = 0, parentKey?: string) {
     if (!o || depth > 10) return;
-    if (Array.isArray(o)) return o.forEach((x) => walk(x, depth + 1));
+    if (Array.isArray(o)) return o.forEach((x) => walk(x, depth + 1, parentKey));
     if (typeof o === 'object') {
       for (const k of Object.keys(o)) {
         try {
           const v2 = o[k];
-          if ((k === 'mint' || k === 'token' || k === 'mintAddress' || k === 'account') && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) found.mint = v2;
-          // try to detect token fields inside nested objects
-          if (k.toLowerCase().includes('mint') && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) found.mint = v2;
-          walk(v2, depth + 1);
+          if ((k === 'mint' || k === 'token' || k === 'mintAddress' || k === 'account' || k === 'accounts') && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) {
+            // ignore known program IDs
+            if (!HELIUS_KNOWN_PROGRAM_IDS.has(v2)) found.mint = v2;
+          }
+          if (Array.isArray(v2) && (k === 'accounts' || k === 'accountKeys')) {
+            for (const a of v2) { if (typeof a === 'string' && a.length >= 32 && a.length <= 44 && !HELIUS_KNOWN_PROGRAM_IDS.has(a)) found.mint = found.mint || a; }
+          }
+          // inspect postTokenBalances explicitly
+          if (k === 'postTokenBalances' && Array.isArray(v2)) {
+            for (const b of v2) { try { if (b && typeof b.mint === 'string' && b.mint.length >= 32 && b.mint.length <= 44 && !HELIUS_KNOWN_PROGRAM_IDS.has(b.mint)) { found.mint = b.mint; found.context = 'postTokenBalances'; } } catch (e) {} }
+          }
+          // logs / messages nearby mentioning 'mint' increase confidence
+          if (typeof v2 === 'string') {
+            const m = v2.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
+            if (m && m.length) {
+              const lower = (parentKey || k || '').toLowerCase();
+              if (lower.includes('log') || lower.includes('message') || v2.toLowerCase().includes('mint')) {
+                const cand = m[0]; if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) { found.mint = found.mint || cand; found.context = 'log'; }
+              } else {
+                // keep as candidate but only accept later if we see corroborating context
+                const cand = m[0]; if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) found.candidate = found.candidate || cand;
+              }
+            }
+          }
+          walk(v2, depth + 1, k);
         } catch (e) {}
       }
     } else if (typeof o === 'string') {
       const m = o.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
-      if (m && m.length) found.candidate = found.candidate || m[0];
+      if (m && m.length) {
+        const cand = m[0]; if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) found.candidate = found.candidate || cand;
+      }
     }
   }
   walk(obj);
-  const mint = found.mint || found.candidate || null;
+  // Only accept fallback candidate if we have a mint from explicit contexts or candidate plus corroborating account lists
+  const mint = found.mint || ((found.candidate && (obj?.transaction?.message?.accountKeys || obj?.params?.result?.value?.meta?.postTokenBalances)) ? found.candidate : null) || null;
   if (!mint) return null;
   return { mint, eventType: 'fallback_recursive', detectedAt: new Date().toISOString(), detectedAtSec: Math.floor(Date.now()/1000), firstSlot: slotFromCtx ?? null, raw: parsed };
 }
@@ -300,7 +672,7 @@ function computeEventConfidence(evt: any, raw: any) {
     if (t === 'inner_parsed' || t === 'parsed_instruction' || t === 'postTokenBalance') return 0.9;
     if (t === 'label') return 0.5;
     if (t === 'memo') return 0.2;
-    if (t === 'fallback_recursive') return 0.15;
+  if (t === 'fallback_recursive') return 0.05;
     // bonus if parsed.transaction contains innerInstructions with mint-like fields
     try {
       const res = raw?.params?.result || raw?.result || raw;

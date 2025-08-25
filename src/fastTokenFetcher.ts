@@ -24,12 +24,15 @@ let __redisClient: any = null;
 async function getRedisClient() {
   if (__redisClient) return __redisClient;
   try {
-    const url = process.env.REDIS_URL || process.env.REDIS_URI || undefined;
-    const client = createClient(url ? { url } : undefined);
-    client.on('error', (e: any) => {});
-    await client.connect();
-    __redisClient = client;
-    return __redisClient;
+  const url = process.env.REDIS_URL || process.env.REDIS_URI || undefined;
+  // If no explicit Redis URL is provided, avoid attempting to connect to localhost
+  // (createClient() with no url will try localhost and may block if Redis is not available).
+  if (!url) return null;
+  const client = createClient({ url });
+  client.on('error', (e: any) => {});
+  await client.connect();
+  __redisClient = client;
+  return __redisClient;
   } catch (e) {
     __redisClient = null;
     return null;
@@ -1147,17 +1150,17 @@ async function getBlockTimeForSlotCached(slot: number): Promise<number | null> {
     if (rc) {
       try {
         const v = await rc.get(key).catch(() => null);
-        if (v) return Number(v);
+        if (v || v === '0') return Number(v);
       } catch (e) {}
     }
 
-    // try web3 connection first
+    // try web3 Connection.getBlockTime if available
     try {
       const cfg = require('./config');
       const conn = cfg && cfg.connection;
       if (conn && typeof conn.getBlockTime === 'function') {
         const bt = await conn.getBlockTime(Number(slot));
-        if (bt && typeof bt === 'number') {
+        if (bt || bt === 0) {
           try { if (rc) await rc.setEx(key, Math.max(1, Math.floor(Number(process.env.SLOT_BLOCKTIME_TTL_SEC || 60 * 60 * 24 * 7))), String(bt)).catch(() => {}); } catch (e) {}
           return Number(bt);
         }
@@ -1184,6 +1187,172 @@ async function getBlockTimeForSlotCached(slot: number): Promise<number | null> {
     return null;
   }
 }
+
+// Cache-only lookup: attempt to read slot->blockTime from Redis only.
+// This is useful for very-low-latency checks where we must not perform
+// web3 or HTTP RPC calls on the hot path.
+async function getCachedBlockTimeForSlot(slot: number): Promise<number | null> {
+  try {
+    const rc = await getRedisClient().catch(() => null);
+    if (!rc) return null;
+    const key = `slot_blocktime:${slot}`;
+    const v = await rc.get(key).catch(() => null);
+    if (v || v === '0') {
+      const num = Number(v);
+      if (Number.isNaN(num)) return null;
+      return num;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// -----------------------------
+// Per-mint snapshot helpers (cache-only + background updater)
+// -----------------------------
+/**
+ * Read a cached per-mint snapshot (cache-only). Returns null when no cache present.
+ * snapshot fields: { lastSeenTs, ageSeconds, volume_60s, volume_3600s, approxLiquidity, eventCount }
+ */
+export async function getMintSnapshotCached(mint: string): Promise<Record<string, any> | null> {
+  try {
+    if (!mint) return null;
+    const rc = await getRedisClient().catch(() => null);
+    // If Redis available, read from it. Otherwise fallback to in-memory store below.
+    if (rc) {
+      const key = `mint_stats:${mint}`;
+      const h = await rc.hGetAll(key).catch(() => ({}));
+      if (!h || Object.keys(h).length === 0) return null;
+      const out: any = {};
+      if (h.lastSeenTs) out.lastSeenTs = Number(h.lastSeenTs);
+      if (out.lastSeenTs) out.ageSeconds = Math.max(0, Math.floor(Date.now()/1000) - Number(out.lastSeenTs));
+      if (h.volume_60s) out.volume_60s = Number(h.volume_60s);
+      if (h.volume_3600s) out.volume_3600s = Number(h.volume_3600s);
+      if (h.approxLiquidity) out.approxLiquidity = Number(h.approxLiquidity);
+      if (h.eventCount) out.eventCount = Number(h.eventCount);
+      return out;
+    }
+    // In-memory fallback
+    try {
+      // lazy-initialize in-memory store
+      if (!(global as any).__inMemoryMintStats) (global as any).__inMemoryMintStats = new Map();
+      const store: Map<string, any> = (global as any).__inMemoryMintStats;
+      const rec = store.get(mint) || null;
+      if (!rec) return null;
+      const now = Math.floor(Date.now()/1000);
+      if (rec.expiry && rec.expiry < now) {
+        try { store.delete(mint); } catch (e) {}
+        return null;
+      }
+      const h = rec.data || {};
+      const out2: any = {};
+      if (h.lastSeenTs) out2.lastSeenTs = Number(h.lastSeenTs);
+      if (out2.lastSeenTs) out2.ageSeconds = Math.max(0, Math.floor(Date.now()/1000) - Number(out2.lastSeenTs));
+      if (h.volume_60s) out2.volume_60s = Number(h.volume_60s);
+      if (h.volume_3600s) out2.volume_3600s = Number(h.volume_3600s);
+      if (h.approxLiquidity) out2.approxLiquidity = Number(h.approxLiquidity);
+      if (h.eventCount) out2.eventCount = Number(h.eventCount);
+      return out2;
+    } catch (e) {
+      return null;
+    }
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Update mint stats from an observed event. Best-effort background updater.
+ * amount can be 0 when unknown. Non-blocking callers should call but not await.
+ */
+export async function updateMintStatsFromEvent(mint: string, amount = 0, slot?: number, tsSec?: number) {
+  try {
+    if (!mint) return false;
+    const rc = await getRedisClient().catch(() => null);
+    const ttl = Math.max(1, Math.floor(Number(process.env.MINT_STATS_TTL_SEC || 60 * 60 * 24 * 7)));
+    const nowSec = tsSec || Math.floor(Date.now()/1000);
+    if (rc) {
+      const key = `mint_stats:${mint}`;
+      const pipeline = rc.multi();
+      try {
+        // set lastSeenTs
+        pipeline.hSet(key, 'lastSeenTs', String(nowSec));
+        // increment counters
+        pipeline.hIncrBy(key, 'eventCount', 1).catch(() => {});
+        if (amount && !isNaN(Number(amount)) && Number(amount) > 0) {
+          pipeline.hIncrByFloat(key, 'volume_60s', Number(amount)).catch(() => {});
+          pipeline.hIncrByFloat(key, 'volume_3600s', Number(amount)).catch(() => {});
+        }
+        // best-effort: attach approxLiquidity from global fetch cache if not already set
+        try {
+          const existing = await rc.hGet(key, 'approxLiquidity').catch(() => null);
+          if (!existing) {
+            try {
+              const cache = getGlobalFetchCache();
+              if (Array.isArray(cache) && cache.length) {
+                const norm = String(mint).toLowerCase();
+                const found = cache.find((c: any) => {
+                  try { return String(c.tokenAddress || c.address || c.mint || '').toLowerCase() === norm; } catch { return false; }
+                });
+                if (found) {
+                  const liq = Number(found.liquidity ?? found.liquidityUsd ?? found.marketCap ?? found.liq ?? found.approxLiquidity ?? found.volume ?? 0) || 0;
+                  if (liq && !isNaN(liq) && Number(liq) > 0) pipeline.hSet(key, 'approxLiquidity', String(Number(liq)));
+                }
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
+        // set ttl
+        pipeline.expire(key, ttl);
+        await pipeline.exec().catch(() => {});
+      } catch (e) {
+        try { await rc.hSet(key, 'lastSeenTs', String(nowSec)).catch(() => {}); await rc.expire(key, ttl).catch(() => {}); } catch {}
+      }
+      return true;
+    } else {
+      // fallback: no Redis configured -> use in-memory Map with expiry
+      try {
+        if (!(global as any).__inMemoryMintStats) (global as any).__inMemoryMintStats = new Map();
+        const store: Map<string, any> = (global as any).__inMemoryMintStats;
+        const existing = store.get(mint) || { data: {}, expiry: 0 };
+        const data = existing.data || {};
+        data.lastSeenTs = String(nowSec);
+        data.eventCount = Number(data.eventCount || 0) + 1;
+        if (amount && !isNaN(Number(amount)) && Number(amount) > 0) {
+          data.volume_60s = Number(data.volume_60s || 0) + Number(amount);
+          data.volume_3600s = Number(data.volume_3600s || 0) + Number(amount);
+        }
+        // best-effort: fill approxLiquidity from global fetch cache if missing
+        try {
+          if (!data.approxLiquidity) {
+            const cache = getGlobalFetchCache();
+            if (Array.isArray(cache) && cache.length) {
+              const norm = String(mint).toLowerCase();
+              const found = cache.find((c: any) => {
+                try { return String(c.tokenAddress || c.address || c.mint || '').toLowerCase() === norm; } catch { return false; }
+              });
+              if (found) {
+                const liq = Number(found.liquidity ?? found.liquidityUsd ?? found.marketCap ?? found.liq ?? found.approxLiquidity ?? found.volume ?? 0) || 0;
+                if (liq && !isNaN(liq) && Number(liq) > 0) data.approxLiquidity = Number(liq);
+              }
+            }
+          }
+        } catch (e) {}
+        const expiry = Math.floor(Date.now()/1000) + ttl;
+        store.set(mint, { data, expiry });
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+// export for external quick lookups (heliusWsListener uses this)
+export { getBlockTimeForSlotCached, getCachedBlockTimeForSlot };
 
 export async function getAccountInfo(pubkey: string) {
   try {
@@ -1236,7 +1405,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
       }
     } catch (e) {}
 
-    // If slot->getBlockTime resolved timestamp, skip heavy signature/parsed tx calls
+  // If slot->getBlockTime resolved timestamp, skip heavy signature/parsed tx calls
     if (!earliestBlockTime) {
       const r = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0);
       if (!r || (r as any).__error) { if ((r as any)?.__error) console.log(`Enrich ${mint} error: ${(r as any).__error}`); return null; }
@@ -1244,30 +1413,66 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
       if (!arr || !Array.isArray(arr) || arr.length === 0) return null;
 
       // compute earliest blockTime across signatures (Helius returns newest-first)
-      for (const entry of arr) {
-        const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
-        let btv: any = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
-        if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
-        if (btv) {
-          const num = Number(btv);
-          if (!earliestBlockTime || num < earliestBlockTime) {
-            earliestBlockTime = num;
-            firstSignature = sig;
+      // compute earliest blockTime across signatures (Helius returns newest-first)
+      // Prefer transactions that look like mint/metadata creation (initializeMint, mintTo, create_metadata) by parsing
+      // a limited set of the oldest signatures to avoid picking a later swap as the 'first' activity.
+      try {
+        // first attempt: look for parsed txs among the oldest N signatures
+        const oldestToCheck = 20; // keep small to bound RPC
+        const arrOldest = Array.isArray(arr) ? arr.slice(-oldestToCheck) : [];
+        let found = false;
+        for (let i = 0; i < arrOldest.length; i++) {
+          const entry = arrOldest[i];
+          const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
+          if (!sig) continue;
+          try {
+            const parsed = await getParsedTransaction(sig);
+            const p = parsed && (parsed.result || parsed) ? (parsed.result || parsed) : parsed;
+            const pbt = p?.blockTime ?? p?.block_time ?? p?.blocktime ?? null;
+            // Inspect instructions for mint/metadata creation hints
+            const instrs = (p?.transaction?.message?.instructions) || (p?.meta?.innerInstructions && Array.isArray(p.meta.innerInstructions) ? p.meta.innerInstructions.flatMap((x:any)=>x.instructions) : null) || [];
+            const rawInstrs = JSON.stringify(instrs || '');
+            const isMintish = /initializeMint|mintTo|CreateMetadataAccount|create_metadata_accounts|create_metadata_accounts_v2|create_metadata_account/i.test(rawInstrs);
+            if (isMintish && pbt) {
+              const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+              earliestBlockTime = pnum;
+              firstSignature = sig;
+              found = true;
+              break;
+            }
+          } catch (e) {
+            // ignore per-sig parse errors
           }
         }
-      }
-
-      // fallback: if no blockTime in signatures, try parsed tx for the last (earliest) signature
-      if (!earliestBlockTime) {
-        const sigTry = arr[arr.length - 1]?.signature || (arr[arr.length - 1] as any)?.txHash || (arr[arr.length - 1] as any)?.tx_hash || null;
-        if (sigTry) {
-          try {
-            const parsed = await getParsedTransaction(sigTry);
-            const pbt = (parsed as any)?.blockTime ?? (parsed as any)?.result?.blockTime ?? (parsed as any)?.result?.block_time ?? (parsed as any)?.result?.blocktime ?? null;
-            if (pbt) earliestBlockTime = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
-            firstSignature = sigTry;
-          } catch (e) {}
+  if (!found) {
+          // fallback to taking minimal blockTime present in signature list
+          for (const entry of arr) {
+            const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
+            let btv: any = entry?.blockTime ?? entry?.block_time ?? entry?.blocktime ?? entry?.timestamp ?? null;
+            if (btv && btv > 1e12) btv = Math.floor(Number(btv) / 1000);
+            if (btv) {
+              const num = Number(btv);
+              if (!earliestBlockTime || num < earliestBlockTime) {
+                earliestBlockTime = num;
+                firstSignature = sig;
+              }
+            }
+          }
+          // fallback: if still missing, try parsed tx for the last (earliest) signature
+          if (!earliestBlockTime) {
+            const sigTry = arr[arr.length - 1]?.signature || (arr[arr.length - 1] as any)?.txHash || (arr[arr.length - 1] as any)?.tx_hash || null;
+            if (sigTry) {
+              try {
+                const parsed = await getParsedTransaction(sigTry);
+                const pbt = (parsed as any)?.blockTime ?? (parsed as any)?.result?.blockTime ?? (parsed as any)?.result?.block_time ?? (parsed as any)?.result?.blocktime ?? null;
+                if (pbt) earliestBlockTime = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+                firstSignature = sigTry;
+              } catch (e) {}
+            }
+          }
         }
+      } catch (e) {
+        // ignore and continue; we'll use available blockTimes
       }
     }
 
@@ -1279,13 +1484,113 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     const nowSec = Math.floor(Date.now() / 1000);
     const ageSeconds = nowSec - Number(earliestBlockTime);
 
-    // verify metadata PDA and token supply
+    // If token looks very young, do a deeper signature parse scan to avoid picking a later swap as the 'first'
+    try {
+      const deepScanThreshold = Number(process.env.DEEP_SCAN_THRESHOLD_SEC || 600); // 10 minutes
+      if (ageSeconds <= deepScanThreshold) {
+        const deepLimit = Number(process.env.DEEP_SCAN_LIMIT || 400);
+        const oldestToCheckDeep = Number(process.env.DEEP_OLDEST_TO_CHECK || 200);
+        try {
+          const deepRes = await heliusRpc('getSignaturesForAddress', [mint, { limit: deepLimit }], 8000, 0);
+          const deepArr = Array.isArray(deepRes) ? deepRes : (deepRes?.result ?? deepRes) || [];
+          if (Array.isArray(deepArr) && deepArr.length) {
+            const arrOldestDeep = deepArr.slice(-Math.min(oldestToCheckDeep, deepArr.length));
+            for (let i = 0; i < arrOldestDeep.length; i++) {
+              const entry = arrOldestDeep[i];
+              const sig = entry?.signature || entry?.txHash || entry?.tx_hash || null;
+              if (!sig) continue;
+              try {
+                const parsed = await getParsedTransaction(sig);
+                const p = parsed && (parsed.result || parsed) ? (parsed.result || parsed) : parsed;
+                const pbt = p?.blockTime ?? p?.block_time ?? p?.blocktime ?? null;
+                const instrs = (p?.transaction?.message?.instructions) || (p?.meta?.innerInstructions && Array.isArray(p.meta.innerInstructions) ? p.meta.innerInstructions.flatMap((x:any)=>x.instructions) : null) || [];
+                const rawInstrs = JSON.stringify(instrs || '');
+                const isMintish = /initializeMint|mintTo|CreateMetadataAccount|create_metadata_accounts|create_metadata_accounts_v2|create_metadata_account/i.test(rawInstrs);
+                if (isMintish && pbt) {
+                  const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+                  if (!earliestBlockTime || pnum < earliestBlockTime) {
+                    earliestBlockTime = pnum;
+                    firstSignature = sig;
+                    // recompute ageSeconds
+                    // not reassigning nowSec
+                  }
+                  break;
+                }
+              } catch (e) {
+                // ignore per-sig parse errors
+              }
+            }
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    // We'll attempt to use metadata PDA creation time if available (prefer it when earlier)
+    let metadataTimestampUsed = false;
     const metadataPda = await metadataPdaForMint(mint);
     let metadataExists = false;
     if (metadataPda) {
       const acct = await getAccountInfo(metadataPda);
       if (acct && acct.value) metadataExists = true;
     }
+    // If metadata PDA exists, try to determine its earliest signature and blockTime and prefer it
+    if (metadataExists && metadataPda) {
+      try {
+        const metaSigsRes = await heliusGetSignaturesFast(metadataPda, heliusUrl, 4000, 0);
+        if (metaSigsRes && !(metaSigsRes as any).__error) {
+          const metaArr = Array.isArray(metaSigsRes) ? metaSigsRes : ((metaSigsRes as any).result ?? metaSigsRes);
+          if (Array.isArray(metaArr) && metaArr.length) {
+            const metaSigEntry = metaArr[metaArr.length - 1];
+            const metaSig = metaSigEntry?.signature || metaSigEntry?.txHash || metaSigEntry?.tx_hash || null;
+            if (metaSig) {
+              try {
+                const parsedMeta = await getParsedTransaction(metaSig);
+                const pbt = (parsedMeta as any)?.blockTime ?? (parsedMeta as any)?.result?.blockTime ?? (parsedMeta as any)?.result?.block_time ?? null;
+                if (pbt) {
+                  const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
+                  if (!earliestBlockTime || pnum < earliestBlockTime) {
+                    earliestBlockTime = pnum;
+                    firstSignature = metaSig;
+                    metadataTimestampUsed = true;
+                  }
+                }
+              } catch (e) {
+                // ignore parse errors for metadata signature
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    // Debug: record which signature/time was selected and why (human) and emit structured JSON for tooling
+    try {
+      const chosenReason = metadataTimestampUsed ? 'metadata-pda' : (earliestBlockTime && firstSignature ? 'parsed-mint-or-metadata' : (earliestBlockTime && !firstSignature ? 'min-signature-blocktime' : 'slot-derived'));
+      console.log(`[handleNewMintEvent] mint=${mint} selectedReason=${chosenReason} firstSignature=${firstSignature} earliestBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds}`);
+      // Structured log (single-line JSON) to help automated analysis
+      try {
+        const signatureSummary: any[] = [];
+        try {
+          const arr = (await heliusGetSignaturesFast(mint, heliusUrl, 2000, 0)) || [];
+          const list = Array.isArray(arr) ? arr : ((arr as any).result ?? arr);
+          if (Array.isArray(list)) {
+            for (const e of list.slice(-10)) {
+              signatureSummary.push({ sig: e?.signature || e?.txHash || null, blockTime: e?.blockTime ?? e?.block_time ?? e?.timestamp ?? null });
+            }
+          }
+        } catch (e) {}
+        const sel = {
+          mint,
+          chosenReason,
+          metadataTimestampUsed: !!metadataTimestampUsed,
+          firstSignature: firstSignature || null,
+          earliestBlockTime: earliestBlockTime || null,
+          ageSeconds: ageSeconds || null,
+          signatureSummary
+        };
+        console.log(JSON.stringify({ handleNewMintEventSelection: sel }));
+      } catch (e) {}
+    } catch (e) {}
     let supply: number | null = null;
     try {
       const sup = await getTokenSupply(mint);
@@ -1734,6 +2039,50 @@ export async function fetchLatest5FromAllSources(n = 5) {
     dexTop: dex.slice(0, n),
     heliusHistory: await maybeValidate(heliusHistoryNorm),
   };
+}
+
+// --- Test helper: fetch latest 5 unique mints, enqueue enrichment, then filter via a simple default strategy ---
+export async function testFetchEnrichFilterLatest() {
+  try {
+    const limit = 5;
+    // 1) fetch latest candidates from combined sources
+    const subs = await fetchLatest5FromAllSources(limit);
+    const mints: string[] = Array.from(new Set([...(subs.heliusEvents || []), ...(subs.dexTop || []), ...(subs.heliusHistory || [])])).slice(0, limit);
+
+    // 2) prepare enrichment manager and handler (reuse handleNewMintEvent if available)
+    const { createEnrichmentManager } = require('./heliusEnrichmentQueue');
+    const mgr = createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 });
+    // small list to collect results
+    const enriched: any[] = [];
+
+    // use existing handleNewMintEvent if present as hf; otherwise use a lightweight enrichment wrapper
+    let hf: any = null;
+    try { const ff = require('./fastTokenFetcher'); hf = ff && (ff.handleNewMintEvent || ff.default && ff.default.handleNewMintEvent); } catch(e) {}
+    if (!hf) {
+      // fallback: use enrichTokenTimestamps on single token objects
+      const { enrichTokenTimestamps } = require('./utils/tokenUtils');
+      hf = async (evt: any) => { const addr = evt && (evt.mint || evt.address); const token = { tokenAddress: addr }; await enrichTokenTimestamps([token], { batchSize: 1, delayMs: 0 }); return token; };
+    }
+
+    // 3) enqueue enrich jobs and wait for them
+    const promises = mints.map((m: string) => mgr.enqueue({ mint: m, detectedAt: Date.now() }, hf));
+    const results = await Promise.all(promises.map(p => p.catch((e:any)=>({ error: String(e && e.message || e) }))));
+
+    // 4) build a naive default strategy requiring some on-chain evidence (minFreshnessScore 20)
+    const defaultStrategy = { enabled: true, minFreshnessScore: 20 };
+    // 5) get canonical global cache and filter using filterTokensByStrategy (import from bot/strategy)
+    const cache = getGlobalFetchCache();
+    const tu = require('./utils/tokenUtils');
+    // map tokens by mint
+    const candidates = mints.map((m:any) => {
+      const found = (cache || []).find((c:any) => (c.tokenAddress || c.address || c.mint || '').toString() === (m||'').toString());
+      return found ? found : { tokenAddress: m, mint: m };
+    });
+    const { filterTokensByStrategy } = require('./bot/strategy');
+    const filtered = await filterTokensByStrategy(candidates, defaultStrategy).catch(() => []);
+
+    return { mints, results, candidates, filtered };
+  } catch (e) { return { error: String(e && e.message ? e.message : e) }; }
 }
 
 // If run directly with command `node fastTokenFetcher.js latest` print latest 5 from each source

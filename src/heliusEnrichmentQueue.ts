@@ -18,25 +18,38 @@ export function createEnrichmentManager(opts?: { ttlSeconds?: number; maxConcurr
   // Redis client (optional)
   let redisClient: any = null;
   let useRedis = false;
-
+  let redisReady = false;
   const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_URI || '';
+
+  // init redis but ensure the manager waits a short bounded time for readiness to avoid races
   async function tryInitRedis() {
-    if (!REDIS_URL || redisClient) return;
+    if (!REDIS_URL) return;
+    if (redisClient) return;
     try {
       const { createClient } = await import('redis');
       redisClient = createClient({ url: REDIS_URL });
       redisClient.on && redisClient.on('error', (e: any) => { try { console.warn('[heliusEnrichmentQueue] redis error', e && e.message ? e.message : e); } catch {} });
-      await redisClient.connect();
-      useRedis = true;
-      try { console.log('[heliusEnrichmentQueue] connected to redis'); } catch {}
+      // connect with a bounded timeout
+      const p = redisClient.connect();
+      const t = new Promise((res) => setTimeout(res, 3000));
+      await Promise.race([p, t]);
+      // If client did not throw, mark as ready only if connected
+      if (redisClient && typeof redisClient.isOpen !== 'undefined' ? redisClient.isOpen : true) {
+        useRedis = true;
+        redisReady = true;
+        try { console.log('[heliusEnrichmentQueue] connected to redis'); } catch {}
+      } else {
+        // fallback silently
+        redisClient = null; useRedis = false; redisReady = false;
+      }
     } catch (e) {
       try { console.warn('[heliusEnrichmentQueue] failed to init redis, falling back to in-memory dedupe', e && e.message ? e.message : e); } catch {}
-      redisClient = null; useRedis = false;
+      redisClient = null; useRedis = false; redisReady = false;
     }
   }
 
-  // initialize Redis asynchronously but don't block creation
-  void tryInitRedis();
+  // start init but export promise so callers can await if they need deterministic dedupe
+  const _redisInitPromise = tryInitRedis();
 
   function nowSec() { return Math.floor(Date.now() / 1000); }
 
@@ -59,17 +72,19 @@ export function createEnrichmentManager(opts?: { ttlSeconds?: number; maxConcurr
   }
 
   async function redisTrySetDedup(key: string, ttlSecondsLocal: number) {
-    if (!redisClient) return false;
+    // Wait a short time for redis readiness if initialization in progress
+    try { await Promise.race([_redisInitPromise, new Promise(res => setTimeout(res, 800))]); } catch {}
+    if (!redisClient || !useRedis || !redisReady) return false;
     try {
-      // SET key value NX EX ttl
+      // Use SET NX EX (redis v4 client supports options)
       const res = await redisClient.set(key, '1', { NX: true, EX: ttlSecondsLocal });
-      // On success returns 'OK', on failure null
       return !!res;
     } catch (e) {
       try { console.warn('[heliusEnrichmentQueue] redis set failed, disabling redis dedupe', e && e.message ? e.message : e); } catch {}
       try { redisClient.disconnect && redisClient.disconnect().catch(() => {}); } catch {}
       redisClient = null;
       useRedis = false;
+      redisReady = false;
       return false;
     }
   }
@@ -93,18 +108,22 @@ export function createEnrichmentManager(opts?: { ttlSeconds?: number; maxConcurr
             const key = `helius:enrich:${mint}`;
             const now = nowSec();
 
-            // Prefer Redis dedupe when available
-            if (useRedis) {
-              const ok = await redisTrySetDedup(key, ttlSeconds);
-              if (!ok) {
-                try { console.log('Enrichment skipped (redis dedupe) for', mint); } catch {}
-                resolve({ skipped: true, reason: 'redis-dedupe' });
+            // Prefer Redis dedupe when available (but avoid races: await init briefly)
+            if (useRedis || REDIS_URL) {
+              try {
+                const ok = await redisTrySetDedup(key, ttlSeconds);
+                if (!ok) {
+                  try { console.log('Enrichment skipped (redis dedupe) for', mint); } catch {}
+                  resolve({ skipped: true, reason: 'redis-dedupe' });
+                  return;
+                }
+                // enqueue job and resolve when handler finishes
+                queue.push({ evt, hf: async (e:any) => { const r = await hf(e); resolve(r); return r; } });
+                tryRunNext();
                 return;
+              } catch (e) {
+                // fallback to in-memory dedupe on redis errors
               }
-              // enqueue job and resolve when handler finishes
-              queue.push({ evt, hf: async (e:any) => { const r = await hf(e); resolve(r); return r; } });
-              tryRunNext();
-              return;
             }
 
             // In-memory fallback
