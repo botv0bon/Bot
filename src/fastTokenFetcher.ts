@@ -7,6 +7,14 @@ import { registerBuyWithTarget } from './bot/strategy';
 import { extractTradeMeta } from './utils/tradeMeta';
 import { unifiedBuy } from './tradeSources';
 import { fetchDexScreenerTokens, fetchSolanaFromCoinGecko, normalizeMintCandidate } from './utils/tokenUtils';
+// Small set of addresses we should never treat as token mints when scanning quick sources
+const KNOWN_NON_MINT_ADDRESSES = new Set<string>([
+  '11111111111111111111111111111111', // system program
+  'So11111111111111111111111111111111111111112', // wrapped SOL sentinel often shown in dexscreener samples
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // SPL Token program
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr', // Memo program
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s' // Metaplex metadata program
+]);
 import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL, HELIUS_API_KEY, getHeliusApiKey, getSolscanApiKey } from './config';
 import { getCoinData as getPumpData } from './pump/api';
 import { withTimeout, createLimiter, makeSourceMeta, SourceMeta, getHostLimiter, retryWithBackoff, TTLCache } from './utils/enrichHelpers';
@@ -387,10 +395,17 @@ export async function getUnifiedCandidates(limit: number) {
       const { getRecentHeliusEvents } = require('./heliusWsListener');
       const evs = getRecentHeliusEvents();
       if (Array.isArray(evs)) {
+        const now = Math.floor(Date.now()/1000);
         for (const e of evs) {
           // prefer analyzer-provided mint field when available
           const raw = e && (e.mint || (e.parsed && e.parsed.info && e.parsed.info.mint) || e.address || null);
           const m = raw ? normalizeMintCandidate(raw) : null;
+          // Skip obviously non-mint addresses and very-old events to reduce noise
+          if (!m) continue;
+          if (KNOWN_NON_MINT_ADDRESSES.has(m)) continue;
+          const evtAge = e && (e.detectedAtSec || e.detectedAt || e.firstSlot) ? (e.detectedAtSec ? Number(e.detectedAtSec) : null) : null;
+          // if we have a detectedAtSec and it's older than 24h, skip here (too noisy)
+          if (evtAge && now - Number(evtAge) > (24 * 3600)) continue;
           if (m && !seen.has(m)) {
             // attach structured provenance so Helius contributes to __sources in canonical cache
             try {
@@ -1644,6 +1659,87 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
   } catch (e) {
     return null;
   }
+}
+
+// Cached wrapper around handleNewMintEvent to reduce repeated heavy calls.
+// Prefer TTLCache for automatic expiry; fall back to Map when TTLCache isn't available.
+const _hh_handle_cache_ttl_ms = Number(process.env.HELIUS_HANDLE_CACHE_TTL_MS || (process.env.HELIUS_HANDLE_CACHE_TTL_S ? Number(process.env.HELIUS_HANDLE_CACHE_TTL_S) * 1000 : 60_000));
+let _hh_cache: any;
+try {
+  _hh_cache = new TTLCache<string, { ts: number; res: any }>(_hh_handle_cache_ttl_ms);
+} catch (e) {
+  _hh_cache = new Map<string, { ts: number; res: any }>();
+}
+const _hh_inflight: Map<string, Promise<any>> = new Map();
+let _hh_active = 0;
+const _hh_queue: Array<() => void> = [];
+const _hh_max = Number(process.env.HELIUS_HANDLE_CONCURRENCY ?? 3);
+
+function _hh_enqueue(fn: () => void) {
+  _hh_queue.push(fn);
+}
+
+function _hh_dequeue() {
+  if (_hh_queue.length === 0) return;
+  if (_hh_active >= _hh_max) return;
+  const fn = _hh_queue.shift();
+  try { if (fn) fn(); } catch (e) {}
+}
+
+export async function handleNewMintEventCached(mintOrObj: any, ttlSec?: number) {
+  try {
+    const mint = typeof mintOrObj === 'string' ? mintOrObj : (mintOrObj?.mint || null);
+    if (!mint) return null;
+    const key = String(mint).toLowerCase();
+  const ttl = Number(ttlSec ?? process.env.HELIUS_HANDLE_CACHE_TTL_S ?? 60);
+  const now = Math.floor(Date.now() / 1000);
+  // Read from TTL-backed cache (support Map fallback)
+  let cached: any = null;
+  try { cached = (typeof _hh_cache.get === 'function') ? _hh_cache.get(key) : _hh_cache.get(key); } catch (e) { cached = null; }
+  if (cached && (now - (cached.ts || 0) <= ttl)) return cached.res;
+
+    // If there's an in-flight request, reuse it
+    const inflight = _hh_inflight.get(key);
+    if (inflight) return inflight;
+
+    // Create a Promise that will run under concurrency control
+    const promise = new Promise<any>((resolve) => {
+      const run = () => {
+        (async () => {
+          _hh_active++;
+          try {
+            const res = await handleNewMintEvent(mintOrObj).catch(() => null);
+            try {
+              const entry = { ts: Math.floor(Date.now() / 1000), res };
+              // TTLCache.set may accept (key, value, ttlMs) or just (key, value)
+              if (typeof _hh_cache.set === 'function') {
+                try { _hh_cache.set(key, entry, ttl * 1000); } catch (e) { try { _hh_cache.set(key, entry); } catch (ee) {} }
+              } else if (typeof (_hh_cache as Map<any, any>).set === 'function') {
+                try { (_hh_cache as Map<any, any>).set(key, entry); } catch (e) {}
+              }
+            } catch (e) {}
+            resolve(res);
+          } catch (e) {
+            resolve(null);
+          } finally {
+            _hh_active = Math.max(0, _hh_active - 1);
+            try { _hh_inflight.delete(key); } catch (e) {}
+            // schedule next queued
+            try { _hh_dequeue(); } catch (e) {}
+          }
+        })();
+      };
+
+      if (_hh_active < _hh_max) {
+        run();
+      } else {
+        _hh_enqueue(run);
+      }
+    });
+
+    try { _hh_inflight.set(key, promise); } catch (e) {}
+    return promise;
+  } catch (e) { return null; }
 }
 
 export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: number; concurrency?: number }) {

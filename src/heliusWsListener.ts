@@ -56,8 +56,207 @@ const USE_WS = HELIUS_USE_WEBSOCKET;
 const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
 const SUBSCRIBE_SPLTOKEN = HELIUS_SUBSCRIBE_SPLTOKEN;
 
+// Freshness threshold (seconds) used to prefer very recent events even when
+// base confidence score is low. Tunable via env HELIUS_FRESHNESS_THRESHOLD_S
+const HELIUS_FRESHNESS_THRESHOLD_S = Number(process.env.HELIUS_FRESHNESS_THRESHOLD_S ?? 180);
+// If true, only accept low-confidence events when Dexscreener reports pairs (no Helius fallback)
+const HELIUS_REQUIRE_DEXSCREENER = (String(process.env.HELIUS_REQUIRE_DEXSCREENER || 'false').toLowerCase() === 'true');
+// Max allowed mint age (seconds) for accepting low-confidence events
+const HELIUS_MAX_MINT_AGE_S = Number(process.env.HELIUS_MAX_MINT_AGE_S ?? 60);
+// In-memory quick caches to reduce API calls
+const _quickCheckCache: Map<string, { isTraded?: boolean; isYoung?: boolean; ts: number }> = new Map();
+const QUICK_CHECK_TTL_S = Number(process.env.HELIUS_QUICK_CHECK_TTL_S ?? 600); // 10 minutes default
+// per-mint dedupe window to ignore repeated events (seconds)
+const HELIUS_MINT_DEDUPE_S = Number(process.env.HELIUS_MINT_DEDUPE_S ?? 60);
+const _recentAccepted: Map<string, number> = new Map();
+
+// Simple HTTP GET with retry/backoff for transient errors (used for quick checks)
+async function httpGetWithRetry(url: string, opts: any = {}) {
+  try {
+    const axios = require('axios');
+    const maxAttempts = Number(process.env.HELIUS_HTTP_RETRY_COUNT ?? 3);
+    const baseMs = Number(process.env.HELIUS_HTTP_RETRY_BASE_MS ?? 300);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const res = await axios.get(url, { timeout: Number(opts.timeoutMs || 2000) });
+        return res;
+      } catch (err: any) {
+        const status = err && err.response && err.response.status ? Number(err.response.status) : null;
+        // retry on 429/5xx or network errors
+        if (attempt < maxAttempts && (status === 429 || (status && status >= 500) || !status)) {
+          const delay = baseMs * Math.pow(2, attempt - 1);
+          await new Promise((res) => setTimeout(res, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
+// Retry wrapper for tokenUtils.officialEnrich to handle transient Helius 429s
+async function retryOfficialEnrich(tuMod: any, tokenObj: any, opts: { timeoutMs?: number } = {}) {
+  try {
+    const maxAttempts = Number(process.env.HELIUS_OFFICIAL_ENRICH_RETRY_COUNT ?? 3);
+    const baseMs = Number(process.env.HELIUS_OFFICIAL_ENRICH_RETRY_BASE_MS ?? 300);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (!tuMod || typeof tuMod.officialEnrich !== 'function') return null;
+        await Promise.race([
+          tuMod.officialEnrich(tokenObj, { timeoutMs: Number(opts.timeoutMs || 2000) }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('official-enrich-timeout')), Number(opts.timeoutMs || 2000)))
+        ]).catch(() => null);
+        // if officialEnrich ran without throwing, return tokenObj so caller can inspect fields
+        return tokenObj;
+      } catch (err: any) {
+        const status = err && err.response && err.response.status ? Number(err.response.status) : null;
+        if (attempt < maxAttempts && (status === 429 || (status && status >= 500) || !status)) {
+          const delay = baseMs * Math.pow(2, attempt - 1);
+          await new Promise((res) => setTimeout(res, delay));
+          continue;
+        }
+        // non-retryable or exhausted attempts
+        return null;
+      }
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
+// Quick external checks to decide if a low-confidence mint has real trading activity.
+async function quickIsTraded(mintAddr: string) {
+  try {
+    const now = Math.floor(Date.now()/1000);
+    const key = String(mintAddr).toLowerCase();
+    const cached = _quickCheckCache.get(key);
+    if (cached && (now - (cached.ts || 0) <= QUICK_CHECK_TTL_S) && typeof cached.isTraded === 'boolean') return cached.isTraded;
+  } catch (e) {}
+  try {
+    const axios = require('axios');
+    const nowS = Math.floor(Date.now()/1000);
+    // 1) Dexscreener token pairs endpoint (fast, public)
+    try {
+  const dTpl = process.env.DEXSCREENER_API_ENDPOINT_TOKEN_PAIRS || 'https://api.dexscreener.com/token-pairs/v1/solana/So11111111111111111111111111111111111111112';
+  const dUrl = dTpl.replace(/So11111111111111111111111111111111111111112/g, encodeURIComponent(mintAddr));
+  const dRes = await httpGetWithRetry(dUrl, { timeoutMs: Number(process.env.DEXSCREENER_QUICK_TIMEOUT_MS || 1800) }).catch(() => null);
+      if (dRes && dRes.data) {
+        // dexscreener returns object with pairs; if any pairs exist, it's trading
+        if (Array.isArray(dRes.data.pairs) && dRes.data.pairs.length > 0) return true;
+        // some endpoints return an object where keys are pairs
+        if (typeof dRes.data === 'object' && Object.keys(dRes.data).length > 0 && (dRes.data.pairs || dRes.data.pair)) return true;
+      }
+    } catch (e) {}
+
+    // 2) Fallback: Helius parse-history for tokenTransfers/nativeTransfers within freshness window
+    try {
+      const cfg = require('./config');
+      const parseTemplate = process.env.HELIUS_PARSE_HISTORY_URL || cfg.HELIUS_PARSE_HISTORY_URL || 'https://api.helius.xyz/v0/addresses/{address}/transactions/?api-key=' + (process.env.HELIUS_API_KEY || '');
+      const url = parseTemplate.replace('{address}', encodeURIComponent(mintAddr));
+      const axios = require('axios');
+  const resp = await httpGetWithRetry(url, { timeoutMs: Number(process.env.HELIUS_QUICK_HTTP_TIMEOUT_MS || 1800) }).catch(() => null);
+      if (resp && resp.data && Array.isArray(resp.data) && resp.data.length) {
+        for (const tx of resp.data) {
+          try {
+            const bt = tx.blockTime || (tx?.meta && tx.meta.blockTime) || null;
+            if (bt && (nowS - Number(bt) <= HELIUS_FRESHNESS_THRESHOLD_S)) return true;
+            // also check tokenTransfers/nativeTransfers entries for non-zero amounts
+            const tokenTransfers = tx.tokenTransfers || [];
+            for (const tt of tokenTransfers) {
+              if (tt && (tt.mint === mintAddr || tt.mint === String(mintAddr))) {
+                // consider any token transfer as signal of trading/flow
+                if (Number(tt.amount || tt.tokenAmount || tt.uiAmount || 0) > 0) return true;
+              }
+            }
+            const nativeTransfers = tx.nativeTransfers || [];
+            if (Array.isArray(nativeTransfers) && nativeTransfers.length) return true;
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+  try { _quickCheckCache.set(String(mintAddr).toLowerCase(), { isTraded: false, ts: Math.floor(Date.now()/1000) }); } catch (e) {}
+  return false;
+  } catch (e) { return false; }
+}
+
+// Dex-only quick check: returns true only if Dexscreener reports pairs/liquidity.
+async function quickIsTradedByDex(mintAddr: string) {
+  try {
+    const now = Math.floor(Date.now()/1000);
+    const key = String(mintAddr).toLowerCase();
+    const cached = _quickCheckCache.get(key);
+    if (cached && (now - (cached.ts || 0) <= QUICK_CHECK_TTL_S) && typeof cached.isTraded === 'boolean') return cached.isTraded;
+  } catch (e) {}
+  try {
+  const dTpl = process.env.DEXSCREENER_API_ENDPOINT_TOKEN_PAIRS || 'https://api.dexscreener.com/token-pairs/v1/solana/So11111111111111111111111111111111111111112';
+  const dUrl = dTpl.replace(/So11111111111111111111111111111111111111112/g, encodeURIComponent(mintAddr));
+  const dRes = await httpGetWithRetry(dUrl, { timeoutMs: Number(process.env.DEXSCREENER_QUICK_TIMEOUT_MS || 1800) }).catch(() => null);
+    if (dRes && dRes.data) {
+      if (Array.isArray(dRes.data.pairs) && dRes.data.pairs.length > 0) return true;
+      if (typeof dRes.data === 'object' && Object.keys(dRes.data).length > 0 && (dRes.data.pairs || dRes.data.pair)) return true;
+    }
+  try { _quickCheckCache.set(String(mintAddr).toLowerCase(), { isTraded: false, ts: Math.floor(Date.now()/1000) }); } catch (e) {}
+  return false;
+  } catch (e) { return false; }
+}
+
+// Quick check whether a mint is actually young (recently created/first-seen)
+async function quickIsMintYoung(mintAddr: string, maxAgeSec = HELIUS_MAX_MINT_AGE_S) {
+  try {
+    const now = Math.floor(Date.now()/1000);
+    const key = String(mintAddr).toLowerCase();
+    const cached = _quickCheckCache.get(key);
+    if (cached && (now - (cached.ts || 0) <= QUICK_CHECK_TTL_S) && typeof cached.isYoung === 'boolean') return cached.isYoung;
+  } catch (e) {}
+  try {
+    if (!mintAddr) return false;
+    const ff = require('./fastTokenFetcher');
+    // 1) try cache-only snapshot for cheap result
+    try {
+      if (ff && typeof ff.getMintSnapshotCached === 'function') {
+        const snap = await ff.getMintSnapshotCached(mintAddr).catch(() => null);
+        if (snap) {
+          let ok = false;
+          if (typeof snap.ageSeconds === 'number' && !isNaN(Number(snap.ageSeconds))) {
+            ok = Number(snap.ageSeconds) <= Number(maxAgeSec);
+          } else if (typeof snap.lastSeenTs === 'number' && !isNaN(Number(snap.lastSeenTs))) {
+            const age = Math.floor(Date.now() / 1000) - Number(snap.lastSeenTs);
+            ok = age <= Number(maxAgeSec);
+          }
+          try { _quickCheckCache.set(String(mintAddr).toLowerCase(), { isYoung: ok, ts: Math.floor(Date.now()/1000) }); } catch (e) {}
+          if (ok) return true;
+        }
+      }
+    } catch (e) {}
+
+    // 2) fallback: run handleNewMintEventCached (heavier, but reliable) with short timeout
+    try {
+      const ffLocal = require('./fastTokenFetcher');
+      const tmo = Number(process.env.HELIUS_QUICK_HANDLE_TIMEOUT_MS || 2500);
+      let res: any = null;
+      try {
+        res = await Promise.race([
+          ffLocal && typeof ffLocal.handleNewMintEventCached === 'function' ? ffLocal.handleNewMintEventCached(mintAddr).catch(() => null) : (ffLocal && typeof ffLocal.handleNewMintEvent === 'function' ? ffLocal.handleNewMintEvent(mintAddr).catch(() => null) : null),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('handle-timeout')), tmo))
+        ]).catch(() => null);
+      } catch (e) { res = null; }
+      if (res && typeof res.ageSeconds === 'number' && !isNaN(Number(res.ageSeconds))) {
+        const ok = Number(res.ageSeconds) <= Number(maxAgeSec);
+        try { _quickCheckCache.set(String(mintAddr).toLowerCase(), { isYoung: ok, ts: Math.floor(Date.now()/1000) }); } catch (e) {}
+        return ok;
+      }
+    } catch (e) {}
+
+  try { _quickCheckCache.set(String(mintAddr).toLowerCase(), { isYoung: false, ts: Math.floor(Date.now()/1000) }); } catch (e) {}
+  return false;
+  } catch (e) { return false; }
+}
+
+
 // Confidence threshold for automatic enrichment (0.0 - 1.0). Can be tuned via env.
-const HELIUS_ENRICH_SCORE_THRESHOLD = Number(process.env.HELIUS_ENRICH_SCORE_THRESHOLD ?? 0.6);
+// Lower default to include lower-confidence events in automatic enrichment flows.
+// Set env HELIUS_ENRICH_SCORE_THRESHOLD to override (e.g. 0.05 for permissive).
+const HELIUS_ENRICH_SCORE_THRESHOLD = Number(process.env.HELIUS_ENRICH_SCORE_THRESHOLD ?? 0.05);
 // Known program/account IDs that should never be treated as mint addresses
 const HELIUS_KNOWN_PROGRAM_IDS = new Set([
   '11111111111111111111111111111111',
@@ -125,7 +324,6 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
   function pushEvent(ev: any) {
     try {
   recentEvents.unshift(ev);
-  try { console.log('Helius detected event', ev && ev.mint, ev && ev.eventType); } catch {}
       if (recentEvents.length > 200) recentEvents.length = 200;
     } catch {}
   }
@@ -135,12 +333,14 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
   function startDiagInterval() {
     try {
       if (_diagInterval) return;
+      const verbose = !!process.env.HELIUS_VERBOSE;
+      const interval = Number(process.env.HELIUS_DIAG_INTERVAL_MS || (verbose ? 15000 : 60000));
       _diagInterval = setInterval(() => {
         try {
           const s = { ..._heliusListenerStats };
-          console.log('HELIUS-LISTENER-STATS:', JSON.stringify(s));
+          if (verbose) console.log('HELIUS-LISTENER-STATS:', JSON.stringify(s)); else if ((s.processed || 0) % 500 === 0) console.log('HELIUS-LISTENER-STATS summary:', JSON.stringify({ processed: s.processed, enriched: s.enriched, skippedLowConfidence: s.skippedLowConfidence }));
         } catch (e) {}
-      }, Number(process.env.HELIUS_DIAG_INTERVAL_MS || 15000));
+      }, interval);
     } catch (e) {}
   }
   function stopDiagInterval() { try { if (_diagInterval) { clearInterval(_diagInterval); _diagInterval = null; } } catch (e) {} }
@@ -191,6 +391,19 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
       try {
         const evt = analyzeHeliusMessage(parsed);
         if (!evt) return;
+        const VERBOSE = !!process.env.HELIUS_VERBOSE;
+        // Strict memo policy: reject memo-only detections unless corroborated
+        if (evt.eventType === 'memo') {
+          const v = parsed?.params?.result?.value || parsed?.result?.value || parsed?.value || parsed?.result || parsed;
+          const hasPostBalances = !!(v && v.meta && Array.isArray(v.meta.postTokenBalances) && v.meta.postTokenBalances.length > 0);
+          const hasInnerWithPost = !!(v && v.meta && Array.isArray(v.meta.innerInstructions) && v.meta.innerInstructions.some((b: any) => Array.isArray(b.instructions) && b.instructions.some((ins: any) => ins && ins.parsed && ins.parsed.info && Array.isArray(ins.parsed.info.postTokenBalances) && ins.parsed.info.postTokenBalances.length > 0)));
+          // Conservative policy: reject any memo-only event that lacks on-chain corroboration.
+          if (!hasPostBalances && !hasInnerWithPost) {
+            _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+            if (VERBOSE) console.log('Rejecting memo-only event (conservative policy): no on-chain corroboration', evt.mint || '(no-mint)');
+            return;
+          }
+        }
         pushEvent(evt);
         try { if ((options as any)?.onNewMint) (options as any).onNewMint(evt); } catch (e) {}
 
@@ -221,6 +434,16 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
               }
             }
             if (quickHintFound) {
+              // For memo-only events, require nearby postTokenBalances to avoid memo noise
+              if (evt.eventType === 'memo') {
+                const v = parsed?.params?.result?.value || parsed?.result?.value || parsed?.value || parsed?.result || parsed;
+                const hasPostBalances = !!(v && v.meta && Array.isArray(v.meta.postTokenBalances) && v.meta.postTokenBalances.length > 0);
+                if (!hasPostBalances) {
+                  _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+                  try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 50 === 1) console.log('Skipping memo-only event (no postTokenBalances)', evt.mint || '(no-mint)'); } catch {}
+                  return;
+                }
+              }
               // If cache hints liquidity/volume, schedule a non-blocking quick officialEnrich for this mint
               try {
                 const tuMod = require('./utils/tokenUtils');
@@ -234,11 +457,8 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
                   (async () => {
                     try {
                       const tokenObj: any = { tokenAddress: tokenAddr };
-                      // run officialEnrich with a short timeout wrapper
-                      await Promise.race([
-                        tuMod.officialEnrich(tokenObj, { timeoutMs: Number(process.env.HELIUS_QUICK_OFFICIAL_ENRICH_TIMEOUT_MS || 2000) }),
-                        new Promise((_, rej) => setTimeout(() => rej(new Error('enrich-timeout')), Number(process.env.HELIUS_QUICK_OFFICIAL_ENRICH_TIMEOUT_MS || 2000)))
-                      ]).catch(() => null);
+                      // run officialEnrich with retry/backoff wrapper
+                      await retryOfficialEnrich(tuMod, tokenObj, { timeoutMs: Number(process.env.HELIUS_QUICK_OFFICIAL_ENRICH_TIMEOUT_MS || 2000) }).catch(() => null);
                       // If enrichment retrieved useful fields, persist snapshot via fastTokenFetcher if available
                       if (tokenObj && (tokenObj.poolOpenTimeMs || tokenObj.liquidity || tokenObj.volume)) {
                         try {
@@ -251,7 +471,7 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
                         // emit follow-up so downstream parsers see enriched data
                         try {
                           const follow = { mint: tokenAddr, eventType: evt.eventType || null, detectedAt: evt.detectedAt || null, enriched: true, _diag: { quickOfficialEnrich: true } };
-                          console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                          if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
                         } catch (e) {}
                         _heliusListenerStats.bgMintResolved = (_heliusListenerStats.bgMintResolved || 0) + 1;
                       } else {
@@ -274,9 +494,40 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
                 return;
               }
             } else {
-              _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
-              try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 50 === 1) console.log('Skipping enrichment due to low confidence (sampled)', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
-              return;
+                // Before skipping low-confidence events, require the transaction
+                // itself to show token-related activity. This avoids trusting labels
+                // or memos without transaction corroboration. Only when transaction
+                // content indicates token activity do we run external quick checks.
+                try {
+                  const txLikely = isLikelyTokenByTx(parsed, evt);
+                  if (!txLikely) {
+                    _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+                    try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 50 === 1) console.log('Skipping low-confidence event: tx does not show token activity', evt.mint || '(no-mint)', 'eventType=', evt.eventType); } catch {}
+                    return;
+                  }
+
+                  const mintAddr = String(evt.mint || '').trim();
+                  let isTraded = false;
+                  if (mintAddr) {
+                    try {
+                      if (HELIUS_REQUIRE_DEXSCREENER) isTraded = await quickIsTradedByDex(mintAddr);
+                      else isTraded = await quickIsTraded(mintAddr);
+                    } catch (e) { isTraded = false; }
+                  }
+                  // Also require the mint to be actually young (created/recently seen)
+                  let isYoung = false;
+                  try { isYoung = await quickIsMintYoung(evt.mint); } catch (e) { isYoung = false; }
+                  if (!isTraded || !isYoung) {
+                    _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+                    try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 50 === 1) console.log('Skipping enrichment due to low confidence (not traded/too-old)', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
+                    return;
+                  }
+                  // if traded and young, allow flow to continue and schedule background enrich if needed
+                } catch (e) {
+                  _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+                  try { console.log('Skipping enrichment due to low confidence', evt.mint || '(no-mint)', 'score=', typeof score === 'number' && score.toFixed ? score.toFixed(2) : score); } catch {}
+                  return;
+                }
             }
           } catch (e) {
             _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
@@ -342,14 +593,14 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
                           score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
                           _diag: { blockTimeDiag: { reason: 'background-resolved', elapsedMs: elapsed2 } }
                         };
-                        try { console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime=', bt, 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
-                        console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                        try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime=', bt, 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
+                        if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
                       } else {
                         _heliusListenerStats.bgNull = (_heliusListenerStats.bgNull || 0) + 1;
                         // optionally emit that background resolution returned null
                         const follow = { mint: evt.mint || null, slot: slotNum, blockTime: null, _diag: { blockTimeDiag: { reason: 'background-null', elapsedMs: elapsed2 } } };
-                        try { console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime= null', 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
-                        console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                        try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime= null', 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
+                        if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
                       }
                     } catch (e) {
                       // background resolution failed; emit nothing (best-effort)
@@ -409,12 +660,21 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
           } catch (e) {}
           // include optional debug diagnostics
           try { if (!(quickDebug as any)) quickDebug = {}; if (Object.keys((quickDebug as any)).length) (quick as any)._diag = quickDebug; } catch {}
-          // concise human-readable diagnostic alongside single-line JSON to aid terminal debugging
+          // enforce per-mint dedupe: avoid emitting same mint within HELIUS_MINT_DEDUPE_S window
           try {
-            const diagShort = (quick as any)._diag ? `diag=${JSON.stringify((quick as any)._diag)}` : '';
-            console.log('helius_quick_enrich:', evt.mint || '(no-mint)', 'slot=', slot, 'blockTime=', blockTime, diagShort);
+            const k = String(evt.mint || '').toLowerCase();
+            const last = _recentAccepted.get(k);
+            const nowSec = Math.floor(Date.now()/1000);
+            if (!last || (nowSec - last) > HELIUS_MINT_DEDUPE_S) {
+              // record acceptance timestamp
+              try { _recentAccepted.set(k, nowSec); } catch (e) {}
+              const diagShort = (quick as any)._diag ? `diag=${JSON.stringify((quick as any)._diag)}` : '';
+              try { console.log('helius_quick_enrich:', evt.mint || '(no-mint)', 'slot=', slot, 'blockTime=', blockTime, diagShort); } catch (e) {}
+              console.log(JSON.stringify({ helius_quick_enrich: quick }));
+            } else {
+              // skip noisy duplicate emission
+            }
           } catch (e) {}
-          console.log(JSON.stringify({ helius_quick_enrich: quick }));
         } catch (e) {}
 
         // proceed with enrichment
@@ -660,27 +920,130 @@ function analyzeHeliusMessage(parsed: any) {
 // Compute a simple confidence score (0..1) for an analyzed event.
 // Heuristics:
 // - metadata_or_initialize -> 1.0
-// - inner_parsed / parsed_instruction / postTokenBalance -> 0.9
-// - label -> 0.5
-// - memo -> 0.2
-// - fallback_recursive -> 0.15
+// - inner_parsed / parsed_instruction / postTokenBalance -> 0.94
+// - label -> 0.65
+// - memo -> 0.05 (very noisy unless corroborated)
+// - fallback_recursive -> 0.01 (only as last resort)
 function computeEventConfidence(evt: any, raw: any) {
   try {
     if (!evt || typeof evt !== 'object') return 0;
     const t = evt.eventType || '';
-    if (t === 'metadata_or_initialize') return 1.0;
-    if (t === 'inner_parsed' || t === 'parsed_instruction' || t === 'postTokenBalance') return 0.9;
-    if (t === 'label') return 0.5;
-    if (t === 'memo') return 0.2;
-  if (t === 'fallback_recursive') return 0.05;
+  if (t === 'metadata_or_initialize') return 1.0;
+  if (t === 'inner_parsed' || t === 'parsed_instruction' || t === 'postTokenBalance') return 0.94;
+  // Labels require corroborating on-chain evidence to be trusted; score moderate
+  if (t === 'label') return 0.65;
+  // Memos are noisy; under conservative policy treat them as effectively zero base trust.
+  if (t === 'memo') return 0.0;
+  if (t === 'fallback_recursive') return 0.01;
     // bonus if parsed.transaction contains innerInstructions with mint-like fields
     try {
       const res = raw?.params?.result || raw?.result || raw;
       const v = res?.value || res;
-      if (v && v.meta && Array.isArray(v.meta.innerInstructions)) return 0.85;
+      if (v && v.meta && Array.isArray(v.meta.innerInstructions)) return 0.9;
     } catch (e) {}
-    return 0.1;
+    return 0.08;
   } catch (e) { return 0; }
+}
+
+// Inspect parsed transaction payload to decide whether the transaction
+// actually contains token-related actions for the candidate mint.
+// This avoids relying on static address lists; decisions are based on
+// transaction content (logs, instructions, postTokenBalances, tokenTransfers).
+function isLikelyTokenByTx(parsed: any, evt: any) {
+  try {
+    if (!parsed || !evt) return false;
+    const res = parsed.params?.result || parsed.result || parsed;
+    const v = res?.value || res;
+
+    // 1) postTokenBalances or pre/post balances showing the mint
+    try {
+      const post = v?.meta?.postTokenBalances || v?.meta?.postTokenBalances;
+      if (Array.isArray(post) && post.length) {
+        for (const b of post) {
+          try { if (b && b.mint && String(b.mint) === String(evt.mint)) return true; } catch (e) {}
+        }
+      }
+    } catch (e) {}
+
+    // 2) explicit tokenTransfers/nativeTransfers arrays (Helius parse-history)
+    try {
+      const tts = v?.tokenTransfers || v?.meta?.tokenTransfers || null;
+      if (Array.isArray(tts) && tts.length) {
+        for (const tt of tts) {
+          try {
+            if (!tt) continue;
+            if (tt.mint && String(tt.mint) === String(evt.mint)) {
+              // any non-zero transfer indicates activity
+              const amt = Number(tt.amount ?? tt.tokenAmount ?? tt.uiAmount ?? 0) || 0;
+              if (amt > 0) return true;
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+
+    // 3) innerInstructions / parsed instructions looking for initializeMint / mintTo / transfer
+    try {
+      const inner = v?.meta?.innerInstructions || null;
+      if (Array.isArray(inner) && inner.length) {
+        for (const block of inner) {
+          if (!block || !Array.isArray(block.instructions)) continue;
+          for (const ins of block.instructions) {
+            try {
+              if (ins.parsed && typeof ins.parsed === 'object') {
+                const info = ins.parsed.info || ins.parsed;
+                const rawType = (ins.parsed.type || '').toString().toLowerCase();
+                if (/initializemint|mintto|transfer|create_metadata|create_metadata_account/.test(rawType)) return true;
+                if (info && info.mint && String(info.mint) === String(evt.mint)) return true;
+                if (info && info.postTokenBalances && Array.isArray(info.postTokenBalances)) {
+                  for (const b of info.postTokenBalances) { try { if (b && b.mint && String(b.mint) === String(evt.mint)) return true; } catch (e) {} }
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 4) top-level transaction.message.instructions parsed forms
+    try {
+      const instrs = v?.transaction?.message?.instructions || null;
+      if (Array.isArray(instrs) && instrs.length) {
+        for (const ins of instrs) {
+          try {
+            if (ins.parsed && typeof ins.parsed === 'object') {
+              const info = ins.parsed.info || ins.parsed;
+              const rawType = (ins.parsed.type || '').toString().toLowerCase();
+              if (/initializemint|mintto|transfer|create_metadata|create_metadata_account/.test(rawType)) return true;
+              if (info && info.mint && String(info.mint) === String(evt.mint)) return true;
+            }
+            // accounts list may contain the mint
+            if (ins.accounts && Array.isArray(ins.accounts)) {
+              for (const a of ins.accounts) { try { if (a && String(a) === String(evt.mint)) return true; } catch (e) {} }
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+
+    // 5) logs containing create_metadata / initialize_mint or explicit mint mention
+    try {
+      const logs = [] as string[];
+      if (Array.isArray(v?.logs)) logs.push(...v.logs.filter((x:any)=>typeof x==='string'));
+      if (Array.isArray(v?.meta?.logMessages)) logs.push(...v.meta.logMessages.filter((x:any)=>typeof x==='string'));
+      for (const ln of logs) {
+        try {
+          const low = (ln || '').toLowerCase();
+          if (low.includes('create_metadata') || low.includes('initialize_mint') || low.includes('mint_to') || low.includes('create_metadata_account')) return true;
+          // if log contains mint address specifically
+          const m = (ln || '').match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
+          if (m && m.length && m[0] === String(evt.mint)) return true;
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    return false;
+  } catch (e) { return false; }
 }
 
 // Helper to expose recent events without keeping the instance around
