@@ -7,7 +7,7 @@ if (typeof globalThis.fetch === 'function') {
   fetchFn = nf.default || nf;
 }
 
-const ENDPOINT = process.env.DEXSCREENER_API_ENDPOINT || 'https://api.dexscreener.com/token-boosts/latest/v1';
+const ENDPOINT = process.env.DEXSCREENER_API_ENDPOINT || 'https://api.dexscreener.com/token/latest/v1';
 
 
 const readline = require('readline');

@@ -68,6 +68,8 @@ const _quickCheckCache: Map<string, { isTraded?: boolean; isYoung?: boolean; ts:
 const QUICK_CHECK_TTL_S = Number(process.env.HELIUS_QUICK_CHECK_TTL_S ?? 600); // 10 minutes default
 // per-mint dedupe window to ignore repeated events (seconds)
 const HELIUS_MINT_DEDUPE_S = Number(process.env.HELIUS_MINT_DEDUPE_S ?? 60);
+// Measurement mode: relax dedupe and force extra quick checks when enabled
+const HELIUS_MEASURE_MODE = String(process.env.HELIUS_MEASURE_MODE || 'false').toLowerCase() === 'true';
 const _recentAccepted: Map<string, number> = new Map();
 
 // Simple HTTP GET with retry/backoff for transient errors (used for quick checks)
@@ -546,76 +548,100 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
           let blockTimeReason: string | null = null;
           let quickDebug: Record<string, any> | null = null;
           if (slot) {
+            // 1) Cache-only fast lookup (no RPCs)
             try {
-              // First do a cache-only fast lookup (must not perform RPCs)
-        if (_getCachedBlockTimeForSlot) {
+              if (_getCachedBlockTimeForSlot) {
                 const start = Date.now();
                 const cached = await _getCachedBlockTimeForSlot(Number(slot)).catch(() => null);
                 const elapsed = Date.now() - start;
                 if (cached || cached === 0) {
                   blockTime = cached;
                   blockTimeReason = 'cache-hit';
-          _heliusListenerStats.cacheHit = (_heliusListenerStats.cacheHit || 0) + 1;
-          (quickDebug as any) ??= {};
-          (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsed };
+                  _heliusListenerStats.cacheHit = (_heliusListenerStats.cacheHit || 0) + 1;
+                  quickDebug ??= {};
+                  (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsed };
                 } else {
                   blockTimeReason = 'cache-miss';
-          _heliusListenerStats.cacheMiss = (_heliusListenerStats.cacheMiss || 0) + 1;
-          (quickDebug as any) ??= {};
-          (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsed };
-                }
-              }
-
-              // If cache missed, launch a background resolution using the full helper
-              // and emit a follow-up single-line JSON when it resolves (best-effort).
-              if ((blockTime === null || blockTime === undefined) && _getBlockTimeForSlotCached) {
-                // Avoid scheduling duplicate background resolutions for the same slot.
-                const slotNum = Number(slot);
-                if (!_backgroundSlotLookupsInFlight.has(slotNum)) {
-                  _backgroundSlotLookupsInFlight.add(slotNum);
-                  _heliusListenerStats.bgInFlight = (_heliusListenerStats.bgInFlight || 0) + 1;
-                  // schedule but don't await
-                  (async () => {
-                    try {
-                      const start2 = Date.now();
-                      const bt = await _getBlockTimeForSlotCached(slotNum);
-                      const elapsed2 = Date.now() - start2;
-                      if (bt || bt === 0) {
-                        _heliusListenerStats.bgResolved = (_heliusListenerStats.bgResolved || 0) + 1;
-                        // emit follow-up JSON indicating resolved blockTime
-                        const follow = {
-                          mint: evt.mint || null,
-                          eventType: evt.eventType || null,
-                          detectedAt: evt.detectedAt || null,
-                          slot: slotNum,
-                          signature: sig,
-                          blockTime: bt,
-                          score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
-                          _diag: { blockTimeDiag: { reason: 'background-resolved', elapsedMs: elapsed2 } }
-                        };
-                        try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime=', bt, 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
-                        if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
-                      } else {
-                        _heliusListenerStats.bgNull = (_heliusListenerStats.bgNull || 0) + 1;
-                        // optionally emit that background resolution returned null
-                        const follow = { mint: evt.mint || null, slot: slotNum, blockTime: null, _diag: { blockTimeDiag: { reason: 'background-null', elapsedMs: elapsed2 } } };
-                        try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime= null', 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
-                        if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
-                      }
-                    } catch (e) {
-                      // background resolution failed; emit nothing (best-effort)
-                    } finally {
-            try { _backgroundSlotLookupsInFlight.delete(slotNum); } catch (e) {}
-            try { _heliusListenerStats.bgInFlight = Math.max(0, (_heliusListenerStats.bgInFlight || 1) - 1); } catch (e) {}
-                    }
-                  })();
-                } else {
-          // already resolving this slot in background; skip duplicate work
-          _heliusListenerStats.bgSkippedDueToDedupe = (_heliusListenerStats.bgSkippedDueToDedupe || 0) + 1;
+                  _heliusListenerStats.cacheMiss = (_heliusListenerStats.cacheMiss || 0) + 1;
+                  quickDebug ??= {};
+                  (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsed };
                 }
               }
             } catch (e) {
               blockTime = null; blockTimeReason = 'exception';
+            }
+
+            // 2) Optional short synchronous resolution (race with timeout)
+            try {
+              const ALLOW_SYNC = String(process.env.HELIUS_QUICK_SYNC_BLOCKTIME ?? 'true').toLowerCase() !== 'false';
+              const SYNC_TIMEOUT_MS = Number(process.env.HELIUS_QUICK_SYNC_TIMEOUT_MS ?? 1200);
+              if ((blockTime === null || blockTime === undefined) && _getBlockTimeForSlotCached && ALLOW_SYNC) {
+                try {
+                  const startSync = Date.now();
+                  const wrapped = await Promise.race([
+                    _getBlockTimeForSlotCached(Number(slot)).catch(() => null),
+                    new Promise(resolve => setTimeout(() => resolve(null), SYNC_TIMEOUT_MS))
+                  ]) as any;
+                  const elapsedSync = Date.now() - startSync;
+                  if (wrapped || wrapped === 0) {
+                    blockTime = wrapped;
+                    blockTimeReason = 'sync-resolved';
+                    _heliusListenerStats.bgResolved = (_heliusListenerStats.bgResolved || 0) + 1;
+                    quickDebug ??= {};
+                    (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, elapsedMs: elapsedSync };
+                  } else {
+                    // leave reason as cache-miss and fall through to background resolution
+                    blockTimeReason = 'cache-miss';
+                  }
+                } catch (e) {
+                  blockTimeReason = 'exception';
+                }
+              }
+            } catch (e) {
+              /* ignore */
+            }
+
+            // 3) If still unresolved, schedule a background resolution (best-effort)
+            if ((blockTime === null || blockTime === undefined) && _getBlockTimeForSlotCached) {
+              const slotNum = Number(slot);
+              if (!_backgroundSlotLookupsInFlight.has(slotNum)) {
+                _backgroundSlotLookupsInFlight.add(slotNum);
+                _heliusListenerStats.bgInFlight = (_heliusListenerStats.bgInFlight || 0) + 1;
+                (async () => {
+                  try {
+                    const start2 = Date.now();
+                    const bt = await _getBlockTimeForSlotCached(slotNum);
+                    const elapsed2 = Date.now() - start2;
+                    if (bt || bt === 0) {
+                      _heliusListenerStats.bgResolved = (_heliusListenerStats.bgResolved || 0) + 1;
+                      const follow = {
+                        mint: evt.mint || null,
+                        eventType: evt.eventType || null,
+                        detectedAt: evt.detectedAt || null,
+                        slot: slotNum,
+                        signature: sig,
+                        blockTime: bt,
+                        score: (typeof score === 'number' && !Number.isNaN(score)) ? Number(score.toFixed ? score.toFixed(3) : score) : null,
+                        _diag: { blockTimeDiag: { reason: 'background-resolved', elapsedMs: elapsed2 } }
+                      };
+                      try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime=', bt, 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
+                      if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                    } else {
+                      _heliusListenerStats.bgNull = (_heliusListenerStats.bgNull || 0) + 1;
+                      const follow = { mint: evt.mint || null, slot: slotNum, blockTime: null, _diag: { blockTimeDiag: { reason: 'background-null', elapsedMs: elapsed2 } } };
+                      try { if (VERBOSE) console.log('helius_quick_enrich_followup:', evt.mint || '(no-mint)', 'slot=', slotNum, 'blockTime= null', 'diag=', JSON.stringify((follow as any)._diag)); } catch {}
+                      if (VERBOSE) console.log(JSON.stringify({ helius_quick_enrich_followup: follow }));
+                    }
+                  } catch (e) {
+                    // background resolution failed; best-effort
+                  } finally {
+                    try { _backgroundSlotLookupsInFlight.delete(slotNum); } catch (e) {}
+                    try { _heliusListenerStats.bgInFlight = Math.max(0, (_heliusListenerStats.bgInFlight || 1) - 1); } catch (e) {}
+                  }
+                })();
+              } else {
+                _heliusListenerStats.bgSkippedDueToDedupe = (_heliusListenerStats.bgSkippedDueToDedupe || 0) + 1;
+              }
             }
           }
 
@@ -660,12 +686,47 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
           } catch (e) {}
           // include optional debug diagnostics
           try { if (!(quickDebug as any)) quickDebug = {}; if (Object.keys((quickDebug as any)).length) (quick as any)._diag = quickDebug; } catch {}
-          // enforce per-mint dedupe: avoid emitting same mint within HELIUS_MINT_DEDUPE_S window
+          // If blockTime is missing, attempt a short on-chain first-tx lookup to improve accuracy
+          try {
+            if ((!blockTime && blockTime !== 0) && typeof evt.mint === 'string' && evt.mint.length) {
+              try {
+                const tu = require('./utils/tokenUtils');
+                // small timeout so we don't block too long on quick-path
+                const quickTs = await tu.getFirstOnchainTimestamp(evt.mint, { timeoutMs: Number(process.env.HELIUS_QUICK_ONCHAIN_TIMEOUT_MS ?? 900) }).catch(() => ({ ts: null }));
+                if (quickTs && quickTs.ts) {
+                  blockTime = quickTs.ts;
+                  blockTimeReason = 'first-onchain-quick';
+                  (quickDebug as any) ??= {};
+                  (quickDebug as any).blockTimeDiag = { reason: blockTimeReason, source: quickTs.source || 'onchain', elapsedMs: null };
+                }
+              } catch (e) {}
+            }
+          } catch (e) {}
+
+          // enforce per-mint dedupe: avoid emitting same mint within effective window
           try {
             const k = String(evt.mint || '').toLowerCase();
             const last = _recentAccepted.get(k);
             const nowSec = Math.floor(Date.now()/1000);
-            if (!last || (nowSec - last) > HELIUS_MINT_DEDUPE_S) {
+            const effectiveDedupe = HELIUS_MEASURE_MODE ? Number(process.env.HELIUS_MEASURE_DEDUPE_S ?? 5) : HELIUS_MINT_DEDUPE_S;
+
+            // If still no blockTime, require quickIsTraded & quickIsMintYoung (best-effort) to avoid old references
+            if ((!blockTime && blockTime !== 0)) {
+              try {
+                let isTraded = false;
+                let isYoung = false;
+                try { if (String(evt.mint || '').trim()) isTraded = await quickIsTraded(String(evt.mint).trim()); } catch (e) { isTraded = false; }
+                try { isYoung = await quickIsMintYoung(evt.mint); } catch (e) { isYoung = false; }
+                if (!(isTraded && isYoung)) {
+                  // skip noisy/old reference
+                  _heliusListenerStats.skippedLowConfidence = (_heliusListenerStats.skippedLowConfidence || 0) + 1;
+                  try { if ((_heliusListenerStats.skippedLowConfidence || 0) % 50 === 1) console.log('Skipping quick-enrich: missing blockTime and not traded/young', evt.mint || '(no-mint)'); } catch (e) {}
+                  throw new Error('skip-quiet-older');
+                }
+              } catch (e) { throw e; }
+            }
+
+            if (!last || (nowSec - last) > effectiveDedupe) {
               // record acceptance timestamp
               try { _recentAccepted.set(k, nowSec); } catch (e) {}
               const diagShort = (quick as any)._diag ? `diag=${JSON.stringify((quick as any)._diag)}` : '';

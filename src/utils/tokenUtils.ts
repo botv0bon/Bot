@@ -129,6 +129,7 @@ const FIELD_MAP: Record<string, string[]> = {
 };
 
 const missingFieldsLog: Set<string> = new Set();
+const MAX_MISSING_FIELDS = Number(process.env.MAX_MISSING_FIELDS_LOG || 200);
 
 // Simple in-memory cache for first-tx timestamps to reduce repeat RPC/HTTP calls
 const firstTxCache: Map<string, { ts: number; expiresAt: number }> = new Map();
@@ -197,7 +198,11 @@ export function getField(token: any, ...fields: string[]): any {
       if (mf in token && !EMPTY_VALUES.includes(token[mf])) return extractNumeric(token[mf], token[mf]);
     }
   }
-  if (fields.length > 0) missingFieldsLog.add(fields[0]);
+  if (fields.length > 0) {
+    try {
+      if (missingFieldsLog.size < MAX_MISSING_FIELDS) missingFieldsLog.add(fields[0]);
+    } catch (e) {}
+  }
   return undefined;
 }
 
