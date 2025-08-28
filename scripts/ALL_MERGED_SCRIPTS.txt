@@ -1,24 +1,16 @@
 #!/usr/bin/env node
-// Single-file Helius WS listener for the 11 known AMM/DEX program IDs.
-// - Dynamically reloads the program list every 7s from a file (`scripts/known_amm_program_ids.txt`) if present,
-//   otherwise uses `KNOWN_AMM_PROGRAM_IDS` env var (comma-separated).
-// - Subscribes to logsSubscribe for each program via Helius WebSocket and prints per-protocol traced events.
-// - Default run duration: 60s (override with LISTEN_RUN_MS).
-// Usage: LISTEN_RUN_MS=60000 node scripts/ALL_MERGED_SCRIPTS.txt
-
-const fs = require('fs');
-const path = require('path');
-const WebSocket = require('ws');
+// Clean test harness: query Helius RPC for latest creation/pool events per program.
+// Loads `.env` so you can set HELIUS_RPC_URL or HELIUS_API_KEY there.
+require('dotenv').config();
 const axios = require('axios');
-// load .env so process.env values are available
-try { require('dotenv').config({ path: path.join(process.cwd(), '.env') }); } catch (e) {}
 
-const RUN_MS = Number(process.env.LISTEN_RUN_MS || 60000); // 1 minute default
-const RELOAD_MS = Number(process.env.PROTOCOL_RULES_RELOAD_MS || 7000); // reload program list every 7s
-const PROG_FILE = path.join(process.cwd(), 'scripts', 'known_amm_program_ids.txt');
+const HELIUS_RPC = process.env.HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL || 'https://mainnet.helius-rpc.com/';
+const HELIUS_KEY = process.env.HELIUS_API_KEY || process.env.HELIUS_KEY || '';
+// Increase defaults for deeper inspection. Can still be overridden via .env
+const LIMIT_SIGNATURES = Number(process.env.LIMIT_SIGNATURES || 1000);
+const PER_PROGRAM_MAX = Number(process.env.PER_PROGRAM_MAX || 10);
 
-// Built-in fallback list (the 11 programs). Lowercased for comparisons.
-const FALLBACK_PROGRAMS = [
+const PROGRAMS = [
   '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
@@ -30,179 +22,131 @@ const FALLBACK_PROGRAMS = [
   'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
   '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp',
   'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu'
-].map(s=>String(s).trim());
+];
 
-// Simple protocol map for tracing
-const PROTOCOL_MAP = {
-  '9xqewvg816bux9epjhmat23yvvm2zwbrrpzb9pusvfin': 'raydium-like',
-  'whirlbmiicvdio4qvufm5kag6ct8vwpyzgff3uctycc': 'orca-like',
-  'tokenkegqfezyinwajnbbgkpfxcwubvf9ss623vq5da': 'spl-token',
-  'memosq4gqabaxkb96qnh8tysncwxmywcqxgdlgmfchr': 'memo',
-  'metaqbxxuerdq28cj1rbawkyqm3ybzjb6a8bt518x1s': 'metaplex-metadata',
-  '11111111111111111111111111111111': 'system',
-  'pammbay6oceh9fjkbrhgp5d4bd4swpmswmn52fmfxea': 'pamm-like',
-  'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4': 'jupiter-router',
-  'cammczo5yl8w4vff8kvhrk22ggusp5vtaw7grrkgrwqk': 'camm-like',
-  '9h6tua7jklhdm3w8bvgptn5lznu7g4zyndmcinn3q6rp': 'unknown-9H6tua',
-  'perphjgbqrharx4dysjwm6ujhir3swaatqfdbs2qqju': 'perp-like'
-};
+// Global RPC stats and simple throttle to avoid bursts
+const RPC_STATS = { calls: 0, successes: 0, failures: 0, retries: 0 };
+let _lastRpcTime = 0;
+const MIN_RPC_INTERVAL_MS = Number(process.env.MIN_RPC_INTERVAL_MS || 30);
 
-// runtime state
-// currentPrograms: preserved original-case array used for subscriptions
-let currentPrograms = FALLBACK_PROGRAMS.map(p=>p);
-// lowercase lookup set for comparisons inside incoming messages
-let currentProgramsLower = new Set(FALLBACK_PROGRAMS.map(s=>s.toLowerCase()));
-let ws = null;
-let nextId = 1;
-
-function debug(...args) { try { console.error(new Date().toISOString(), ...args); } catch(e){ console.log(...args); } }
-
-function loadProgramList() {
-  try {
-    if (fs.existsSync(PROG_FILE)) {
-      const txt = fs.readFileSync(PROG_FILE,'utf8');
-      const lines = txt.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).map(l=>l.split('#')[0].trim()).map(l=>l.replace(/,.*/,'').trim());
-      const unique = Array.from(new Set(lines));
-      if (unique.length) {
-        currentPrograms = unique; // preserve original case
-        currentProgramsLower = new Set(unique.map(s=>s.toLowerCase()));
-        debug('Loaded programs from file:', currentPrograms.length);
-        return;
-      }
-    }
-  } catch (e) { debug('Error loading program file', e.message || e); }
-  // fallback to env
-  try {
-    const env = process.env.KNOWN_AMM_PROGRAM_IDS || '';
-    if (env && env.trim()) {
-      const arr = Array.from(new Set(env.split(',').map(s=>s.trim()).filter(Boolean)));
-      if (arr.length) { currentPrograms = arr; currentProgramsLower = new Set(arr.map(s=>s.toLowerCase())); debug('Loaded programs from ENV:', currentPrograms.length); return; }
-    }
-  } catch (e) { debug('Error loading from env', e && e.message || e); }
-  // default
-  currentPrograms = FALLBACK_PROGRAMS.map(s=>s);
-  currentProgramsLower = new Set(FALLBACK_PROGRAMS.map(s=>s.toLowerCase()));
-  debug('Using fallback program list:', currentPrograms.length);
-}
-
-// periodic reload
-loadProgramList();
-setInterval(loadProgramList, RELOAD_MS);
-
-function getHeliusWsUrl() {
-  const envWs = process.env.HELIUS_WEBSOCKET_URL || process.env.HELIUS_WS_URL || '';
-  const HELIUS_RPC = process.env.HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL || process.env.HELIUS_RPC || '';
-  const HELIUS_KEY = process.env.HELIUS_API_KEY || process.env.HELIUS_KEY || '';
-  if (envWs) return envWs.trim();
-  if (!HELIUS_RPC) return '';
-  let wsUrl = HELIUS_RPC.replace(/^http/, 'ws');
-  if (HELIUS_KEY) wsUrl += (wsUrl.includes('?') ? '&' : '?') + 'api-key=' + HELIUS_KEY;
-  return wsUrl.replace(/\s+/g,'');
-}
-
-function startListener() {
-  const url = getHeliusWsUrl();
-  if (!url) { debug('No Helius WS URL configured (set HELIUS_WEBSOCKET_URL or HELIUS_RPC_URL + HELIUS_API_KEY)'); return; }
-  debug('Connecting to Helius WS:', url.replace(/(^https?:\/\/[^/]+)(.*)$/,'$1/...'));
-  ws = new WebSocket(url, { handshakeTimeout: 8000 });
-
-  ws.on('open', () => {
-    debug('WS open; subscribing to programs:', currentPrograms.length);
-    // subscribe each program using mentions filter so Helius only sends relevant logs
-    for (const p of currentPrograms) {
-      try {
-        const params = [{ mentions: [p] }, { commitment: 'finalized' }];
-        const id = nextId++;
-        const msg = { jsonrpc: '2.0', id, method: 'logsSubscribe', params };
-        ws.send(JSON.stringify(msg));
-        debug('Sent logsSubscribe for', p, 'id=', id);
-      } catch (e) { debug('subscribe error for', p, e && e.message || e); }
-    }
-  });
-
-  ws.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(String(raw)); } catch (e) { return; }
+async function heliusRpc(method, params) {
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      // subscription confirmations: log them
-      if (msg.id && (msg.result || msg.error)) {
-        debug('sub response id=', msg.id, 'result=', msg.result ? '[ok]' : '[err]', msg.error ? msg.error : '');
-        return;
+      // throttle
+      const now = Date.now();
+      const since = now - _lastRpcTime;
+      if (since < MIN_RPC_INTERVAL_MS) await new Promise(r => setTimeout(r, MIN_RPC_INTERVAL_MS - since));
+      RPC_STATS.calls++;
+      const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, HELIUS_KEY ? { 'x-api-key': HELIUS_KEY } : {});
+      const res = await axios.post(HELIUS_RPC, body, { headers, timeout: 15000 });
+      _lastRpcTime = Date.now();
+      // treat 429/5xx as retryable
+      const status = res && res.status;
+      if (status === 429 || (status >= 500 && status < 600)) {
+        throw { retryable: true, status, message: res.statusText || 'server_error' };
       }
-      const payload = (msg.params && msg.params.result) || (msg.result && msg.result.value) || msg.result || null;
-      const value = payload && (payload.value || payload) || null;
-      if (!value) return;
-
-      const signature = value.signature || (payload && payload.signature) || null;
-      const slot = value.slot || (payload && payload.context && payload.context.slot) || null;
-      const logs = value.logs || value.logMessages || [];
-      const joined = Array.isArray(logs) ? logs.join('\n').toLowerCase() : '';
-
-  // Identify which of our programs is implicated by inspecting instructions and accountKeys
-  let implicated = [];
-      try {
-        const tx = value.transaction || payload.transaction || null;
-        if (tx && tx.message && Array.isArray(tx.message.instructions)) {
-          for (const instr of tx.message.instructions) {
-            const pid = String(instr.programId || instr.program || '').toLowerCase();
-            if (currentPrograms.includes(pid) && !implicated.includes(pid)) implicated.push(pid);
-            // also check parsed info for program
-            try {
-              const parsedProg = (instr.parsed && instr.parsed.program) || null;
-              if (parsedProg) {
-                const low = String(parsedProg).toLowerCase();
-                if (currentPrograms.includes(low) && !implicated.includes(low)) implicated.push(low);
-              }
-            } catch(e){}
-          }
-        }
-        // fallback: check accountKeys mention in payload
-        try {
-          const keys = value.accountKeys || (tx && tx.message && tx.message.accountKeys) || payload.accounts || [];
-          for (const k of keys || []) {
-            const kk = String((k && (k.pubkey || k)) || k).toLowerCase();
-            if (currentPrograms.includes(kk) && !implicated.includes(kk)) implicated.push(kk);
-          }
-        } catch(e){}
-      } catch (e) { }
-
-      // If nothing implicated, attempt to match logs keywords (best-effort)
-      if (!implicated.length) {
-        for (const p of currentPrograms) {
-          const name = PROTOCOL_MAP[p] || p;
-          // quick keyword heuristics per protocol
-          const keywords = ['swap','addliquidity','mintto','initializemint','create account','initialize account','memo','openposition'];
-          for (const kw of keywords) if (joined.includes(kw)) { implicated.push(p); break; }
-        }
+      RPC_STATS.successes++;
+      return res.data && (res.data.result || res.data);
+    } catch (err) {
+      RPC_STATS.retries += Math.max(0, attempt - 1);
+      // normalize error
+      const status = err && err.response && err.response.status;
+      const msg = (err && err.message) || (err && err.response && err.response.statusText) || String(err);
+      const retryable = (status === 429) || (status >= 500 && status < 600) || (err && (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT')) || (msg && msg.toLowerCase().includes('rate'));
+      if (attempt >= maxAttempts || !retryable) {
+        RPC_STATS.failures++;
+        return { __error: msg, status: status };
       }
-
-      // Build a trace for each implicated program
-      for (const pid of implicated) {
-        const proto = PROTOCOL_MAP[pid] || 'unknown';
-        const sampleLogs = Array.isArray(logs) ? logs.slice(0,6) : [];
-        const out = {
-          ts: new Date().toISOString(),
-          program: pid,
-          protocol: proto,
-          signature: signature,
-          slot: slot,
-          sampleLogs: sampleLogs
-        };
-        try { console.log(JSON.stringify({ helius_program_event: out })); } catch(e){ console.log(out); }
-      }
-    } catch (e) { debug('message handling error', e && e.message || e); }
-  });
-
-  ws.on('error', (err) => { debug('WS error', err && err.message || err); });
-  ws.on('close', (code, reason) => { debug('WS closed', code, reason && reason.toString ? reason.toString() : reason); });
+      // exponential backoff with small jitter
+      const base = 200; // ms
+      const backoff = Math.min(5000, Math.pow(2, attempt) * base) + Math.floor(Math.random() * 200);
+      await new Promise(r => setTimeout(r, backoff));
+      // retry
+    }
+  }
+  RPC_STATS.failures++;
+  return { __error: 'unreachable' };
 }
 
-// start and stop after RUN_MS
-startListener();
-setTimeout(() => {
-  try { if (ws) { ws.terminate(); debug('Terminated listener after', RUN_MS, 'ms'); } } catch (e) {}
-  process.exit(0);
-}, RUN_MS + 500);
+function extractMintsFromTx(tx) {
+  const mints = new Set();
+  try {
+    const meta = tx && (tx.meta || tx.transaction && tx.meta) || {};
+    const post = Array.isArray(meta.postTokenBalances) ? meta.postTokenBalances : [];
+    const pre = Array.isArray(meta.preTokenBalances) ? meta.preTokenBalances : [];
+    for (const b of post.concat(pre)) if (b && b.mint) mints.add(b.mint);
+    const inner = (meta && meta.innerInstructions) || [];
+    for (const block of inner) {
+      const ins = block && block.instructions || [];
+      for (const insItem of ins) {
+        try {
+          const pt = insItem && insItem.parsed && insItem.parsed.info && insItem.parsed.info.postTokenBalances;
+          if (Array.isArray(pt)) for (const b of pt) if (b && b.mint) mints.add(b.mint);
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  return Array.from(mints);
+}
 
-// keep process alive until timeout
-process.stdin.resume();
+function txLooksLikeCreationOrPool(tx) {
+  try {
+    const meta = tx && (tx.meta || tx.transaction && tx.meta) || {};
+    const logMsgs = Array.isArray(meta.logMessages) ? meta.logMessages.join('\n').toLowerCase() : '';
+    const keywords = ['initializemint', 'mintto', 'create account', 'initialize account', 'swap', 'addliquidity', 'initializepool', 'createpool'];
+    for (const k of keywords) if (logMsgs.includes(k)) return true;
+    const msg = tx && (tx.transaction && tx.transaction.message || tx.transaction) || {};
+    const instrs = (msg && msg.instructions) || [];
+    for (const instr of instrs) {
+      const parsedType = (instr && (instr.parsed && instr.parsed.type)) || (instr && instr.type) || '';
+      if (!parsedType) continue;
+      const pt = String(parsedType).toLowerCase();
+      if (pt.includes('initializemint') || pt.includes('mintto') || pt.includes('swap') || pt.includes('addliquidity')) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+async function analyzeProgram(program) {
+  const result = { program, found: [] };
+  const sigs = await heliusRpc('getSignaturesForAddress', [program, { limit: LIMIT_SIGNATURES }]);
+  if (!Array.isArray(sigs)) { result.error = sigs && sigs.__error ? sigs.__error : 'no-sigs'; return result; }
+  for (let i = 0; i < sigs.length && result.found.length < PER_PROGRAM_MAX; i++) {
+    const s = sigs[i];
+    const signature = s && (s.signature || s.txHash || s.signature);
+    if (!signature) continue;
+    const tx = await heliusRpc('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
+    if (!tx || tx.__error) continue;
+    if (!txLooksLikeCreationOrPool(tx)) continue;
+    const mints = extractMintsFromTx(tx);
+    const blockTime = (s && (s.blockTime || s.block_time || s.blocktime)) || (tx && tx.blockTime) || null;
+    const accounts = [];
+    try {
+      const msg = tx && (tx.transaction && tx.transaction.message || tx.transaction) || {};
+      const keys = msg && (msg.accountKeys || msg.message && msg.message.accountKeys) || tx && tx.accountKeys || [];
+      for (const k of keys || []) {
+        const pk = (k && (k.pubkey || k)) || k;
+        if (!pk) continue;
+        accounts.push(pk);
+      }
+    } catch (e) {}
+    result.found.push({ signature, blockTime, mints, accounts, summaryLog: (tx && tx.meta && tx.meta.logMessages && tx.meta.logMessages.slice(0,6)) || [] });
+  }
+  return result;
+}
+
+(async function runAll(){
+  console.error('Starting program analysis for', PROGRAMS.length, 'programs -- limit signatures:', LIMIT_SIGNATURES);
+  const out = [];
+  for (const p of PROGRAMS) {
+    process.stderr.write('Analyzing '+p.slice(0,6)+'... ');
+    try {
+      const r = await analyzeProgram(p);
+      out.push(r);
+      process.stderr.write('done, found='+(r.found && r.found.length||0)+'\n');
+    } catch (e) { process.stderr.write('error\n'); out.push({ program: p, error: String(e) }); }
+  }
+  console.log(JSON.stringify({ generatedAt: new Date().toISOString(), heliusRpc: HELIUS_RPC, results: out }, null, 2));
+})();

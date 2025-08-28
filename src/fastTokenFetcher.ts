@@ -15,6 +15,32 @@ const KNOWN_NON_MINT_ADDRESSES = new Set<string>([
   'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr', // Memo program
   'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s' // Metaplex metadata program
 ]);
+// RULES and DENY set copied from terminal scripts to apply strict per-program filtering
+export const SCRIPTS_RULES: Record<string, { allow: string[] }> = {
+  // More aggressive strictness: default NO 'swap' allowed.
+  default: { allow: ['initialize','pool_creation'] },
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s': { allow: ['initialize'] },
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA': { allow: [] },
+  // Only JUP is allowed to report swaps (router aggregator).
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4': { allow: ['pool_creation','swap'] },
+  // AMM programs: allow pool creation and swaps (trusted)
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA': { allow: ['pool_creation','swap'] },
+  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK': { allow: ['pool_creation','swap'] },
+  // Treat others as quiet / no allowed events unless initialize/pool
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': { allow: ['swap'] },
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr': { allow: ['swap'] },
+  '11111111111111111111111111111111': { allow: ['swap'] },
+  '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin': { allow: ['pool_creation','initialize'] },
+  '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp': { allow: [] },
+  'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu': { allow: ['swap'] }
+};
+
+export const SCRIPTS_DENY: Set<string> = new Set<string>([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  'So11111111111111111111111111111111111111112',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+]);
 import { JUPITER_QUOTE_API, HELIUS_RPC_URL, SOLSCAN_API_URL, HELIUS_PARSE_HISTORY_URL, HELIUS_API_KEY, getHeliusApiKey, getSolscanApiKey } from './config';
 import { getCoinData as getPumpData } from './pump/api';
 import { withTimeout, createLimiter, makeSourceMeta, SourceMeta, getHostLimiter, retryWithBackoff, TTLCache } from './utils/enrichHelpers';
@@ -1021,9 +1047,14 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
   let attempt = 0;
   while (attempt <= retries) {
     try {
+  // RPC_STATS instrumentation
+  try { (globalThis as any).__RPC_STATS = (globalThis as any).__RPC_STATS || { calls: 0, errors: 0, rateLimit429: 0, totalLatencyMs: 0 }; } catch (e) {}
+  const _stats: any = (globalThis as any).__RPC_STATS || null;
       const host = (() => { try { return new URL(heliusUrl).host; } catch { return heliusUrl; } })();
       const limiter = getHostLimiter(host, Number(process.env.HELIUS_CONCURRENCY || 2));
-      const res = await limiter(async () => {
+  const start = Date.now();
+  if (_stats) _stats.calls = (_stats.calls || 0) + 1;
+  const res = await limiter(async () => {
         return await retryWithBackoff(async () => {
           const headers: Record<string, string> = { 'Content-Type': 'application/json' };
           try { const _hk = getHeliusApiKey(); if (_hk) headers['x-api-key'] = _hk; } catch (e) {}
@@ -1033,11 +1064,14 @@ export async function heliusGetSignaturesFast(mint: string, heliusUrl: string, t
           return (wrap.result as any);
         }, { retries: Math.max(0, retries || Number(process.env.HELIUS_RETRIES || 1)), baseMs: 200 });
       });
-      const resData = res as any;
+  const latency = Date.now() - start;
+  try { if (_stats) _stats.totalLatencyMs = (_stats.totalLatencyMs || 0) + latency; } catch (e) {}
+  const resData = res as any;
       if (!resData.data || !resData.data.result) throw new Error('Invalid response');
       return resData.data;
     } catch (e: any) {
       const status = e.response?.status;
+  try { const _stats: any = (globalThis as any).__RPC_STATS || null; if (_stats) { _stats.errors = (_stats.errors || 0) + 1; if (status === 429) _stats.rateLimit429 = (_stats.rateLimit429 || 0) + 1; } } catch (ee) {}
       // If 429 or 5xx, consider retrying
   if (status && (status === 429 || (status >= 500 && status < 600)) && attempt < retries) {
         const backoff = 200 * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
@@ -1065,6 +1099,10 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
   let attempt = 0;
   while (attempt <= retries) {
     try {
+  // RPC_STATS instrumentation
+  try { (globalThis as any).__RPC_STATS = (globalThis as any).__RPC_STATS || { calls: 0, errors: 0, rateLimit429: 0, totalLatencyMs: 0 }; } catch (e) {}
+  const _stats: any = (globalThis as any).__RPC_STATS || null;
+  const start = Date.now(); if (_stats) _stats.calls = (_stats.calls || 0) + 1;
       const host = (() => { try { return new URL(heliusUrl).host; } catch { return heliusUrl; } })();
       const limiter = getHostLimiter(host, Number(process.env.HELIUS_CONCURRENCY || 2));
       const resp = await limiter(async () => {
@@ -1077,10 +1115,12 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
           return (wrap.result as any);
         }, { retries: Math.max(0, retries || Number(process.env.HELIUS_RETRIES || 1)), baseMs: 200 });
       });
-      const res = resp as any;
-      return res.data?.result ?? res.data;
+  const latency = Date.now() - start; try { if (_stats) _stats.totalLatencyMs = (_stats.totalLatencyMs || 0) + latency; } catch (e) {}
+  const res = resp as any;
+  return res.data?.result ?? res.data;
     } catch (e: any) {
       const status = e.response?.status;
+  try { const _stats: any = (globalThis as any).__RPC_STATS || null; if (_stats) { _stats.errors = (_stats.errors || 0) + 1; if (status === 429) _stats.rateLimit429 = (_stats.rateLimit429 || 0) + 1; } } catch (ee) {}
       // handle 429/5xx with cooldown/backoff
       if (status && (status === 429 || (status >= 500 && status < 600))) {
         // record in global host cooldowns
@@ -1104,6 +1144,78 @@ async function heliusRpc(method: string, params: any[] = [], timeout = 4000, ret
     }
   }
   return { __error: 'unknown' };
+}
+
+// Helper: check whether a mint has been seen previously according to Helius signature history
+export async function mintPreviouslySeen(mint: string, txBlockTime: number | null, currentSig?: string): Promise<boolean | null> {
+  try {
+    if (!mint) return null;
+    const heliusUrl = process.env.HELIUS_FAST_RPC_URL || HELIUS_RPC_URL;
+    if (!heliusUrl) return null;
+    // Check Redis-first for a short-lived seen flag to avoid repeated heavy signature queries
+    try {
+      const rc = await getRedisClient().catch(() => null);
+      if (rc) {
+        const key = `mint_seen:${String(mint).toLowerCase()}`;
+        try {
+          const v = await rc.get(key).catch(() => null);
+          if (v) return true;
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    const lookback = Number(process.env.HELIUS_MINT_PREV_LOOKBACK || 20);
+    const res = await heliusGetSignaturesFast(mint, heliusUrl, 4000, 0).catch(() => null);
+    if (!res) return null;
+    const arr = Array.isArray(res) ? res : (res?.result ?? res) || [];
+    if (!Array.isArray(arr) || arr.length === 0) return false;
+    // If multiple signatures exist and the list contains signatures other than currentSig,
+    // consider the mint previously seen. Use lookback to bound our decision.
+    const sigs = arr.slice(0, lookback).map((x: any) => x?.signature || x?.txHash || x?.tx_hash).filter(Boolean);
+    if (!sigs.length) return null;
+    // If currentSig is provided and matches the newest signature, but there are older signatures => previously seen
+    if (currentSig) {
+      for (const s of sigs) {
+        if (s && s !== currentSig) return true;
+      }
+      // only signature encountered equals currentSig
+      return false;
+    }
+    // No currentSig provided: if more than 1 signature exists assume seen
+    return sigs.length > 1;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Helper: inspect parsed instructions and check whether they reference the mint string
+function instructionReferencesMint(instrs: any[], mint: string): boolean {
+  try {
+    if (!instrs || !Array.isArray(instrs) || !mint) return false;
+    const norm = String(mint).toLowerCase();
+    for (const ins of instrs) {
+      try {
+        // check common parsed fields
+        if (ins && ins.parsed && ins.parsed.info) {
+          // many parsed infos include 'mint' or 'mintAddress' or tokenAccount fields
+          const infos = JSON.stringify(ins.parsed.info || {}) || '';
+          if (infos.toLowerCase().includes(norm)) return true;
+        }
+        // check account keys / program accounts
+        if (ins && ins.accounts && Array.isArray(ins.accounts)) {
+          for (const a of ins.accounts) if (String(a || '').toLowerCase().includes(norm)) return true;
+        }
+        // raw instruction data may include base58 or mint references in 'programId' or 'data'
+        if (ins && ins.programId && String(ins.programId).toLowerCase().includes(norm)) return true;
+        if (ins && ins.data && String(ins.data).toLowerCase().includes(norm)) return true;
+        // innerInstructions wrapper (older parsed shapes)
+        if (ins && ins.inner && Array.isArray(ins.inner)) {
+          if (instructionReferencesMint(ins.inner, mint)) return true;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return false;
 }
 
 async function getParsedTransaction(signature: string) {
@@ -1436,7 +1548,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
         const oldestToCheck = 20; // keep small to bound RPC
         const arrOldest = Array.isArray(arr) ? arr.slice(-oldestToCheck) : [];
         let found = false;
-        for (let i = 0; i < arrOldest.length; i++) {
+    for (let i = 0; i < arrOldest.length; i++) {
           const entry = arrOldest[i];
           const sig = entry?.signature || (entry as any)?.txHash || (entry as any)?.tx_hash || null;
           if (!sig) continue;
@@ -1445,10 +1557,12 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
             const p = parsed && (parsed.result || parsed) ? (parsed.result || parsed) : parsed;
             const pbt = p?.blockTime ?? p?.block_time ?? p?.blocktime ?? null;
             // Inspect instructions for mint/metadata creation hints
-            const instrs = (p?.transaction?.message?.instructions) || (p?.meta?.innerInstructions && Array.isArray(p.meta.innerInstructions) ? p.meta.innerInstructions.flatMap((x:any)=>x.instructions) : null) || [];
-            const rawInstrs = JSON.stringify(instrs || '');
-            const isMintish = /initializeMint|mintTo|CreateMetadataAccount|create_metadata_accounts|create_metadata_accounts_v2|create_metadata_account/i.test(rawInstrs);
-            if (isMintish && pbt) {
+      const instrs = (p?.transaction?.message?.instructions) || (p?.meta?.innerInstructions && Array.isArray(p.meta.innerInstructions) ? p.meta.innerInstructions.flatMap((x:any)=>x.instructions) : null) || [];
+      const rawInstrs = JSON.stringify(instrs || '');
+      const isMintish = /initializeMint|mintTo|CreateMetadataAccount|create_metadata_accounts|create_metadata_accounts_v2|create_metadata_account/i.test(rawInstrs);
+      // ensure parsed instructions actually reference the mint address to avoid later-swap false positives
+      const refsMint = instructionReferencesMint(instrs || [], mint);
+      if (isMintish && refsMint && pbt) {
               const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
               earliestBlockTime = pnum;
               firstSignature = sig;
@@ -1510,7 +1624,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
           const deepArr = Array.isArray(deepRes) ? deepRes : (deepRes?.result ?? deepRes) || [];
           if (Array.isArray(deepArr) && deepArr.length) {
             const arrOldestDeep = deepArr.slice(-Math.min(oldestToCheckDeep, deepArr.length));
-            for (let i = 0; i < arrOldestDeep.length; i++) {
+      for (let i = 0; i < arrOldestDeep.length; i++) {
               const entry = arrOldestDeep[i];
               const sig = entry?.signature || entry?.txHash || entry?.tx_hash || null;
               if (!sig) continue;
@@ -1519,9 +1633,10 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
                 const p = parsed && (parsed.result || parsed) ? (parsed.result || parsed) : parsed;
                 const pbt = p?.blockTime ?? p?.block_time ?? p?.blocktime ?? null;
                 const instrs = (p?.transaction?.message?.instructions) || (p?.meta?.innerInstructions && Array.isArray(p.meta.innerInstructions) ? p.meta.innerInstructions.flatMap((x:any)=>x.instructions) : null) || [];
-                const rawInstrs = JSON.stringify(instrs || '');
-                const isMintish = /initializeMint|mintTo|CreateMetadataAccount|create_metadata_accounts|create_metadata_accounts_v2|create_metadata_account/i.test(rawInstrs);
-                if (isMintish && pbt) {
+        const rawInstrs = JSON.stringify(instrs || '');
+        const isMintish = /initializeMint|mintTo|CreateMetadataAccount|create_metadata_accounts|create_metadata_accounts_v2|create_metadata_account/i.test(rawInstrs);
+        const refsMint = instructionReferencesMint(instrs || [], mint);
+        if (isMintish && refsMint && pbt) {
                   const pnum = Number(pbt > 1e12 ? Math.floor(pbt / 1000) : pbt);
                   if (!earliestBlockTime || pnum < earliestBlockTime) {
                     earliestBlockTime = pnum;
@@ -1616,6 +1731,17 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     const detectedAtSec = (mintOrObj as any)?.detectedAtSec ?? Math.floor(Date.now() / 1000);
     const detection = { mint, firstBlockTime: earliestBlockTime, ageSeconds, metadataExists, supply, firstSignature, detectedAtSec };
 
+    // If this mint appears previously in history, skip notifying users to avoid duplicates
+    try {
+      const prev = await mintPreviouslySeen(mint, earliestBlockTime, firstSignature).catch(() => null);
+      if (prev === true) {
+        console.log(`[handleNewMintEvent] skipping ${mint} because previously seen`);
+        // still return detection info but do not notify
+        if (validated) console.log(`ValidatedNewMint (skipped-notify): ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
+        return detection;
+      }
+    } catch (e) {}
+
     if (validated && users && telegram) {
       for (const uid of Object.keys(users)) {
         try {
@@ -1655,6 +1781,15 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
     // log and return detection
     if (validated) console.log(`ValidatedNewMint: ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
     else console.log(`CandidateMint (unvalidated): ${mint} firstBlockTime=${earliestBlockTime} ageSeconds=${ageSeconds} metadata=${metadataExists} supply=${supply}`);
+    // mark Redis seen flag for short-term dedupe to avoid re-notifying rapidly
+    try {
+      const rc = await getRedisClient().catch(() => null);
+      if (rc) {
+        const key = `mint_seen:${String(mint).toLowerCase()}`;
+        const ttl = Math.max(5, Math.floor(Number(process.env.MINT_SEEN_TTL_SEC || 60)));
+        try { await rc.setEx(key, ttl, '1').catch(() => {}); } catch (e) {}
+      }
+    } catch (e) {}
     return detection;
   } catch (e) {
     return null;
