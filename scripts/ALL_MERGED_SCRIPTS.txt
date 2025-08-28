@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+// Single-file Helius WS listener for the 11 known AMM/DEX program IDs.
+// - Dynamically reloads the program list every 7s from a file (`scripts/known_amm_program_ids.txt`) if present,
+//   otherwise uses `KNOWN_AMM_PROGRAM_IDS` env var (comma-separated).
+// - Subscribes to logsSubscribe for each program via Helius WebSocket and prints per-protocol traced events.
+// - Default run duration: 60s (override with LISTEN_RUN_MS).
+// Usage: LISTEN_RUN_MS=60000 node scripts/ALL_MERGED_SCRIPTS.txt
+
+const fs = require('fs');
+const path = require('path');
+const WebSocket = require('ws');
+const axios = require('axios');
+// load .env so process.env values are available
+try { require('dotenv').config({ path: path.join(process.cwd(), '.env') }); } catch (e) {}
+
+const RUN_MS = Number(process.env.LISTEN_RUN_MS || 60000); // 1 minute default
+const RELOAD_MS = Number(process.env.PROTOCOL_RULES_RELOAD_MS || 7000); // reload program list every 7s
+const PROG_FILE = path.join(process.cwd(), 'scripts', 'known_amm_program_ids.txt');
+
+// Built-in fallback list (the 11 programs). Lowercased for comparisons.
+const FALLBACK_PROGRAMS = [
+  '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  '11111111111111111111111111111111',
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
+  '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp',
+  'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu'
+].map(s=>String(s).trim());
+
+// Simple protocol map for tracing
+const PROTOCOL_MAP = {
+  '9xqewvg816bux9epjhmat23yvvm2zwbrrpzb9pusvfin': 'raydium-like',
+  'whirlbmiicvdio4qvufm5kag6ct8vwpyzgff3uctycc': 'orca-like',
+  'tokenkegqfezyinwajnbbgkpfxcwubvf9ss623vq5da': 'spl-token',
+  'memosq4gqabaxkb96qnh8tysncwxmywcqxgdlgmfchr': 'memo',
+  'metaqbxxuerdq28cj1rbawkyqm3ybzjb6a8bt518x1s': 'metaplex-metadata',
+  '11111111111111111111111111111111': 'system',
+  'pammbay6oceh9fjkbrhgp5d4bd4swpmswmn52fmfxea': 'pamm-like',
+  'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4': 'jupiter-router',
+  'cammczo5yl8w4vff8kvhrk22ggusp5vtaw7grrkgrwqk': 'camm-like',
+  '9h6tua7jklhdm3w8bvgptn5lznu7g4zyndmcinn3q6rp': 'unknown-9H6tua',
+  'perphjgbqrharx4dysjwm6ujhir3swaatqfdbs2qqju': 'perp-like'
+};
+
+// runtime state
+// currentPrograms: preserved original-case array used for subscriptions
+let currentPrograms = FALLBACK_PROGRAMS.map(p=>p);
+// lowercase lookup set for comparisons inside incoming messages
+let currentProgramsLower = new Set(FALLBACK_PROGRAMS.map(s=>s.toLowerCase()));
+let ws = null;
+let nextId = 1;
+
+function debug(...args) { try { console.error(new Date().toISOString(), ...args); } catch(e){ console.log(...args); } }
+
+function loadProgramList() {
+  try {
+    if (fs.existsSync(PROG_FILE)) {
+      const txt = fs.readFileSync(PROG_FILE,'utf8');
+      const lines = txt.split(/\r?\n/).map(l=>l.trim()).filter(Boolean).map(l=>l.split('#')[0].trim()).map(l=>l.replace(/,.*/,'').trim());
+      const unique = Array.from(new Set(lines));
+      if (unique.length) {
+        currentPrograms = unique; // preserve original case
+        currentProgramsLower = new Set(unique.map(s=>s.toLowerCase()));
+        debug('Loaded programs from file:', currentPrograms.length);
+        return;
+      }
+    }
+  } catch (e) { debug('Error loading program file', e.message || e); }
+  // fallback to env
+  try {
+    const env = process.env.KNOWN_AMM_PROGRAM_IDS || '';
+    if (env && env.trim()) {
+      const arr = Array.from(new Set(env.split(',').map(s=>s.trim()).filter(Boolean)));
+      if (arr.length) { currentPrograms = arr; currentProgramsLower = new Set(arr.map(s=>s.toLowerCase())); debug('Loaded programs from ENV:', currentPrograms.length); return; }
+    }
+  } catch (e) { debug('Error loading from env', e && e.message || e); }
+  // default
+  currentPrograms = FALLBACK_PROGRAMS.map(s=>s);
+  currentProgramsLower = new Set(FALLBACK_PROGRAMS.map(s=>s.toLowerCase()));
+  debug('Using fallback program list:', currentPrograms.length);
+}
+
+// periodic reload
+loadProgramList();
+setInterval(loadProgramList, RELOAD_MS);
+
+function getHeliusWsUrl() {
+  const envWs = process.env.HELIUS_WEBSOCKET_URL || process.env.HELIUS_WS_URL || '';
+  const HELIUS_RPC = process.env.HELIUS_RPC_URL || process.env.HELIUS_FAST_RPC_URL || process.env.HELIUS_RPC || '';
+  const HELIUS_KEY = process.env.HELIUS_API_KEY || process.env.HELIUS_KEY || '';
+  if (envWs) return envWs.trim();
+  if (!HELIUS_RPC) return '';
+  let wsUrl = HELIUS_RPC.replace(/^http/, 'ws');
+  if (HELIUS_KEY) wsUrl += (wsUrl.includes('?') ? '&' : '?') + 'api-key=' + HELIUS_KEY;
+  return wsUrl.replace(/\s+/g,'');
+}
+
+function startListener() {
+  const url = getHeliusWsUrl();
+  if (!url) { debug('No Helius WS URL configured (set HELIUS_WEBSOCKET_URL or HELIUS_RPC_URL + HELIUS_API_KEY)'); return; }
+  debug('Connecting to Helius WS:', url.replace(/(^https?:\/\/[^/]+)(.*)$/,'$1/...'));
+  ws = new WebSocket(url, { handshakeTimeout: 8000 });
+
+  ws.on('open', () => {
+    debug('WS open; subscribing to programs:', currentPrograms.length);
+    // subscribe each program using mentions filter so Helius only sends relevant logs
+    for (const p of currentPrograms) {
+      try {
+        const params = [{ mentions: [p] }, { commitment: 'finalized' }];
+        const id = nextId++;
+        const msg = { jsonrpc: '2.0', id, method: 'logsSubscribe', params };
+        ws.send(JSON.stringify(msg));
+        debug('Sent logsSubscribe for', p, 'id=', id);
+      } catch (e) { debug('subscribe error for', p, e && e.message || e); }
+    }
+  });
+
+  ws.on('message', async (raw) => {
+    let msg;
+    try { msg = JSON.parse(String(raw)); } catch (e) { return; }
+    try {
+      // subscription confirmations: log them
+      if (msg.id && (msg.result || msg.error)) {
+        debug('sub response id=', msg.id, 'result=', msg.result ? '[ok]' : '[err]', msg.error ? msg.error : '');
+        return;
+      }
+      const payload = (msg.params && msg.params.result) || (msg.result && msg.result.value) || msg.result || null;
+      const value = payload && (payload.value || payload) || null;
+      if (!value) return;
+
+      const signature = value.signature || (payload && payload.signature) || null;
+      const slot = value.slot || (payload && payload.context && payload.context.slot) || null;
+      const logs = value.logs || value.logMessages || [];
+      const joined = Array.isArray(logs) ? logs.join('\n').toLowerCase() : '';
+
+  // Identify which of our programs is implicated by inspecting instructions and accountKeys
+  let implicated = [];
+      try {
+        const tx = value.transaction || payload.transaction || null;
+        if (tx && tx.message && Array.isArray(tx.message.instructions)) {
+          for (const instr of tx.message.instructions) {
+            const pid = String(instr.programId || instr.program || '').toLowerCase();
+            if (currentPrograms.includes(pid) && !implicated.includes(pid)) implicated.push(pid);
+            // also check parsed info for program
+            try {
+              const parsedProg = (instr.parsed && instr.parsed.program) || null;
+              if (parsedProg) {
+                const low = String(parsedProg).toLowerCase();
+                if (currentPrograms.includes(low) && !implicated.includes(low)) implicated.push(low);
+              }
+            } catch(e){}
+          }
+        }
+        // fallback: check accountKeys mention in payload
+        try {
+          const keys = value.accountKeys || (tx && tx.message && tx.message.accountKeys) || payload.accounts || [];
+          for (const k of keys || []) {
+            const kk = String((k && (k.pubkey || k)) || k).toLowerCase();
+            if (currentPrograms.includes(kk) && !implicated.includes(kk)) implicated.push(kk);
+          }
+        } catch(e){}
+      } catch (e) { }
+
+      // If nothing implicated, attempt to match logs keywords (best-effort)
+      if (!implicated.length) {
+        for (const p of currentPrograms) {
+          const name = PROTOCOL_MAP[p] || p;
+          // quick keyword heuristics per protocol
+          const keywords = ['swap','addliquidity','mintto','initializemint','create account','initialize account','memo','openposition'];
+          for (const kw of keywords) if (joined.includes(kw)) { implicated.push(p); break; }
+        }
+      }
+
+      // Build a trace for each implicated program
+      for (const pid of implicated) {
+        const proto = PROTOCOL_MAP[pid] || 'unknown';
+        const sampleLogs = Array.isArray(logs) ? logs.slice(0,6) : [];
+        const out = {
+          ts: new Date().toISOString(),
+          program: pid,
+          protocol: proto,
+          signature: signature,
+          slot: slot,
+          sampleLogs: sampleLogs
+        };
+        try { console.log(JSON.stringify({ helius_program_event: out })); } catch(e){ console.log(out); }
+      }
+    } catch (e) { debug('message handling error', e && e.message || e); }
+  });
+
+  ws.on('error', (err) => { debug('WS error', err && err.message || err); });
+  ws.on('close', (code, reason) => { debug('WS closed', code, reason && reason.toString ? reason.toString() : reason); });
+}
+
+// start and stop after RUN_MS
+startListener();
+setTimeout(() => {
+  try { if (ws) { ws.terminate(); debug('Terminated listener after', RUN_MS, 'ms'); } } catch (e) {}
+  process.exit(0);
+}, RUN_MS + 500);
+
+// keep process alive until timeout
+process.stdin.resume();

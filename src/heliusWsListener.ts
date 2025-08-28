@@ -56,6 +56,32 @@ const USE_WS = HELIUS_USE_WEBSOCKET;
 const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
 const SUBSCRIBE_SPLTOKEN = HELIUS_SUBSCRIBE_SPLTOKEN;
 
+// Protocol rules dynamic loader (shared with other listeners)
+import * as fs from 'fs';
+import * as path from 'path';
+const PROTOCOL_RULES_PATH = path.join(process.cwd(), 'scripts', 'amm_protocol_rules.json');
+let PROTOCOL_RULES: any = null;
+function loadProtocolRules() {
+  try {
+    if (!fs.existsSync(PROTOCOL_RULES_PATH)) return null;
+    const txt = fs.readFileSync(PROTOCOL_RULES_PATH, 'utf8');
+    const parsed = JSON.parse(txt);
+    // build quick map by lowercased pubkey
+    const map: Record<string, any> = {};
+    for (const p of (parsed.protocols || [])) {
+      if (p && p.pubkey) map[String(p.pubkey).toLowerCase()] = p;
+    }
+    parsed._map = map;
+    PROTOCOL_RULES = parsed;
+    return parsed;
+  } catch (e) { return null; }
+}
+// initial load and periodic reload every 7s
+loadProtocolRules();
+setInterval(() => { try { loadProtocolRules(); } catch (e) {} }, Number(process.env.PROTOCOL_RULES_RELOAD_MS || 7000));
+
+export function getProtocolRules() { return PROTOCOL_RULES; }
+
 // Freshness threshold (seconds) used to prefer very recent events even when
 // base confidence score is low. Tunable via env HELIUS_FRESHNESS_THRESHOLD_S
 const HELIUS_FRESHNESS_THRESHOLD_S = Number(process.env.HELIUS_FRESHNESS_THRESHOLD_S ?? 180);
@@ -393,6 +419,22 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
       try {
         const evt = analyzeHeliusMessage(parsed);
         if (!evt) return;
+        // attach protocol-rule match if available
+        try {
+          const rules = PROTOCOL_RULES && PROTOCOL_RULES._map ? PROTOCOL_RULES._map : null;
+          if (rules && parsed && parsed.params && parsed.params.result && parsed.params.result.value) {
+            const value = parsed.params.result.value;
+            const instrs = (value.transaction && value.transaction.message && value.transaction.message.instructions) || (value.meta && value.meta.innerInstructions) || [];
+            // try to detect a programId from top-level instructions
+            try {
+              const first = Array.isArray(instrs) ? instrs[0] : null;
+              const pid = first && (first.programId || first.program) ? String(first.programId || first.program).toLowerCase() : null;
+              if (pid && rules[pid]) {
+                (evt as any)._protocolRule = rules[pid];
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
         const VERBOSE = !!process.env.HELIUS_VERBOSE;
         // Strict memo policy: reject memo-only detections unless corroborated
         if (evt.eventType === 'memo') {
@@ -938,11 +980,22 @@ function analyzeHeliusMessage(parsed: any) {
         try {
           const v2 = o[k];
           if ((k === 'mint' || k === 'token' || k === 'mintAddress' || k === 'account' || k === 'accounts') && typeof v2 === 'string' && v2.length >= 32 && v2.length <= 44) {
-            // ignore known program IDs
-            if (!HELIUS_KNOWN_PROGRAM_IDS.has(v2)) found.mint = v2;
+            // ignore known program IDs and common system/program accounts
+            const lower = v2.toLowerCase();
+            const deny = new Set(['11111111111111111111111111111111','tokenkegqfezyinwajbnbgkpfxcwubvf9ss623vq5da','memosq4gqabaxkb96qnh8tysncwxmywcqxgdlgmfchr','metaqbxxuerdq28cj1rbawkyqm3ybzjb6a8bt518x1s','so11111111111111111111111111111111111111112']);
+            if (!HELIUS_KNOWN_PROGRAM_IDS.has(v2) && !deny.has(lower)) found.mint = v2;
           }
           if (Array.isArray(v2) && (k === 'accounts' || k === 'accountKeys')) {
-            for (const a of v2) { if (typeof a === 'string' && a.length >= 32 && a.length <= 44 && !HELIUS_KNOWN_PROGRAM_IDS.has(a)) found.mint = found.mint || a; }
+            for (const a of v2) {
+              try {
+                const lower = (typeof a === 'string' ? a.toLowerCase() : '');
+                const deny = new Set(['11111111111111111111111111111111','tokenkegqfezyinwajbnbgkpfxcwubvf9ss623vq5da','memosq4gqabaxkb96qnh8tysncwxmywcqxgdlgmfchr','metaqbxxuerdq28cj1rbawkyqm3ybzjb6a8bt518x1s','so11111111111111111111111111111111111111112']);
+                if (typeof a === 'string' && a.length >= 32 && a.length <= 44 && !HELIUS_KNOWN_PROGRAM_IDS.has(a) && !deny.has(lower)) {
+                  // only set as candidate (not immediate mint) — require corroboration elsewhere
+                  found.candidate = found.candidate || a;
+                }
+              } catch (e) {}
+            }
           }
           // inspect postTokenBalances explicitly
           if (k === 'postTokenBalances' && Array.isArray(v2)) {
@@ -953,11 +1006,14 @@ function analyzeHeliusMessage(parsed: any) {
             const m = v2.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g);
             if (m && m.length) {
               const lower = (parentKey || k || '').toLowerCase();
+              const cand = m[0];
+              const deny = new Set(['11111111111111111111111111111111','tokenkegqfezyinwajbnbgkpfxcwubvf9ss623vq5da','memosq4gqabaxkb96qnh8tysncwxmywcqxgdlgmfchr','metaqbxxuerdq28cj1rbawkyqm3ybzjb6a8bt518x1s','so11111111111111111111111111111111111111112']);
+              if (deny.has(cand.toLowerCase())) continue;
               if (lower.includes('log') || lower.includes('message') || v2.toLowerCase().includes('mint')) {
-                const cand = m[0]; if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) { found.mint = found.mint || cand; found.context = 'log'; }
+                if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) { found.mint = found.mint || cand; found.context = 'log'; }
               } else {
                 // keep as candidate but only accept later if we see corroborating context
-                const cand = m[0]; if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) found.candidate = found.candidate || cand;
+                if (!HELIUS_KNOWN_PROGRAM_IDS.has(cand)) found.candidate = found.candidate || cand;
               }
             }
           }
