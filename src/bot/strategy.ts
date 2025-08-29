@@ -261,12 +261,24 @@ export function getStrategyEnrichMetrics() {
  * Filters a list of tokens based on the user's strategy settings.
  * All comments and variable names are in English for clarity.
  */
-export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, opts?: { preserveSources?: boolean }): Promise<any[]> {
+export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, opts?: { preserveSources?: boolean, fastOnly?: boolean }): Promise<any[]> {
   if (!strategy || !Array.isArray(tokens)) return [];
+  // If the caller passed tokens that look like they originate from the listener
+  // (they contain a sourceProgram field), prefer preserving those sources so
+  // we don't merge arbitrary realtime candidates into the caller-supplied list.
+  try {
+    if (!opts) opts = {};
+    if (opts.preserveSources === undefined && tokens.length > 0) {
+      const allHaveSource = tokens.every(t => t && (t.sourceProgram || t.sourceSignature));
+      if (allHaveSource) opts.preserveSources = true;
+    }
+  } catch (e) {}
   // Integrated enrichment: attempt to enrich tokens with on-chain timestamps and freshness
   // using Helius (RPC/parse/websocket), Solscan and RPC fallbacks. This improves age
   // detection and allows downstream freshness scoring to be used in filters.
-  if (tokens.length > 0) {
+  // If caller requested a fast-only pass, skip merging realtime sources and any enrichment.
+  // If caller passes opts.preserveSources = true, do NOT merge realtime sources
+  if (tokens.length > 0 && !(opts && opts.fastOnly) && !(opts && opts.preserveSources)) {
     try {
       const utils = await import('../utils/tokenUtils');
       // Merge realtime sources (Helius WS buffer, DexScreener top, Helius parse-history) so filters
@@ -298,15 +310,15 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
         try { console.warn('[filterTokensByStrategy] failed to fetch realtime candidates', e && e.message ? e.message : e); } catch {}
       }
 
-    const enrichPromise = utils.enrichTokenTimestamps(tokens, {
-      batchSize: Number(HELIUS_BATCH_SIZE || 6),
-      delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
-    });
-    // Start enrichment in background (non-blocking) so filtering remains responsive.
-    // Log outcome for diagnostics but do not block the caller.
-    enrichPromise
-      .then(() => { try { console.log('[filterTokensByStrategy] background enrichment completed'); } catch (_) {} })
-      .catch((err: any) => { try { console.warn('[filterTokensByStrategy] background enrichment failed:', err && err.message ? err.message : err); } catch (_) {} });
+      const enrichPromise = utils.enrichTokenTimestamps(tokens, {
+        batchSize: Number(HELIUS_BATCH_SIZE || 6),
+        delayMs: Number(HELIUS_BATCH_DELAY_MS || 300)
+      });
+      // Start enrichment in background (non-blocking) so filtering remains responsive.
+      // Log outcome for diagnostics but do not block the caller.
+      enrichPromise
+        .then(() => { try { console.log('[filterTokensByStrategy] background enrichment completed'); } catch (_) {} })
+        .catch((err: any) => { try { console.warn('[filterTokensByStrategy] background enrichment failed:', err && err.message ? err.message : err); } catch (_) {} });
     } catch (e: any) {
       console.warn('[filterTokensByStrategy] enrichment failed or timed out:', e?.message || e);
     }

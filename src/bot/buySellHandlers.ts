@@ -34,7 +34,8 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
           user.history.push(entry);
           saveUsers(users);
         }
-        ctx.reply(`✅ تم شراء الرمز بنجاح!\n<a href='https://solscan.io/tx/${result.tx}'>View Tx</a>`, { parse_mode: 'HTML', disable_web_page_preview: true });
+  // cast options to any to avoid strict typings for telegram options
+  ctx.reply(`✅ تم شراء الرمز بنجاح!\n<a href='https://solscan.io/tx/${result.tx}'>View Tx</a>`, { ...( { parse_mode: 'HTML', disable_web_page_preview: true } as any) });
       } else {
         ctx.reply('❌ فشل الشراء: لم يتم تنفيذ العملية.');
       }
@@ -63,7 +64,7 @@ export function registerBuySellHandlers(bot: any, users: Record<string, any>, bo
           user.history.push(entry);
           saveUsers(users);
         }
-        ctx.reply(`✅ تم بيع الرمز بنجاح!\n<a href='https://solscan.io/tx/${result.tx}'>View Tx</a>`, { parse_mode: 'HTML', disable_web_page_preview: true });
+  ctx.reply(`✅ تم بيع الرمز بنجاح!\n<a href='https://solscan.io/tx/${result.tx}'>View Tx</a>`, { ...( { parse_mode: 'HTML', disable_web_page_preview: true } as any) });
       } else {
         ctx.reply('❌ فشل البيع: لم يتم تنفيذ العملية.');
       }

@@ -119,7 +119,7 @@ export async function startEnrichQueue(telegram: any, users: Record<string, any>
             if (enrichedMap.has(key)) tokens[i] = enrichedMap.get(key);
           }
 
-          const filtered = await filterTokensByStrategy(tokens, job.strategy);
+          const filtered = await filterTokensByStrategy(tokens, job.strategy, { preserveSources: true });
 
           // notify user if matches
           const chatId = job.chatId || (usersRef && usersRef[job.userId] && (usersRef[job.userId].id || usersRef[job.userId].userId || usersRef[job.userId].telegramId));

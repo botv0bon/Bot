@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 require('dotenv').config();
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const PROGRAMS = [
   '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
@@ -30,15 +32,23 @@ async function heliusRpc(method, params){
 function txKindExplicit(tx){
   try{
     const meta = tx && (tx.meta || (tx.transaction && tx.meta)) || {};
-    const logs = Array.isArray(meta.logMessages)? meta.logMessages.join('\n').toLowerCase() : '';
-    if(logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('instruction: initialize_mint')) return 'initialize';
-    if(logs.includes('createpool') || logs.includes('initializepool') || logs.includes('create pool')) return 'pool_creation';
-    if(logs.includes('instruction: swap') || logs.includes('\nprogram log: instruction: swap') || logs.includes(' swap ')) return 'swap';
     const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
     const instrs = (msg && msg.instructions) || [];
+    // prefer parsed instruction types
     for(const ins of instrs){
-      try{ const t = (ins.parsed && ins.parsed.type) || (ins.type || ''); if(!t) continue; const lt = String(t).toLowerCase(); if(lt.includes('initializemint')||lt.includes('initialize_mint')||lt.includes('initialize mint')) return 'initialize'; if(lt.includes('createpool')||lt.includes('initializepool')||lt.includes('create pool')) return 'pool_creation'; if(lt.includes('swap')) return 'swap'; }catch(e){}
+      try{
+        const t = (ins.parsed && ins.parsed.type) || (ins.type || '');
+        const lt = String(t).toLowerCase();
+        if(!lt) continue;
+        if(lt.includes('initializemint')||lt.includes('initialize_mint')||lt.includes('initialize mint')||lt.includes('create_account')) return 'initialize';
+        if(lt.includes('createpool')||lt.includes('initializepool')||lt.includes('create pool')||lt.includes('init_pool')||lt.includes('init_pair')) return 'pool_creation';
+        if(lt.includes('swap')) return 'swap';
+      }catch(e){}
     }
+    const logs = Array.isArray(meta.logMessages)? meta.logMessages.join('\n').toLowerCase() : '';
+    if(logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('instruction: initialize_mint')) return 'initialize';
+    if(logs.includes('createpool') || logs.includes('initializepool') || logs.includes('create pool') || logs.includes('init_pool')) return 'pool_creation';
+    if(logs.includes('instruction: swap') || logs.includes('\nprogram log: instruction: swap') || logs.includes(' swap ')) return 'swap';
   }catch(e){}
   return 'other';
 }
@@ -93,7 +103,54 @@ async function mintPreviouslySeen(mint, txBlockTime, currentSig){
         const fresh = [];
         for(const m of mints){ if(['EPjFWd...','Es9vMF...'].includes(m)) continue; try{ const prev = await mintPreviouslySeen(m, txBlock, sig); if(prev===false) fresh.push(m); }catch(e){}
         }
-        if(fresh.length) console.log(JSON.stringify({ program:p, signature:sig, kind, freshMints:fresh.slice(0,5), time:new Date().toISOString() }));
+        if(fresh.length) {
+          console.log(JSON.stringify({ program:p, signature:sig, kind, freshMints:fresh.slice(0,5), time:new Date().toISOString() }));
+          try{
+            const usersPath = path.join(process.cwd(), 'users.json');
+            let usersRaw = '{}';
+            try { usersRaw = fs.readFileSync(usersPath, 'utf8'); } catch (e) { usersRaw = '{}'; }
+            const users = usersRaw ? JSON.parse(usersRaw) : {};
+            const strategyFilter = require('../src/bot/strategy').filterTokensByStrategy;
+      const candidateTokens = fresh.map(m => ({ address: m, tokenAddress: m, mint: m }));
+            for(const uid of Object.keys(users || {})){
+              try{
+                const user = users[uid];
+                if(!user || !user.strategy || user.strategy.enabled === false) continue;
+        const matched = await strategyFilter(candidateTokens, user.strategy, { preserveSources: true }).catch(() => []);
+                if(Array.isArray(matched) && matched.length > 0){
+                  const matchAddrs = matched.map(t => t.address || t.tokenAddress || t.mint).slice(0,5);
+                  console.log(JSON.stringify({ time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs }));
+                  try{
+                    const outDir = path.join(process.cwd(), 'out');
+                    try{ fs.mkdirSync(outDir, { recursive: true }); } catch(e){}
+                    const notifFile = path.join(outDir, 'notifications.json');
+                    let arr = [];
+                    try{ const raw = fs.readFileSync(notifFile, 'utf8'); arr = JSON.parse(raw || '[]'); } catch(e){ arr = []; }
+                    arr.push({ user: uid, program: p, signature: sig, matched: matchAddrs, time: new Date().toISOString() });
+                    try{ fs.writeFileSync(notifFile, JSON.stringify(arr, null, 2), 'utf8'); } catch(e){}
+                  }catch(e){}
+                  try{
+                    const outDir = path.join(process.cwd(), 'out');
+                    try{ fs.mkdirSync(outDir, { recursive: true }); } catch(e){}
+                    const notifDir = path.join(outDir, 'notifications');
+                    try{ fs.mkdirSync(notifDir, { recursive: true }); } catch(e){}
+                    const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
+                    const filePath = path.join(notifDir, fileName);
+                    fs.writeFileSync(filePath, JSON.stringify({ user: uid, program: p, signature: sig, matched: matchAddrs, time: new Date().toISOString() }, null, 2), 'utf8');
+                    if (process.env.REDIS_URL) {
+                      try {
+                        const IORedis = require('ioredis');
+                        const r = new IORedis(process.env.REDIS_URL);
+                        await r.lpush('notifications', JSON.stringify({ user: uid, program: p, signature: sig, matched: matchAddrs, time: new Date().toISOString() }));
+                        r.disconnect();
+                      } catch (re) {}
+                    }
+                  }catch(e){}
+                }
+              }catch(e){}
+            }
+          }catch(e){}
+        }
       }catch(e){ console.error('err',String(e)); }
       await new Promise(r=>setTimeout(r,300));
     }

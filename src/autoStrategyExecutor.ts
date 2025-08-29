@@ -11,7 +11,7 @@ export async function autoExecuteStrategyForUser(user: any, tokens: any[], mode:
   if (!user.strategy || !user.wallet || !user.secret || user.strategy.enabled === false) return;
 
   // Filter tokens according to user's strategy
-  const filteredTokens = await (require('./bot/strategy').filterTokensByStrategy(tokens, user.strategy));
+    const filteredTokens = await (require('./bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
   if (filteredTokens.length === 0) {
     console.log(`[autoExecute] No tokens matched for user ${user.id || user.username}`);
     return;

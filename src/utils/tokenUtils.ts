@@ -120,6 +120,16 @@ import { getSolscanApiKey, getJupiterApiKey } from '../config';
 // ========== General Constants ==========
 const EMPTY_VALUES = [undefined, null, '-', '', 'N/A', 'null', 'undefined'];
 
+// Simple heuristic to detect system/program addresses that should be ignored as tokens
+export function isSystemMint(addr: string | null | undefined): boolean {
+  if (!addr || typeof addr !== 'string') return false;
+  const a = addr.trim();
+  if (!a) return false;
+  const sysPatterns = [/^So11111111111111111111111111111111111111112$/, /^11111111111111111111111111111111$/, /^TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA$/i];
+  for (const p of sysPatterns) if (p.test(a)) return true;
+  return false;
+}
+
 // Unified field map (easily extendable)
 const FIELD_MAP: Record<string, string[]> = {
   marketCap: ['marketCap', 'fdv', 'totalAmount', 'amount'],
@@ -380,9 +390,18 @@ export async function fetchDexScreenerProfiles(chainId?: string, extraParams?: R
   try {
     const response = await axios.get(url);
     let data = Array.isArray(response.data) ? response.data : [];
-    // If API does not support filtering, fallback to local filtering
-    if (chainId && data.length && !data.some(t => t.chainId === chainId)) {
-      data = data.filter((t: any) => t.chainId === chainId);
+    // Always apply local chain filtering to ensure we only return profiles for the requested chain
+    if (chainId && data.length) {
+      try {
+        const want = String(chainId).toLowerCase();
+        data = data.filter((t: any) => {
+          if (!t) return false;
+          const ci = t.chainId || t.chain || t.network || '';
+          return String(ci).toLowerCase() === want;
+        });
+      } catch (e) {
+        // fall back to raw data if unexpected format
+      }
     }
     return data;
   } catch (err: any) {
@@ -617,7 +636,32 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
       t.ageMinutes = Math.floor((t.ageSeconds || 0) / 60);
     }
   }
-  return Object.values(allTokens);
+    // Final filter: only include tokens that match the requested chain and have a numeric price.
+    try {
+      const wantChain = String(chainId || '').toLowerCase();
+      const candidates = Object.values(allTokens).filter((t: any) => {
+        try {
+          // chain filtering when chainId present on profile/pair
+          if (wantChain) {
+            const ci = (t.chainId || t.chain || t.network || '');
+            if (ci && String(ci).toLowerCase() !== wantChain) return false;
+            // fallback: for solana require base58-like address when no chainId present
+            if (!ci && wantChain === 'solana') {
+              const addrStr = String(t.address || t.tokenAddress || t.mint || '');
+              if (!/[1-9A-HJ-NP-Za-km-z]{32,44}/.test(addrStr)) return false;
+            }
+          }
+          // price presence: require numeric price (priceUsd or price)
+          const price = t.priceUsd ?? t.price ?? t.price_usd ?? t.priceUsd;
+          if (price === undefined || price === null || price === '-' || price === '') return false;
+          if (typeof price === 'string' && isNaN(Number(price))) return false;
+          return true;
+        } catch (e) { return false; }
+      });
+      return candidates;
+    } catch (e) {
+      return Object.values(allTokens);
+    }
 }
 
 
@@ -1472,6 +1516,25 @@ export function buildTokenMessage(token: any, botUsername: string, pairAddress: 
   return { msg, inlineKeyboard };
 }
 
+// Build a concise preview message used in fast previews and notifications
+export function buildPreviewMessage(token: any): { title: string; addr: string; price: string; url?: string; shortMsg: string } {
+  const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || 'N/A';
+  const name = token.name || token.symbol || addr;
+  const priceNum = token.priceUsd || token.price || token.priceUsdFloat || token.priceFloat;
+  const price = (typeof priceNum === 'number') ? priceNum.toLocaleString(undefined, { maximumFractionDigits: 8 }) : (priceNum ? String(priceNum) : 'N/A');
+  const url = token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : undefined);
+  // Include source program/signature when available (useful for listener-sourced candidates)
+  let srcLine = '';
+  try {
+    const sp = token.sourceProgram || token.source || token.sourceName;
+    const sig = token.sourceSignature || token.signature || token.sig;
+    if (sp) srcLine += `\nSource: ${sp}`;
+    if (sig) srcLine += ` | Sig: ${sig}`;
+  } catch (e) {}
+  const shortMsg = `🪙 ${name} (${addr})\nPrice: ${price} USD${url ? '\n' + url : ''}${srcLine}`;
+  return { title: name, addr, price, url, shortMsg };
+}
+
 function progressBar(percent: number, size = 10, fill = '█', empty = '░') {
   const filled = Math.round((percent / 100) * size);
   return fill.repeat(filled) + empty.repeat(size - filled);
@@ -1497,20 +1560,14 @@ export async function notifyUsers(bot: any, users: Record<string, any>, tokens: 
           await bot.telegram.sendMessage(uid, '⚠️ We are still looking for the gems you want.');
           continue;
         }
-        await bot.telegram.sendMessage(uid, msg, {
-          parse_mode: 'HTML',
-          disable_web_page_preview: false,
-          reply_markup: { inline_keyboard: inlineKeyboard }
-        });
+  // cast options to any to satisfy differing telegram typings
+  await bot.telegram.sendMessage(uid, msg, ({ parse_mode: 'HTML', disable_web_page_preview: false, reply_markup: { inline_keyboard: inlineKeyboard } } as any));
       }
     } else if (bot) {
       await bot.telegram.sendMessage(
         uid,
         'No tokens currently match your strategy.\n\nYour strategy filters may be too strict for the available data from DexScreener.\n\nTry lowering requirements like liquidity, market cap, volume, age, or holders, then try again.',
-        {
-          parse_mode: 'HTML',
-          disable_web_page_preview: true
-        }
+  ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)
       );
     }
   }
@@ -1522,6 +1579,11 @@ export function autoFilterTokensVerbose(tokens: any[], strategy: Record<string, 
   const passed: any[] = [];
   const rejected: Array<{ token: any; reasons: string[] }> = [];
   for (const token of tokens) {
+    // quick reject of obvious system/program addresses
+    try {
+      const addr = String(token && (token.tokenAddress || token.address || token.mint || '') || '').trim();
+      if (isSystemMint(addr)) { rejected.push({ token, reasons: ['system_address'] }); continue; }
+    } catch (e) {}
     const reasons: string[] = [];
     let ok = true;
     for (const field of STRATEGY_FIELDS) {

@@ -5,6 +5,8 @@ const axios = require('axios');
 const HELIUS_RPC = process.env.HELIUS_RPC_URL || process.env.HELIUS_RPC || 'https://mainnet.helius-rpc.com/';
 const HELIUS_KEY = process.env.HELIUS_API_KEY || process.env.HELIUS_KEY || '';
 const headers = Object.assign({ 'Content-Type': 'application/json' }, HELIUS_KEY ? { 'x-api-key': HELIUS_KEY } : {});
+const fs = require('fs');
+const path = require('path');
 
 const PROGRAMS = [
   '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
@@ -107,63 +109,128 @@ async function mintPreviouslySeen(mint, txBlockTime, currentSig){
 }
 
 (async()=>{
-  console.error('Sequential 10s per-program listener starting');
+  console.error('Sequential 10s per-program listener starting (daemon mode)');
   const seenMints = new Set();
-  for(const p of PROGRAMS){
-    try{
-      const rule = RULES[p] || RULES.default;
-      console.error(`[${p}] listening (10s)`);
-      const end = Date.now()+10000;
-      const seenTxs = new Set();
-      while(Date.now()<end){
-        try{
-          if(!rule || !Array.isArray(rule.allow) || rule.allow.length===0) break;
-          const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: 1 }]);
-          if(!Array.isArray(sigs)||sigs.length===0){ await sleep(250); continue; }
-          const s = sigs[0]; if(!s) { await sleep(250); continue; }
-          const sig = s.signature||s.txHash||s.sig||s.txhash; if(!sig) { await sleep(250); continue; }
-          if(seenTxs.has(sig)) { await sleep(250); continue; } seenTxs.add(sig);
-          const tx = await heliusRpc('getTransaction', [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
-          if(!tx || tx.__error) { await sleep(250); continue; }
-          const kind = txKindExplicit(tx); if(!kind) { await sleep(250); continue; }
-          if(!rule.allow.includes(kind)) { await sleep(250); continue; }
-          const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) { await sleep(250); continue; }
-          const fresh = [];
-          const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
-          for(const m of mints){ if(seenMints.has(m)) continue; const prev = await mintPreviouslySeen(m, txBlock, sig); if(prev===false) fresh.push(m); }
-          if(fresh.length===0) { await sleep(250); continue; }
-          if(kind==='swap'){
-            // Tightened rule: require an explicit parsed instruction reference
-            // (info.mint / info.source / info.destination) to match a fresh mint.
+  let stopped = false;
+  process.on('SIGINT', () => { console.error('SIGINT received, stopping listener...'); stopped = true; });
+  while(!stopped){
+    for(const p of PROGRAMS){
+      if (stopped) break;
+      try{
+        const rule = RULES[p] || RULES.default;
+        console.error(`[${p}] listening (10s)`);
+        const end = Date.now()+10000;
+        const seenTxs = new Set();
+        while(Date.now()<end){
+          if (stopped) break;
+          try{
+            if(!rule || !Array.isArray(rule.allow) || rule.allow.length===0) break;
+            const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: 1 }]);
+            if(!Array.isArray(sigs)||sigs.length===0){ await sleep(250); continue; }
+            const s = sigs[0]; if(!s) { await sleep(250); continue; }
+            const sig = s.signature||s.txHash||s.sig||s.txhash; if(!sig) { await sleep(250); continue; }
+            if(seenTxs.has(sig)) { await sleep(250); continue; } seenTxs.add(sig);
+            const tx = await heliusRpc('getTransaction', [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
+            if(!tx || tx.__error) { await sleep(250); continue; }
+            const kind = txKindExplicit(tx); if(!kind) { await sleep(250); continue; }
+            if(!rule.allow.includes(kind)) { await sleep(250); continue; }
+            const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) { await sleep(250); continue; }
+            const fresh = [];
+            const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
+            for(const m of mints){ if(seenMints.has(m)) continue; const prev = await mintPreviouslySeen(m, txBlock, sig); if(prev===false) fresh.push(m); }
+            if(fresh.length===0) { await sleep(250); continue; }
+            if(kind==='swap'){
+              // Tightened rule: require an explicit parsed instruction reference
+              // (info.mint / info.source / info.destination) to match a fresh mint.
+              try{
+                const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
+                const instrs = (msg && msg.instructions) || [];
+                let referencesFresh = false;
+                for(const ins of instrs){
+                  try{
+                    const info = ins.parsed && ins.parsed.info;
+                    if(info){
+                      if(info.mint && fresh.includes(info.mint)) referencesFresh = true;
+                      if(info.source && fresh.includes(info.source)) referencesFresh = true;
+                      if(info.destination && fresh.includes(info.destination)) referencesFresh = true;
+                    }
+                  }catch(e){}
+                }
+                if(!referencesFresh){ await sleep(250); continue; }
+              }catch(e){}
+            }
+            for(const m of fresh) seenMints.add(m);
+            // Emit global event for listeners
+            console.log(JSON.stringify({ time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) }));
+            // Also evaluate per-user strategies (if any) and emit per-user matches
             try{
-              const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
-              const instrs = (msg && msg.instructions) || [];
-              let referencesFresh = false;
-              for(const ins of instrs){
+              const usersPath = path.join(process.cwd(), 'users.json');
+              let usersRaw = '{}';
+              try { usersRaw = fs.readFileSync(usersPath, 'utf8'); } catch (e) { usersRaw = '{}'; }
+              const users = usersRaw ? JSON.parse(usersRaw) : {};
+              const strategyFilter = require('../src/bot/strategy').filterTokensByStrategy;
+              // Build token objects from fresh mints for filtering
+              // Lightweight on-chain enrichment: fetch the first signature for each mint to derive a first-tx timestamp (cheap, 1 RPC per mint)
+              const candidateTokens = await Promise.all(fresh.map(async (m) => {
+                const tok = { address: m, tokenAddress: m, mint: m };
                 try{
-                  const info = ins.parsed && ins.parsed.info;
-                  if(info){
-                    if(info.mint && fresh.includes(info.mint)) referencesFresh = true;
-                    if(info.source && fresh.includes(info.source)) referencesFresh = true;
-                    if(info.destination && fresh.includes(info.destination)) referencesFresh = true;
+                  const sigs = await heliusRpc('getSignaturesForAddress', [m, { limit: 1 }]);
+                  if (Array.isArray(sigs) && sigs.length > 0) {
+                    const s0 = sigs[0];
+                    const bt = s0.blockTime || s0.block_time || s0.blocktime || null;
+                    if (bt) {
+                      try { tok.freshnessDetails = { firstTxMs: Number(bt) * 1000 }; } catch(e){}
+                      try { tok._canonicalAgeSeconds = (Date.now() - (Number(bt) * 1000)) / 1000; } catch(e){}
+                    }
                   }
                 }catch(e){}
+                return tok;
+              }));
+              for(const uid of Object.keys(users || {})){
+                try{
+                  const user = users[uid];
+                  if(!user || !user.strategy || user.strategy.enabled === false) continue;
+                  // run the filter (allow enrichment inside strategy filter for accuracy)
+                  const matched = await strategyFilter(candidateTokens, user.strategy).catch(() => []);
+                  if(Array.isArray(matched) && matched.length > 0){
+                    const matchAddrs = matched.map(t => t.address || t.tokenAddress || t.mint).slice(0,5);
+                    console.log(JSON.stringify({ time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs }));
+                    // Append to notifications queue for the bot to pick up
+                    try{
+                      const outDir = path.join(process.cwd(), 'out');
+                      try{ fs.mkdirSync(outDir, { recursive: true }); } catch(e){}
+                      const notifDir = path.join(outDir, 'notifications');
+                      try{ fs.mkdirSync(notifDir, { recursive: true }); } catch(e){}
+                      const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
+                      const filePath = path.join(notifDir, fileName);
+                      fs.writeFileSync(filePath, JSON.stringify({ user: uid, program: p, signature: sig, matched: matchAddrs, time: new Date().toISOString() }, null, 2), 'utf8');
+                      // Optional Redis enqueue for faster consumption when REDIS_URL is set
+                      if (process.env.REDIS_URL) {
+                        try {
+                          const IORedis = require('ioredis');
+                          const r = new IORedis(process.env.REDIS_URL);
+                          await r.lpush('notifications', JSON.stringify({ user: uid, program: p, signature: sig, matched: matchAddrs, time: new Date().toISOString() }));
+                          r.disconnect();
+                        } catch (re) { /* ignore redis errors */ }
+                      }
+                    }catch(e){}
+                  }
+                }catch(e){ /* per-user errors shouldn't break main loop */ }
               }
-              if(!referencesFresh){ await sleep(250); continue; }
             }catch(e){}
-          }
-          for(const m of fresh) seenMints.add(m);
-          console.log(JSON.stringify({ time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) }));
-        }catch(e){ }
-        await sleep(120);
-      }
-      console.error(`[${p}] done`);
-    }catch(e){ console.error(`[${p}] err ${String(e)}`); }
+          }catch(e){ }
+          await sleep(120);
+        }
+        console.error(`[${p}] done`);
+      }catch(e){ console.error(`[${p}] err ${String(e)}`); }
+    }
+    // Print RPC stats summary per full cycle
+    try{
+      const avg = RPC_STATS.calls ? Math.round(RPC_STATS.totalLatencyMs / RPC_STATS.calls) : 0;
+      console.error('RPC_STATS', JSON.stringify({ calls: RPC_STATS.calls, errors: RPC_STATS.errors, rateLimit429: RPC_STATS.rateLimit429, avgLatencyMs: avg }));
+    }catch(e){}
+    // short delay between cycles to avoid tight looping
+    try { await sleep(2000); } catch (e) { }
   }
-  // Print RPC stats summary
-  try{
-    const avg = RPC_STATS.calls ? Math.round(RPC_STATS.totalLatencyMs / RPC_STATS.calls) : 0;
-    console.error('RPC_STATS', JSON.stringify({ calls: RPC_STATS.calls, errors: RPC_STATS.errors, rateLimit429: RPC_STATS.rateLimit429, avgLatencyMs: avg }));
-  }catch(e){}
-  console.error('Sequential 10s per-program listener finished');
+  console.error('Sequential 10s per-program listener stopped');
 })();

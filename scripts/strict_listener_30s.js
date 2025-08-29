@@ -46,6 +46,7 @@ const RULES = {
 };
 
 const DENY = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB','So11111111111111111111111111111111111111112','TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA']);
+const fs = require('fs');
 
 function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
@@ -94,21 +95,26 @@ function txKindExplicit(tx){
   try{
     const meta = tx && (tx.meta || (tx.transaction && tx.meta)) || {};
     const logs = Array.isArray(meta.logMessages)? meta.logMessages.join('\n').toLowerCase() : '';
-    if(logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('instruction: initialize_mint')) return 'initialize';
-    if(logs.includes('createpool') || logs.includes('initializepool') || logs.includes('create pool')) return 'pool_creation';
-    if(logs.includes('instruction: swap') || logs.includes('\nprogram log: instruction: swap') || logs.includes(' swap ')) return 'swap';
     const msg = tx && (tx.transaction && tx.transaction.message) || tx.transaction || {};
     const instrs = (msg && msg.instructions) || [];
+    // 1) Prefer parsed instruction types (strong signal)
     for(const ins of instrs){
       try{
         const t = (ins.parsed && ins.parsed.type) || (ins.type || '');
-        if(!t) continue;
         const lt = String(t).toLowerCase();
-        if(lt.includes('initializemint')||lt.includes('initialize_mint')||lt.includes('initialize mint')) return 'initialize';
-        if(lt.includes('createpool')||lt.includes('initializepool')||lt.includes('create pool')) return 'pool_creation';
-        if(lt.includes('swap')) return 'swap';
+        if(!lt) continue;
+        if(lt.includes('initializemint')||lt.includes('initialize_mint')||lt.includes('initialize mint')||lt.includes('create_account')) return 'initialize';
+        if(lt.includes('createpool')||lt.includes('initializepool')||lt.includes('create pool')||lt.includes('init_pool')||lt.includes('init_pair')) return 'pool_creation';
+        if(lt.includes('swap')) {
+          // only mark as swap here; caller should validate whether swap references fresh mints
+          return 'swap';
+        }
       }catch(e){}
     }
+    // 2) Fallback to logs (weaker signal)
+    if(logs.includes('instruction: initializemint') || logs.includes('initialize mint') || logs.includes('instruction: initialize_mint')) return 'initialize';
+    if(logs.includes('createpool') || logs.includes('initializepool') || logs.includes('create pool') || logs.includes('init_pool')) return 'pool_creation';
+    if(logs.includes('instruction: swap') || logs.includes('\nprogram log: instruction: swap') || logs.includes(' swap ')) return 'swap';
   }catch(e){}
   return null;
 }
@@ -158,7 +164,7 @@ async function mintPreviouslySeen(mint, txBlockTime, currentSig){
             if(prev===false) fresh.push(m);
           }catch(e){}
         }
-        if(fresh.length===0) continue;
+  if(fresh.length===0) continue;
         if(kind==='swap'){
           // Tightened rule: require explicit parsed instruction reference
           try{
@@ -180,6 +186,34 @@ async function mintPreviouslySeen(mint, txBlockTime, currentSig){
         }
         for(const m of fresh) seenMints.add(m);
         console.log(JSON.stringify({ time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) }));
+        try{
+          const usersPath = path.join(process.cwd(), 'users.json');
+          let usersRaw = '{}';
+          try { usersRaw = fs.readFileSync(usersPath, 'utf8'); } catch (e) { usersRaw = '{}'; }
+          const users = usersRaw ? JSON.parse(usersRaw) : {};
+          const strategyFilter = require('../src/bot/strategy').filterTokensByStrategy;
+          const candidateTokens = fresh.map(m => ({ address: m, tokenAddress: m, mint: m }));
+          for(const uid of Object.keys(users || {})){
+            try{
+              const user = users[uid];
+              if(!user || !user.strategy || user.strategy.enabled === false) continue;
+              const matched = await strategyFilter(candidateTokens, user.strategy, { preserveSources: true }).catch(() => []);
+              if(Array.isArray(matched) && matched.length > 0){
+                const matchAddrs = matched.map(t => t.address || t.tokenAddress || t.mint).slice(0,5);
+                console.log(JSON.stringify({ time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs }));
+                try{
+                  const outDir = path.join(process.cwd(), 'out');
+                  try{ fs.mkdirSync(outDir, { recursive: true }); } catch(e){}
+                  const notifFile = path.join(outDir, 'notifications.json');
+                  let arr = [];
+                  try{ const raw = fs.readFileSync(notifFile, 'utf8'); arr = JSON.parse(raw || '[]'); } catch(e){ arr = []; }
+                  arr.push({ user: uid, program: p, signature: sig, matched: matchAddrs, time: new Date().toISOString() });
+                  try{ fs.writeFileSync(notifFile, JSON.stringify(arr, null, 2), 'utf8'); } catch(e){}
+                }catch(e){}
+              }
+            }catch(e){}
+          }
+        }catch(e){}
       }catch(e){ }
       await sleep(120);
     }

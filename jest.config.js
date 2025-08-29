@@ -1,4 +1,5 @@
 module.exports = {
   testEnvironment: 'node',
-  testMatch: ['**/__tests__/**/*.test.ts'],
+  // Support both .ts and .js test files in __tests__
+  testMatch: ['**/__tests__/**/*.test.ts', '**/__tests__/**/*.test.js'],
 };

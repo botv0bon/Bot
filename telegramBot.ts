@@ -1,13 +1,15 @@
 // =================== Imports ===================
 import dotenv from 'dotenv';
 import fs from 'fs';
+import path from 'path';
 const fsp = fs.promises;
 import { Telegraf, Markup } from 'telegraf';
 import { loadUsers, loadUsersSync, saveUsers, walletKeyboard, getErrorMessage, limitHistory, hasWallet, writeJsonFile } from './src/bot/helpers';
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
-import { STRATEGY_FIELDS, notifyUsers, fetchDexScreenerTokens } from './src/utils/tokenUtils';
+import { STRATEGY_FIELDS, notifyUsers, fetchDexScreenerTokens, fetchDexScreenerProfiles, fetchDexScreenerPairsForSolanaTokens, withTimeout } from './src/utils/tokenUtils';
+import { buildPreviewMessage } from './src/utils/tokenUtils';
 import { enqueueEnrichJob, startEnrichQueue } from './src/bot/enrichQueue';
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
@@ -44,23 +46,20 @@ console.log = (...args: any[]) => {
 console.log('--- Bot starting: Imports loaded ---');
 
 dotenv.config();
-// Configuration values (can be overridden via .env). Using environment variables
-// makes deployment/runtime configuration flexible per environment.
+
+// Configuration values (can be overridden via .env)
 const HELIUS_BATCH_SIZE = Number(process.env.HELIUS_BATCH_SIZE ?? 8);
 const HELIUS_BATCH_DELAY_MS = Number(process.env.HELIUS_BATCH_DELAY_MS ?? 250);
 const HELIUS_ENRICH_LIMIT = Number(process.env.HELIUS_ENRICH_LIMIT ?? 25);
 const ONCHAIN_FRESHNESS_TIMEOUT_MS = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS ?? 5000);
-
 console.log('--- dotenv loaded ---');
-
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN);
 if (!TELEGRAM_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN not found in .env file. Please add TELEGRAM_BOT_TOKEN=YOUR_TOKEN to .env');
   process.exit(1);
 }
-
-const bot = new Telegraf(TELEGRAM_TOKEN as string);
+const bot = new Telegraf(TELEGRAM_TOKEN);
 console.log('--- Telegraf instance created ---');
 let users: Record<string, any> = {};
 console.log('--- Users placeholder created ---');
@@ -240,15 +239,15 @@ bot.hears('💼 Wallet', async (ctx) => {
       balance = await getSolBalance(user.wallet);
     } catch {}
     await ctx.reply(
-      `💼 Your Wallet:\nAddress: <code>${user.wallet}</code>\nBalance: <b>${balance}</b> SOL`,
-      {
+    `💼 Your Wallet:\nAddress: <code>${user.wallet}</code>\nBalance: <b>${balance}</b> SOL`,
+      ({
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [
             [ { text: '👁️ Show Private Key', callback_data: 'show_secret' } ]
           ]
         }
-      }
+      } as any)
     );
   } else {
     await ctx.reply('❌ No wallet found for this user.', walletKeyboard());
@@ -298,7 +297,7 @@ bot.command('notify_tokens', async (ctx) => {
   }
   const now = Date.now();
   const tokens = await getTokensForUser(userId, user.strategy);
-  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy));
+  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
   if (!filteredTokens.length) {
     await ctx.reply('No tokens currently match your strategy.');
     return;
@@ -425,7 +424,7 @@ bot.action('create_wallet', async (ctx) => {
   user.secret = secret;
   user.wallet = keypair.publicKey?.toBase58?.() || keypair.publicKey;
   saveUsers(users);
-  await ctx.reply(`✅ Wallet created successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key (keep it safe): <code>${user.secret}</code>`, { parse_mode: 'HTML' });
+  await ctx.reply(`✅ Wallet created successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key (keep it safe): <code>${user.secret}</code>`, ({ parse_mode: 'HTML' } as any));
 });
 
 bot.action('restore_wallet', async (ctx) => {
@@ -451,7 +450,7 @@ bot.on('text', async (ctx, next) => {
       saveUsers(users);
       delete restoreStates[userId];
 
-      await ctx.reply(`✅ Wallet restored successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key stored securely.`, { parse_mode: 'HTML' });
+  await ctx.reply(`✅ Wallet restored successfully!\nAddress: <code>${user.wallet}</code>\nPrivate key stored securely.`, ({ parse_mode: 'HTML' } as any));
     } catch {
       await ctx.reply('❌ Failed to restore wallet. Invalid key. Try again or create a new wallet.');
     }
@@ -535,124 +534,6 @@ bot.on('text', async (ctx, next) => {
 
   // Note: strategy state handlers are registered earlier to avoid duplicate registrations
 
-      bot.command('show_token', async (ctx) => {
-  console.log(`[show_token] User: ${String(ctx.from?.id)}`);
-        const userId = String(ctx.from?.id);
-        const user = users[userId];
-        if (!user || !user.strategy || !user.strategy.enabled) {
-          await ctx.reply('❌ You must set a strategy first using /strategy');
-          return;
-        }
-    const tokens = await getTokensForUser(userId, user.strategy);
-  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy));
-        const maxTrades = user.strategy.maxTrades && user.strategy.maxTrades > 0 ? user.strategy.maxTrades : 5;
-        const tokensToTrade = filteredTokens.slice(0, maxTrades);
-        if (!tokensToTrade.length) {
-          await ctx.reply('No tokens currently match your strategy.');
-          return;
-        }
-        await ctx.reply(`🔎 Found <b>${tokensToTrade.length}</b> tokens matching your strategy${filteredTokens.length > maxTrades ? ` (showing first ${maxTrades})` : ''}.\nExecuting auto-buy and auto-sell setup...`, { parse_mode: 'HTML' });
-
-        let buyResults: string[] = [];
-        let successCount = 0, failCount = 0;
-        for (const token of tokensToTrade) {
-          const tokenAddress = token.tokenAddress || token.address || token.mint || token.pairAddress;
-          const buyAmount = user.strategy.buyAmount || 0.01;
-          const name = token.name || token.symbol || tokenAddress;
-          const price = token.priceUsd || token.price || '-';
-          const dexUrl = token.url || (token.pairAddress ? `https://dexscreener.com/solana/${token.pairAddress}` : '');
-          console.log(`[show_token] Attempting buy: User: ${userId}, Token: ${tokenAddress}, Amount: ${buyAmount}`);
-          try {
-            const buyResult = await unifiedBuy(tokenAddress, buyAmount, user.secret);
-            console.log(`[show_token] Buy result:`, buyResult);
-            if (buyResult && buyResult.tx) {
-              successCount++;
-              // سجل العملية في التاريخ
-              const entry = `AutoShowTokenBuy: ${tokenAddress} | Amount: ${buyAmount} SOL | Source: unifiedBuy | Tx: ${buyResult.tx}`;
-              user.history = user.history || [];
-              user.history.push(entry);
-              limitHistory(user);
-              saveUsers(users);
-              // سجل أمر بيع تلقائي
-              const targetPercent = user.strategy.targetPercent || 10;
-              try { await registerBuyWithTarget(user, { address: tokenAddress, price }, buyResult, targetPercent); } catch (e) { console.error('registerBuyWithTarget error:', e); }
-              buyResults.push(`🟢 <b>${name}</b> (<code>${tokenAddress}</code>)\nPrice: <b>${price}</b> USD\nAmount: <b>${buyAmount}</b> SOL\nTx: <a href='https://solscan.io/tx/${buyResult.tx}'>${buyResult.tx}</a>\n<a href='${dexUrl}'>DexScreener</a> | <a href='https://solscan.io/token/${tokenAddress}'>Solscan</a>\n------------------------------`);
-            } else {
-              failCount++;
-              console.log(`[show_token] Buy failed for token: ${tokenAddress}`);
-              buyResults.push(`🔴 <b>${name}</b> (<code>${tokenAddress}</code>)\n❌ Failed to buy.`);
-            }
-          } catch (e) {
-            failCount++;
-            console.log(`[show_token] Error during buy for token: ${tokenAddress}`, e);
-            buyResults.push(`🔴 <b>${name}</b> (<code>${tokenAddress}</code>)\n❌ Error: ${getErrorMessage(e)}`);
-          }
-        }
-        let summary = `<b>Auto Buy Summary</b>\n------------------------------\n✅ Success: <b>${successCount}</b>\n❌ Failed: <b>${failCount}</b>\n------------------------------`;
-  await ctx.reply(summary + '\n' + buyResults.join('\n'), { parse_mode: 'HTML' });
-// Handle Buy/Sell actions from show_token
-bot.action(/showtoken_buy_(.+)/, async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  const tokenAddress = ctx.match[1];
-  console.log(`[showtoken_buy] User: ${userId}, Token: ${tokenAddress}`);
-  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
-    return;
-  }
-  try {
-    const amount = user.strategy.buyAmount || 0.01;
-    await ctx.reply(`🛒 Buying token: <code>${tokenAddress}</code> with amount: <b>${amount}</b> SOL ...`, { parse_mode: 'HTML' });
-    const result = await unifiedBuy(tokenAddress, amount, user.secret);
-    if (result && result.tx) {
-      const entry = `ShowTokenBuy: ${tokenAddress} | Amount: ${amount} SOL | Source: unifiedBuy | Tx: ${result.tx}`;
-      user.history = user.history || [];
-      user.history.push(entry);
-      limitHistory(user);
-      saveUsers(users);
-      await ctx.reply(`Token bought successfully! Tx: ${result.tx}`);
-    } else {
-      await ctx.reply('Buy failed: Transaction was not completed.');
-    }
-  } catch (e) {
-    await ctx.reply('❌ Error during buy: ' + getErrorMessage(e));
-    console.error('showtoken buy error:', e);
-  }
-});
-
-bot.action(/showtoken_sell_(.+)/, async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  const tokenAddress = ctx.match[1];
-  console.log(`[showtoken_sell] User: ${userId}, Token: ${tokenAddress}`);
-  if (!user || !hasWallet(user) || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ No active strategy or wallet found.');
-    return;
-  }
-  try {
-    const sellPercent = user.strategy.sellPercent1 || 100;
-    // For demo, assume full balance = buyAmount
-    const balance = user.strategy.buyAmount || 0.01;
-    const amount = (balance * sellPercent) / 100;
-    await ctx.reply(`🔻 Selling token: <code>${tokenAddress}</code> with <b>${sellPercent}%</b> of your balance (${balance}) ...`, { parse_mode: 'HTML' });
-    const result = await unifiedSell(tokenAddress, amount, user.secret);
-    if (result && result.tx) {
-      const entry = `ShowTokenSell: ${tokenAddress} | Amount: ${amount} | Source: unifiedSell | Tx: ${result.tx}`;
-      user.history = user.history || [];
-      user.history.push(entry);
-      limitHistory(user);
-      saveUsers(users);
-      await ctx.reply(`Token sold successfully! Tx: ${result.tx}`);
-    } else {
-      await ctx.reply('Sell failed: Transaction was not completed.');
-    }
-  } catch (e) {
-    await ctx.reply('❌ Error during sell: ' + getErrorMessage(e));
-    console.error('showtoken sell error:', e);
-  }
-});
-      });
-
 
 // =================== Bot Launch ===================
 console.log('--- About to launch bot ---');
@@ -663,6 +544,164 @@ console.log('--- About to launch bot ---');
       users = await loadUsers();
       console.log('--- Users loaded (async) ---');
       try { startEnrichQueue(bot.telegram, users, { intervalMs: 2000 }); } catch (err) { console.warn('Failed to start enrich queue early:', err); }
+
+      // Start background notification pump early so it runs even if bot.launch hangs.
+      try {
+        const startNotificationPump = async () => {
+          const outDir = path.join(process.cwd(), 'out');
+          const notifFile = path.join(outDir, 'notifications.json');
+          const notifDir = path.join(outDir, 'notifications');
+          try { await fsp.mkdir(outDir, { recursive: true }); } catch (e) {}
+          try { await fsp.mkdir(notifDir, { recursive: true }); } catch (e) {}
+          console.log('[notificationPump] notifDir path:', notifDir, 'legacy file:', notifFile);
+          // suppression map: userId -> Map(addr -> lastSentTs)
+          const sentNotifications: Record<string, Map<string, number>> = {};
+          // For testing defaults, use 1 minute unless overridden in env
+          const suppressionMinutes = Number(process.env.NOTIF_SUPPRESSION_MINUTES ?? 1);
+          const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
+          async function collectNotificationsFromRedis(){
+            const out: any[] = [];
+            if(!process.env.REDIS_URL) return out;
+            try{
+              const IORedis = require('ioredis');
+              const r = new IORedis(process.env.REDIS_URL);
+              while(true){
+                const item = await r.rpop('notifications');
+                if(!item) break;
+                try{ out.push(JSON.parse(item)); } catch(e) { /* ignore parse errors */ }
+              }
+              r.disconnect();
+            }catch(e){ console.warn('[notificationPump] redis collect failed', e?.message||e); }
+            return out;
+          }
+          async function collectNotificationsFromFiles(){
+            const out: any[] = [];
+            try{
+              const files = await fsp.readdir(notifDir).catch(()=>[]);
+              // process files in time order
+              files.sort();
+              for(const fname of files){
+                const p = path.join(notifDir, fname);
+                try{
+                  const raw = await fsp.readFile(p, 'utf8').catch(()=>null);
+                  if(!raw) { try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}; continue; }
+                  try{ const obj = JSON.parse(raw); if(obj) out.push(obj); } catch(e){}
+                  try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}
+                }catch(e){}
+              }
+            }catch(e){ /* ignore */ }
+            return out;
+          }
+          async function pumpOnce(){
+            try{
+              console.log('[notificationPump] pumpOnce triggered');
+              let arr: any[] = [];
+              // 1) collect from Redis (if available)
+              try{ const fromRedis = await collectNotificationsFromRedis(); if(Array.isArray(fromRedis) && fromRedis.length) arr = arr.concat(fromRedis); } catch(e){}
+              // 2) collect from append-only files
+              try{ const fromFiles = await collectNotificationsFromFiles(); if(Array.isArray(fromFiles) && fromFiles.length) arr = arr.concat(fromFiles); } catch(e){}
+              // 3) legacy file fallback (notifications.json)
+              if(arr.length === 0){
+                try{
+                  const raw = await fsp.readFile(notifFile, 'utf8').catch(()=>null);
+                  if(raw){ try{ const legacy = JSON.parse(raw||'[]'); if(Array.isArray(legacy) && legacy.length) arr = arr.concat(legacy); } catch(e){} }
+                }catch(e){}
+              }
+              if(!Array.isArray(arr) || arr.length===0) { console.log('[notificationPump] no notifications found'); return; }
+              console.log('[notificationPump] collected', arr.length, 'notification(s)');
+              // group by user
+              const byUser: Record<string, any[]> = {};
+              for(const n of arr){ if(!n || !n.user) continue; if(!byUser[n.user]) byUser[n.user]=[]; byUser[n.user].push(n); }
+              // process per user
+              for(const uid of Object.keys(byUser)){
+                try{
+                  const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled===false) continue;
+                  const maxTrades = Number(user.strategy?.maxTrades || 3);
+                  const items = byUser[uid].slice(0, maxTrades);
+                  // convert matched addresses to token objects; use listener matches as authoritative
+                  const addrs = [].concat(...items.map(it => it.matched || it.matchAddrs || []));
+                  const uniq = Array.from(new Set(addrs)).slice(0, maxTrades);
+                  let tokens: any[] = uniq.map(a=>({ tokenAddress: a, address: a, mint: a }));
+                  // Enrich each address individually via DexScreener (best-effort). Do NOT drop tokens lacking Dex data.
+                  try{
+                    for (let i = 0; i < tokens.length; i++){
+                      const t = tokens[i];
+                      const addr = String(t.tokenAddress || t.address || t.mint || '');
+                      try{
+                        // Try token profile first
+                        const profiles = await fetchDexScreenerProfiles('solana', { tokenAddress: addr });
+                        if (Array.isArray(profiles) && profiles.length > 0) {
+                          tokens[i] = { ...t, ...profiles[0] };
+                          continue;
+                        }
+                        // Fallback: try pairs API to get market data
+                        const pairs = await fetchDexScreenerPairsForSolanaTokens([addr]).catch(() => []);
+                        if (Array.isArray(pairs) && pairs.length > 0) {
+                          const p = pairs[0];
+                          const enriched: any = { ...t };
+                          if (p.priceUsd || p.price) enriched.priceUsd = p.priceUsd || p.price;
+                          enriched.pairAddress = p.pairAddress || p.pair_address || p.pairId || p.pairId || enriched.pairAddress;
+                          enriched.url = enriched.url || (enriched.pairAddress ? `https://dexscreener.com/solana/${enriched.pairAddress}` : undefined) || enriched.url;
+                          tokens[i] = enriched;
+                        }
+                      }catch(e){ /* per-address enrichment failed - keep original token object */ }
+                    }
+                  }catch(e){ /* ignore top-level dex failures */ }
+                  // Send up to maxTrades preview messages
+                          // prepare sentNotifications map for user
+                          if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
+                          // optional Redis client for persistent suppression
+                          let __redisClient: any = null;
+                          async function getRedisClient(){
+                            if(__redisClient) return __redisClient;
+                            if(!process.env.REDIS_URL) return null;
+                            try{ const IORedis = require('ioredis'); __redisClient = new IORedis(process.env.REDIS_URL); return __redisClient; }catch(e){ return null; }
+                          }
+                          // aggregate tokens for this user into a single message with inline buttons
+                          const finalTokens = [];
+                          for(const tok of tokens.slice(0, maxTrades)){
+                            try{
+                              const addr = tok.tokenAddress || tok.address || tok.mint || '';
+                              const lastMap = sentNotifications[uid];
+                              let suppressed = false;
+                              try{ const rc = await getRedisClient(); if(rc){ const key = `sent:${uid}:${addr}`; const v = await rc.get(key).catch(()=>null); if(v) suppressed = true; } }catch(e){}
+                              const last = lastMap.get(addr) || 0;
+                              if(!suppressed && suppressionMs > 0 && (Date.now() - last) < suppressionMs) suppressed = true;
+                              if(suppressed) { console.log(`[notificationPump] skipping ${addr} for user ${uid} (suppressed)`); continue; }
+                              finalTokens.push(tok);
+                            }catch(e){ }
+                          }
+                          if(finalTokens.length === 0) continue;
+                          try{
+                            // build aggregated message
+                            const lines = finalTokens.map(t => {
+                              const title = (t.name || t.symbol) ? `${t.name || ''}${t.symbol ? ' ('+t.symbol+')' : ''}` : t.tokenAddress.slice(0,8);
+                              const price = t.priceUsd ? `${Number(t.priceUsd).toFixed(4)} USD` : 'N/A';
+                              const liq = t.liquidityUsd ? `${Math.round(Number(t.liquidityUsd)).toLocaleString()} USD` : 'N/A';
+                              const shortSig = (t.sourceSignature||'').substring(0,8);
+                              const dex = t.url || (t.pairAddress ? `https://dexscreener.com/solana/${t.pairAddress}` : '');
+                              return `• <b>${title}</b> <code>${t.tokenAddress}</code>\n  السعر: ${price} | سيولة: ${liq}\n  مصدر: ${t.sourceProgram || 'listener'} | <code>${shortSig}</code>${dex? '\n  🔗 '+dex : ''}`;
+                            }).join('\n\n');
+                            const keyboard = { inline_keyboard: [ finalTokens.slice(0,5).map(t=>({ text: `${t.symbol||t.name||t.tokenAddress.slice(0,6)}`, callback_data: `view|${uid}|${t.tokenAddress}` })), [{ text: 'إيقاف الإشعارات لهذه الإستراتيجية', callback_data: `mute|${uid}|strategy` }] ] };
+                            const chatId = uid;
+                            const aggMsg = `🔔 <b>نتائج استراتيجيتك (${finalTokens.length})</b>\n\n${lines}`;
+                            await (bot.telegram as any).sendMessage(chatId, aggMsg, { parse_mode: 'HTML', reply_markup: keyboard });
+                            // mark suppression for sent tokens
+                            const rc = await getRedisClient();
+                            for(const t of finalTokens){ const a = t.tokenAddress || t.address || t.mint || ''; sentNotifications[uid].set(a, Date.now()); try{ if(rc && suppressionMs>0){ const key = `sent:${uid}:${a}`; const ex = Math.max(1, Math.round(suppressionMs/1000)); await rc.set(key, '1', 'EX', ex).catch(()=>{}); } }catch(e){} }
+                            console.log(`[notificationPump] sent aggregated notification for ${finalTokens.length} token(s) to user ${uid}`);
+                          }catch(e){ console.error('[notificationPump] failed to send aggregated preview to', uid, e?.message||e); }
+                }catch(e){ console.error('[notificationPump] per-user processing failed', e); }
+              }
+              // clear legacy file if it existed
+              try{ await fsp.writeFile(notifFile, JSON.stringify([], null, 2), 'utf8'); } catch(e){ }
+            }catch(e){ /* ignore top-level pump errors */ }
+          }
+          setInterval(pumpOnce, 3000);
+          try { pumpOnce().catch(e=>console.error('[notificationPump] initial pump error', e)); } catch(e) { console.error('[notificationPump] initial pump scheduling failed', e); }
+        };
+        startNotificationPump().catch(e=>console.error('[notificationPump] start failed', e));
+      } catch (e) { console.error('[notificationPump] failed to initialize', e); }
     } catch (e) { console.error('Failed to load users async:', e); users = loadUsersSync(); }
 
     // Register centralized buy/sell handlers now that users are loaded
@@ -682,6 +721,144 @@ console.log('--- About to launch bot ---');
       } catch (e) {
         console.warn('Failed to start fast token fetcher:', e);
       }
+  // Background notifications reader: pick up listener-produced notifications and send to users
+      (async function notificationPump(){
+        const outDir = path.join(process.cwd(), 'out');
+        const notifFile = path.join(outDir, 'notifications.json');
+        const notifDir = path.join(outDir, 'notifications');
+        console.log('[notificationPump] notifDir path:', notifDir, 'legacy file:', notifFile);
+        try { await fsp.mkdir(outDir, { recursive: true }); } catch (e) {}
+        try { await fsp.mkdir(notifDir, { recursive: true }); } catch (e) {}
+        // suppression map: userId -> Map(addr -> lastSentTs)
+        const sentNotifications: Record<string, Map<string, number>> = {};
+  // For testing defaults, use 1 minute unless overridden in env
+  const suppressionMinutes = Number(process.env.NOTIF_SUPPRESSION_MINUTES ?? 1);
+  const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
+  async function collectNotificationsFromRedis(){
+    const out = [];
+    if(!process.env.REDIS_URL) return out;
+    try{
+      const IORedis = require('ioredis');
+      const r = new IORedis(process.env.REDIS_URL);
+      while(true){
+        const item = await r.rpop('notifications');
+        if(!item) break;
+        try{ out.push(JSON.parse(item)); } catch(e) { /* ignore parse errors */ }
+      }
+      r.disconnect();
+    }catch(e){ console.warn('[notificationPump] redis collect failed', e?.message||e); }
+    return out;
+  }
+  async function collectNotificationsFromFiles(){
+    const out = [];
+    try{
+      const files = await fsp.readdir(notifDir).catch(()=>[]);
+      files.sort();
+      for(const fname of files){
+        const p = path.join(notifDir, fname);
+        try{
+          const raw = await fsp.readFile(p, 'utf8').catch(()=>null);
+          if(!raw) { try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}; continue; }
+          try{ const obj = JSON.parse(raw); if(obj) out.push(obj); } catch(e){}
+          try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}
+        }catch(e){}
+      }
+    }catch(e){ /* ignore */ }
+    return out;
+  }
+    async function pumpOnce(){
+          try{
+      console.log('[notificationPump] pumpOnce triggered');
+            let arr = [];
+            try{ const fromRedis = await collectNotificationsFromRedis(); if(Array.isArray(fromRedis) && fromRedis.length) arr = arr.concat(fromRedis); } catch(e){}
+            try{ const fromFiles = await collectNotificationsFromFiles(); if(Array.isArray(fromFiles) && fromFiles.length) arr = arr.concat(fromFiles); } catch(e){}
+            if(arr.length === 0){
+              try{
+                const raw = await fsp.readFile(notifFile, 'utf8').catch(()=>null);
+                if(raw){ try{ const legacy = JSON.parse(raw||'[]'); if(Array.isArray(legacy) && legacy.length) arr = arr.concat(legacy); } catch(e){} }
+              }catch(e){}
+            }
+            if(!Array.isArray(arr) || arr.length===0) { console.log('[notificationPump] notifications array empty'); return; }
+      console.log('[notificationPump] collected', arr.length, 'notification(s)');
+            // group by user
+            const byUser: Record<string, any[]> = {};
+            for(const n of arr){ if(!n || !n.user) continue; if(!byUser[n.user]) byUser[n.user]=[]; byUser[n.user].push(n); }
+            // process per user
+            for(const uid of Object.keys(byUser)){
+              try{
+                const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled===false) continue;
+                const maxTrades = Number(user.strategy?.maxTrades || 3);
+                const items = byUser[uid].slice(0, maxTrades);
+                // convert matched addresses to token objects; use listener matches as authoritative
+                const addrs = [].concat(...items.map(it => it.matched || it.matchAddrs || []));
+                const uniq = Array.from(new Set(addrs)).slice(0, maxTrades);
+                let tokens: any[] = uniq.map(a=>({ tokenAddress: a, address: a, mint: a }));
+                // Enrich each address individually via DexScreener (best-effort). Do NOT drop tokens lacking Dex data.
+                try{
+                  for (let i = 0; i < tokens.length; i++){
+                    const t = tokens[i];
+                    const addr = String(t.tokenAddress || t.address || t.mint || '');
+                    try{
+                      // Try token profile first
+                      const profiles = await fetchDexScreenerProfiles('solana', { tokenAddress: addr });
+                      if (Array.isArray(profiles) && profiles.length > 0) {
+                        tokens[i] = { ...t, ...profiles[0] };
+                        continue;
+                      }
+                      // Fallback: try pairs API to get market data
+                      const pairs = await fetchDexScreenerPairsForSolanaTokens([addr]).catch(() => []);
+                      if (Array.isArray(pairs) && pairs.length > 0) {
+                        const p = pairs[0];
+                        const enriched: any = { ...t };
+                        if (p.priceUsd || p.price) enriched.priceUsd = p.priceUsd || p.price;
+                        enriched.pairAddress = p.pairAddress || p.pair_address || p.pairId || p.pairId || enriched.pairAddress;
+                        enriched.url = enriched.url || (enriched.pairAddress ? `https://dexscreener.com/solana/${enriched.pairAddress}` : undefined) || enriched.url;
+                        tokens[i] = enriched;
+                      }
+                    }catch(e){ /* per-address enrichment failed - keep original token object */ }
+                  }
+                }catch(e){ /* ignore top-level dex failures */ }
+                // aggregate tokens for this user into a single message with inline buttons
+                if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
+                const finalTokens2 = [];
+                for(const tok of tokens.slice(0, maxTrades)){
+                  try{
+                    const addr = tok.tokenAddress || tok.address || tok.mint || '';
+                    const lastMap = sentNotifications[uid];
+                    const last = lastMap.get(addr) || 0;
+                    if (suppressionMs > 0 && (Date.now() - last) < suppressionMs) { console.log(`[notificationPump] skipping ${addr} for user ${uid} (recently sent)`); continue; }
+                    finalTokens2.push(tok);
+                  }catch(e){}
+                }
+                if(finalTokens2.length>0){
+                  try{
+                    const lines = finalTokens2.map(t => {
+                      const title = (t.name || t.symbol) ? `${t.name || ''}${t.symbol ? ' ('+t.symbol+')' : ''}` : t.tokenAddress.slice(0,8);
+                      const price = t.priceUsd ? `${Number(t.priceUsd).toFixed(4)} USD` : 'N/A';
+                      const liq = t.liquidityUsd ? `${Math.round(Number(t.liquidityUsd)).toLocaleString()} USD` : 'N/A';
+                      const shortSig = (t.sourceSignature||'').substring(0,8);
+                      const dex = t.url || (t.pairAddress ? `https://dexscreener.com/solana/${t.pairAddress}` : '');
+                      return `• <b>${title}</b> <code>${t.tokenAddress}</code>\n  السعر: ${price} | سيولة: ${liq}\n  مصدر: ${t.sourceProgram || 'listener'} | <code>${shortSig}</code>${dex? '\n  🔗 '+dex : ''}`;
+                    }).join('\n\n');
+                    const keyboard = { inline_keyboard: [ finalTokens2.slice(0,5).map(t=>({ text: `${t.symbol||t.name||t.tokenAddress.slice(0,6)}`, callback_data: `view|${uid}|${t.tokenAddress}` })), [{ text: 'إيقاف الإشعارات لهذه الإستراتيجية', callback_data: `mute|${uid}|strategy` }] ] };
+                    const chatId = uid;
+                    const aggMsg = `🔔 <b>نتائج استراتيجيتك (${finalTokens2.length})</b>\n\n${lines}`;
+                    await (bot.telegram as any).sendMessage(chatId, aggMsg, { parse_mode: 'HTML', reply_markup: keyboard });
+                    for(const t of finalTokens2){ const a = t.tokenAddress||t.address||t.mint||''; sentNotifications[uid].set(a, Date.now()); }
+                    console.log(`[notificationPump] sent aggregated notification for ${finalTokens2.length} token(s) to user ${uid}`);
+                  }catch(e){ console.error('[notificationPump] failed to send aggregated preview to', uid, e?.message||e); }
+                }
+              }catch(e){ console.error('[notificationPump] per-user processing failed', e); }
+            }
+            // after processing, clear legacy file if it existed
+            try{ await fsp.writeFile(notifFile, JSON.stringify([], null, 2), 'utf8'); } catch(e){ }
+          }catch(e){ /* ignore */ }
+        }
+  // run pump every 3s
+  setInterval(pumpOnce, 3000);
+  // run once immediately at startup to pick up any existing notifications
+  try { pumpOnce().catch(e=>console.error('[notificationPump] initial pump error', e)); } catch(e) { console.error('[notificationPump] initial pump scheduling failed', e); }
+      })();
   } catch (err: any) {
     if (err?.response?.error_code === 409) {
       console.error('❌ Bot launch failed: Conflict 409. Make sure the bot is not running elsewhere or stop all other sessions.');
@@ -710,11 +887,48 @@ bot.command('show_token', async (ctx) => {
     await ctx.reply('❌ You must set a strategy first using /strategy');
     return;
   }
-  try {
-    await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id });
-    await ctx.reply('🔔 Your request is queued for background processing. You will be notified if matching tokens are found (this avoids long waits and provider rate limits).');
+    try {
+      // Deep, accurate check path: fetch user-tailored tokens (may include on-chain enrichment) and apply strategy filter
+      await ctx.reply('🔎 Performing an accurate strategy check — this may take a few seconds. Please wait...');
+      // getTokensForUser will fetch Dex tokens and perform limited enrichment where needed
+      const tokens = await getTokensForUser(userId, user.strategy);
+      // Apply strategy filter with full checks (allow enrichment inside the filter)
+      let accurate: any[] = [];
+      try {
+        // Limit the accurate filter to a short timeout to avoid Telegraf's 90s handler cap.
+        // If it times out, enqueue a background job and inform the user.
+        accurate = await withTimeout(filterTokensByStrategy(tokens, user.strategy, { fastOnly: false }), 7000, 'show_token-filter');
+      } catch (e) {
+        console.error('[show_token] accurate filter failed or timed out', e?.message || e);
+        accurate = [];
+      }
+
+    if (!accurate || accurate.length === 0) {
+      // Nothing matched after the deeper check — queue a background enrich and inform user
+      try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch (e) { console.warn('[show_token] enqueue error:', e); }
+      await ctx.reply('🔔 No matches found after a deeper check; a background verification has been queued and you will be notified if matches appear.');
+      return;
+    }
+
+    // Respect user's maxTrades and present a professional list
+    const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
+    const maxShow = Math.min(maxTrades, 10, accurate.length);
+    let msg = `✅ Accurate results: <b>${accurate.length}</b> token(s) match your strategy (showing up to ${maxShow}):\n`;
+    for (const t of accurate.slice(0, maxShow)) {
+      try {
+  const preview = buildPreviewMessage(t);
+  const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
+  msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+      } catch (e) {
+        const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
+        msg += `\n<code>${addr}</code>\n`;
+      }
+    }
+  try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found matching tokens (accurate results).'); } catch {} }
+    return;
   } catch (e) {
-    console.error('[show_token] enqueue error:', e);
-    await ctx.reply('❌ Failed to enqueue background job. Try again later.');
+    console.error('[show_token] fast-preview error:', e?.stack || e);
+    try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch {}
+    await ctx.reply('❗ Internal error while producing a fast preview; a background check was queued.');
   }
 });
