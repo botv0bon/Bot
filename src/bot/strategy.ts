@@ -273,6 +273,23 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       if (allHaveSource) opts.preserveSources = true;
     }
   } catch (e) {}
+  // If caller requested to preserve sources (listener path) and the strategy has no
+  // numeric constraints (minMarketCap/minLiquidity/minVolume/minAge are all zero/undefined),
+  // treat listener-provided tokens as authoritative and bypass further filtering/enrichment.
+  try {
+    const numericKeys = ['minMarketCap', 'minLiquidity', 'minVolume', 'minAge'];
+    const hasNumericConstraint = numericKeys.some(k => {
+      const v = (strategy as any)?.[k];
+      return v !== undefined && v !== null && Number(v) > 0;
+    });
+    if ((opts && opts.preserveSources) && !hasNumericConstraint) {
+      const looksLikeListener = tokens.length > 0 && tokens.every(t => t && (t.sourceProgram || t.sourceSignature || t.sourceCandidates || (t.sourceTags && Array.isArray(t.sourceTags) && t.sourceTags.some((s: string) => /helius|listener|ws|dexscreener/i.test(s) ))));
+      if (looksLikeListener) {
+        try { console.log('[filterTokensByStrategy] bypassing filter for listener-provided tokens (no numeric constraints)'); } catch(_) {}
+        return tokens.slice();
+      }
+    }
+  } catch (e) {}
   // Integrated enrichment: attempt to enrich tokens with on-chain timestamps and freshness
   // using Helius (RPC/parse/websocket), Solscan and RPC fallbacks. This improves age
   // detection and allows downstream freshness scoring to be used in filters.
@@ -334,8 +351,9 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
   // Selective enrichment: when the strategy requires strict numeric/on-chain checks,
   // enrich a small set of top candidates (bounded concurrency) to obtain liquidity/volume/age fields
   try {
-    const needStrictNumeric = (strategy.minLiquidity !== undefined || strategy.minVolume !== undefined || strategy.minAge !== undefined || (strategy as any).requireOnchain === true);
-    if (needStrictNumeric && Array.isArray(prelim) && prelim.length > 0) {
+  const needStrictNumeric = (strategy.minLiquidity !== undefined || strategy.minVolume !== undefined || strategy.minAge !== undefined || (strategy as any).requireOnchain === true);
+  // If caller requested a fast-only pass, skip selective on-chain enrichment to remain responsive.
+  if (!(opts && opts.fastOnly) && needStrictNumeric && Array.isArray(prelim) && prelim.length > 0) {
       const tu = require('../utils/tokenUtils');
       const candidateLimit = Number(process.env.STRATEGY_ENRICH_CANDIDATES || 8);
       const concurrency = Math.max(1, Number(process.env.STRATEGY_ENRICH_CONCURRENCY || 3));

@@ -74,6 +74,67 @@ const userTokenCache: Record<string, { tokens: any[]; ts: number }> = {};
 
 async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
   const now = Date.now();
+  // If user's numeric strategy fields are all zero/undefined, prefer listener output
+  try {
+    const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
+    const hasNumericConstraint = numericKeys.some(k => {
+      const v = strategy && (strategy as any)[k];
+      return v !== undefined && v !== null && Number(v) > 0;
+    });
+  console.log('[show_token] hasNumericConstraint=', hasNumericConstraint);
+  if (!hasNumericConstraint) {
+      const isEthHex = (s: string) => typeof s === 'string' && /^0x[0-9a-fA-F]{40}$/.test(s);
+      // Try reading per-user notification files produced by the listener (newest first)
+      try {
+        const notifDir = path.join(process.cwd(), 'out', 'notifications');
+        const stat = await fsp.stat(notifDir).catch(() => null);
+        if (stat) {
+          const files = await fsp.readdir(notifDir).catch(() => []);
+          files.sort().reverse();
+          for (const fn of files) {
+            try {
+              const fp = path.join(notifDir, fn);
+              const raw = await fsp.readFile(fp, 'utf8').catch(() => null);
+              if (!raw) continue;
+              const o = JSON.parse(raw);
+              if (o && String(o.user) === String(userId) && Array.isArray(o.candidateTokens) && o.candidateTokens.length>0) {
+                const matches: any[] = [];
+                for (const c of o.candidateTokens) {
+                  try {
+                    const v = Object.assign({}, c || {});
+                    const addr = String(v.tokenAddress || v.address || v.mint || '').trim();
+                    if (!addr) continue;
+                    if (isEthHex(addr)) continue; // skip non-Solana hex addresses
+                    matches.push({ ...v, tokenAddress: addr, address: addr, mint: addr });
+                  } catch(e){}
+                }
+                if (matches.length > 0) {
+                  const maxTrades = strategy && strategy.maxTrades ? Math.max(1, Number(strategy.maxTrades)) : undefined;
+                  return (typeof maxTrades === 'number') ? matches.slice(0, maxTrades) : matches;
+                }
+              }
+            } catch (e) { /* ignore per-file errors */ }
+          }
+        }
+      } catch (e) { /* ignore and continue to other sources */ }
+
+      // If no per-user notification files, fall back to fastTokenFetcher (live sources)
+      try {
+        const ff = await import('./src/fastTokenFetcher');
+        const maxTrades = strategy && strategy.maxTrades ? Number(strategy.maxTrades) : undefined;
+        const latest = await ff.fetchLatest5FromAllSources(maxTrades && !isNaN(maxTrades) ? Math.max(1, Math.floor(maxTrades)) : undefined).catch(() => null);
+        const candidates: any[] = [];
+        if (latest) {
+          const push = (a: any) => { if (!a) return; const s = String(a).trim(); if (!s) return; if (isEthHex(s)) return; candidates.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
+          (latest.heliusEvents || []).forEach(push);
+          (latest.dexTop || []).forEach(push);
+          (latest.heliusHistory || []).forEach(push);
+        }
+        if (maxTrades && !isNaN(Number(maxTrades)) && Number(maxTrades) > 0) return candidates.slice(0, Number(maxTrades));
+        return candidates;
+      } catch (e) { /* fallback below */ }
+    }
+  } catch (e) {}
   // If user has no strategy or empty filters, reuse global cache for efficiency
   if (!strategy || Object.keys(strategy).length === 0) {
     if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
@@ -94,37 +155,16 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
   // Build extra params from strategy fields (only numeric/boolean filters)
   const extraParams: Record<string, string> = {};
   try {
-    for (const f of STRATEGY_FIELDS) {
-      if (!(f.key in strategy)) continue;
-      const v = strategy[f.key];
-      if (v === undefined || v === null) continue;
-      if (f.type === 'number') {
-        const n = Number(v);
-        if (!isNaN(n) && n !== 0) extraParams[f.key] = String(n);
-      } else if (f.type === 'boolean') {
-        extraParams[f.key] = v ? '1' : '0';
-      } else {
+      for (const f of STRATEGY_FIELDS) {
+        if (!(f.key in strategy)) continue;
+        const v = strategy[f.key];
+        if (v === undefined || v === null) continue;
+        // collect filter param to pass through to DexScreener
         extraParams[f.key] = String(v);
       }
-    }
-  } catch (e) {
-    console.error('[getTokensForUser] Error building extraParams from strategy', e);
-  }
+    } catch (e) {}
 
-  // If no meaningful params, fall back to global cache
-  if (Object.keys(extraParams).length === 0) {
-    if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
-      try {
-        globalTokenCache = await fetchDexScreenerTokens('solana');
-        lastCacheUpdate = Date.now();
-      } catch (e: any) {
-        console.error('[getTokensForUser] Fallback failed to refresh globalTokenCache:', e?.message || e);
-      }
-    }
-    return globalTokenCache;
-  }
-
-  // Try to fetch with user-specific params. If it fails, fall back to global cache.
+    // Try to fetch with user-specific params. If it fails, fall back to global cache.
   try {
     const tokens = await fetchDexScreenerTokens('solana', extraParams);
     // If strategy references age, apply fast numeric pre-filters (exclude age)
@@ -887,21 +927,61 @@ bot.command('show_token', async (ctx) => {
     await ctx.reply('❌ You must set a strategy first using /strategy');
     return;
   }
-    try {
-      // Deep, accurate check path: fetch user-tailored tokens (may include on-chain enrichment) and apply strategy filter
-      await ctx.reply('🔎 Performing an accurate strategy check — this may take a few seconds. Please wait...');
-      // getTokensForUser will fetch Dex tokens and perform limited enrichment where needed
+  try {
+    // If user's numeric strategy fields are all zero/undefined, present listener/live candidates immediately
+    const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
+    const hasNumericConstraint = numericKeys.some(k => {
+      const v = user.strategy && (user.strategy as any)[k];
+      return v !== undefined && v !== null && Number(v) > 0;
+    });
+    if (!hasNumericConstraint) {
+      // Fast path: return listener-produced candidates (or fastFetcher) without heavy enrichment
+      await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...');
       const tokens = await getTokensForUser(userId, user.strategy);
-      // Apply strategy filter with full checks (allow enrichment inside the filter)
-      let accurate: any[] = [];
-      try {
-        // Limit the accurate filter to a short timeout to avoid Telegraf's 90s handler cap.
-        // If it times out, enqueue a background job and inform the user.
-        accurate = await withTimeout(filterTokensByStrategy(tokens, user.strategy, { fastOnly: false }), 7000, 'show_token-filter');
-      } catch (e) {
-        console.error('[show_token] accurate filter failed or timed out', e?.message || e);
-        accurate = [];
+      console.log('[show_token] fast-path tokens:', (tokens || []).length);
+      // If these tokens are live candidates (from listener/fastFetcher), present immediately
+      if (Array.isArray(tokens) && tokens.length && tokens.every(t => (t as any).sourceCandidates || (t as any).matched || (t as any).tokenAddress)) {
+        console.log('[show_token] presenting live/sourceCandidates without heavy filter');
+        // proceed to render below as live results
+      } else {
+        // no tokens to show
       }
+      if (!tokens || tokens.length === 0) {
+        try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch (e) { console.warn('[show_token] enqueue error:', e); }
+        await ctx.reply('🔔 No recent listener results found; a background verification has been queued and you will be notified if matches appear.');
+        return;
+      }
+      const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
+      const maxShow = Math.min(maxTrades, 10, tokens.length);
+      let msg = `✅ Live results: <b>${tokens.length}</b> token(s) available (showing up to ${maxShow}):\n`;
+      for (const t of tokens.slice(0, maxShow)) {
+        try {
+          const preview = buildPreviewMessage(t);
+          const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
+          msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+        } catch (e) {
+          const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
+          msg += `\n<code>${addr}</code>\n`;
+        }
+      }
+      try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found live matching tokens.'); } catch {} }
+      return;
+    }
+
+    // Deep, accurate check path: fetch user-tailored tokens (may include on-chain enrichment) and apply strategy filter
+    await ctx.reply('🔎 Performing an accurate strategy check — this may take a few seconds. Please wait...');
+    // getTokensForUser will fetch Dex tokens and perform limited enrichment where needed
+    const tokens = await getTokensForUser(userId, user.strategy);
+    // Apply strategy filter with full checks (allow enrichment inside the filter)
+    let accurate: any[] = [];
+    try {
+      // Limit the accurate filter to a short timeout to avoid Telegraf's 90s handler cap.
+      // If it times out, enqueue a background job and inform the user.
+      accurate = await withTimeout(filterTokensByStrategy(tokens, user.strategy, { fastOnly: false }), 7000, 'show_token-filter');
+    } catch (e) {
+      console.error('[show_token] accurate filter failed or timed out', e?.message || e);
+      accurate = [];
+    }
 
     if (!accurate || accurate.length === 0) {
       // Nothing matched after the deeper check — queue a background enrich and inform user
@@ -916,15 +996,15 @@ bot.command('show_token', async (ctx) => {
     let msg = `✅ Accurate results: <b>${accurate.length}</b> token(s) match your strategy (showing up to ${maxShow}):\n`;
     for (const t of accurate.slice(0, maxShow)) {
       try {
-  const preview = buildPreviewMessage(t);
-  const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
-  msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+        const preview = buildPreviewMessage(t);
+        const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
+        msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
       } catch (e) {
         const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
         msg += `\n<code>${addr}</code>\n`;
       }
     }
-  try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found matching tokens (accurate results).'); } catch {} }
+    try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found matching tokens (accurate results).'); } catch {} }
     return;
   } catch (e) {
     console.error('[show_token] fast-preview error:', e?.stack || e);
