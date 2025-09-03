@@ -325,60 +325,66 @@ async function filterTokensByStrategy(tokens, strategy, opts) {
     // detection and allows downstream freshness scoring to be used in filters.
     if (tokens.length > 0) {
         try {
-            const utils = await Promise.resolve().then(() => __importStar(require('../utils/tokenUtils')));
-            // Merge realtime sources (Helius WS buffer, DexScreener top, Helius parse-history) so filters
-            // operate on a richer, corroborated set. Use existing fastTokenFetcher helper to gather latest candidates.
-            try {
-                const ff = await Promise.resolve().then(() => __importStar(require('../fastTokenFetcher')));
-                const latest = await ff.fetchLatest5FromAllSources(10).catch(() => null);
-                if (latest) {
-                    const extras = [];
-                    const pushAddr = (a) => { if (!a)
-                        return; const s = String(a); if (!s)
-                        return; extras.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
-                    (latest.heliusEvents || []).forEach(pushAddr);
-                    (latest.dexTop || []).forEach(pushAddr);
-                    (latest.heliusHistory || []).forEach(pushAddr);
-                    // merge extras into a local copy so we don't mutate caller's array
-                    const localTokens = tokens.slice();
-                    const seen = new Set(localTokens.map(t => (t.tokenAddress || t.address || t.mint || '').toString()));
-                    for (const ex of extras) {
-                        const key = ex.tokenAddress || ex.address || ex.mint || '';
-                        if (!key)
-                            continue;
-                        if (!seen.has(key)) {
-                            localTokens.push(ex);
-                            seen.add(key);
+            // If caller asked to preserve sources (listener path), skip merging realtime
+            // sources and background enrichment to remain fast and avoid network calls.
+            if (opts && opts.preserveSources) {
+                // noop: caller wants original tokens preserved
+            } else {
+                const utils = await Promise.resolve().then(() => __importStar(require('../utils/tokenUtils')));
+                // Merge realtime sources (Helius WS buffer, DexScreener top, Helius parse-history) so filters
+                // operate on a richer, corroborated set. Use existing fastTokenFetcher helper to gather latest candidates.
+                try {
+                    const ff = await Promise.resolve().then(() => __importStar(require('../fastTokenFetcher')));
+                    const latest = await ff.fetchLatest5FromAllSources(10).catch(() => null);
+                    if (latest) {
+                        const extras = [];
+                        const pushAddr = (a) => { if (!a)
+                            return; const s = String(a); if (!s)
+                            return; extras.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
+                        (latest.heliusEvents || []).forEach(pushAddr);
+                        (latest.dexTop || []).forEach(pushAddr);
+                        (latest.heliusHistory || []).forEach(pushAddr);
+                        // merge extras into a local copy so we don't mutate caller's array
+                        const localTokens = tokens.slice();
+                        const seen = new Set(localTokens.map(t => (t.tokenAddress || t.address || t.mint || '').toString()));
+                        for (const ex of extras) {
+                            const key = ex.tokenAddress || ex.address || ex.mint || '';
+                            if (!key)
+                                continue;
+                            if (!seen.has(key)) {
+                                localTokens.push(ex);
+                                seen.add(key);
+                            }
                         }
+                        tokens = localTokens;
+                        try {
+                            console.log('[filterTokensByStrategy] merged realtime sources; extraCandidates=', extras.length);
+                        }
+                        catch { }
                     }
-                    tokens = localTokens;
+                }
+                catch (e) {
                     try {
-                        console.log('[filterTokensByStrategy] merged realtime sources; extraCandidates=', extras.length);
+                        console.warn('[filterTokensByStrategy] failed to fetch realtime candidates', e && e.message ? e.message : e);
                     }
                     catch { }
                 }
-            }
-            catch (e) {
-                try {
-                    console.warn('[filterTokensByStrategy] failed to fetch realtime candidates', e && e.message ? e.message : e);
+                const enrichPromise = utils.enrichTokenTimestamps(tokens, {
+                    batchSize: Number(config_1.HELIUS_BATCH_SIZE || 6),
+                    delayMs: Number(config_1.HELIUS_BATCH_DELAY_MS || 300)
+                });
+                // Start enrichment in background (non-blocking) so filtering remains responsive.
+                // Log outcome for diagnostics but do not block the caller.
+                enrichPromise
+                    .then(() => { try {
+                    console.log('[filterTokensByStrategy] background enrichment completed');
                 }
-                catch { }
+                catch (_) { } })
+                    .catch((err) => { try {
+                    console.warn('[filterTokensByStrategy] background enrichment failed:', err && err.message ? err.message : err);
+                }
+                catch (_) { } });
             }
-            const enrichPromise = utils.enrichTokenTimestamps(tokens, {
-                batchSize: Number(config_1.HELIUS_BATCH_SIZE || 6),
-                delayMs: Number(config_1.HELIUS_BATCH_DELAY_MS || 300)
-            });
-            // Start enrichment in background (non-blocking) so filtering remains responsive.
-            // Log outcome for diagnostics but do not block the caller.
-            enrichPromise
-                .then(() => { try {
-                console.log('[filterTokensByStrategy] background enrichment completed');
-            }
-            catch (_) { } })
-                .catch((err) => { try {
-                console.warn('[filterTokensByStrategy] background enrichment failed:', err && err.message ? err.message : err);
-            }
-            catch (_) { } });
         }
         catch (e) {
             console.warn('[filterTokensByStrategy] enrichment failed or timed out:', e?.message || e);
@@ -521,7 +527,7 @@ async function filterTokensByStrategy(tokens, strategy, opts) {
         // that don't have a known on-chain age when the required min age is >= 60s
         // (treat numeric strategy.minAge as minutes for backward compatibility).
         const minAgeSeconds = strategy.minAge !== undefined
-            ? (typeof strategy.minAge === 'string' ? parseDuration(strategy.minAge) : Number(strategy.minAge) * 60)
+            ? parseDuration(strategy.minAge)
             : undefined;
         if (minAgeSeconds !== undefined) {
             if (ageSeconds === undefined || isNaN(ageSeconds)) {

@@ -277,16 +277,38 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
   // numeric constraints (minMarketCap/minLiquidity/minVolume/minAge are all zero/undefined),
   // treat listener-provided tokens as authoritative and bypass further filtering/enrichment.
   try {
-    const numericKeys = ['minMarketCap', 'minLiquidity', 'minVolume', 'minAge'];
-    const hasNumericConstraint = numericKeys.some(k => {
+    // Treat small numeric minAge (0/1/2) as seconds (not minutes) and do not
+    // consider them a "numeric constraint" for the purposes of bypassing the
+    // listener-preserve fast path. Any minAge > 2 (or non-numeric/string values)
+    // is considered a numeric constraint.
+    const numericKeys = ['minMarketCap', 'minLiquidity', 'minVolume'];
+    const hasOtherNumericConstraint = numericKeys.some(k => {
       const v = (strategy as any)?.[k];
       return v !== undefined && v !== null && Number(v) > 0;
     });
+    let minAgeIsConstraint = false;
+    try {
+      const ma = (strategy as any)?.minAge;
+      if (ma !== undefined && ma !== null) {
+        if (typeof ma === 'number' || !isNaN(Number(ma))) {
+          const num = Number(ma);
+          // 0/1/2 are treated as seconds and do NOT count as constraints; larger
+          // numbers count as minutes and are considered constraints when > 2.
+          if (num > 2) minAgeIsConstraint = true;
+        } else {
+          // string value (eg. '30s', '2m') - treat as constraint conservatively
+          minAgeIsConstraint = true;
+        }
+      }
+    } catch (e) {}
+    const hasNumericConstraint = hasOtherNumericConstraint || minAgeIsConstraint;
     if ((opts && opts.preserveSources) && !hasNumericConstraint) {
       const looksLikeListener = tokens.length > 0 && tokens.every(t => t && (t.sourceProgram || t.sourceSignature || t.sourceCandidates || (t.sourceTags && Array.isArray(t.sourceTags) && t.sourceTags.some((s: string) => /helius|listener|ws|dexscreener/i.test(s) ))));
       if (looksLikeListener) {
         try { console.log('[filterTokensByStrategy] bypassing filter for listener-provided tokens (no numeric constraints)'); } catch(_) {}
-        return tokens.slice();
+        // Respect user's maxTrades when returning bypassed listener tokens.
+        const maxTrades = strategy && (strategy as any).maxTrades ? Math.max(1, Number((strategy as any).maxTrades)) : undefined;
+        return (typeof maxTrades === 'number') ? tokens.slice(0, maxTrades) : tokens.slice();
       }
     }
   } catch (e) {}
@@ -464,7 +486,7 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
     // that don't have a known on-chain age when the required min age is >= 60s
     // (treat numeric strategy.minAge as minutes for backward compatibility).
     const minAgeSeconds = strategy.minAge !== undefined
-      ? (typeof strategy.minAge === 'string' ? parseDuration(strategy.minAge) : Number(strategy.minAge) * 60)
+      ? parseDuration(strategy.minAge as any)
       : undefined;
     if (minAgeSeconds !== undefined) {
       if (ageSeconds === undefined || isNaN(ageSeconds)) {

@@ -63,96 +63,54 @@ const bot = new Telegraf(TELEGRAM_TOKEN);
 console.log('--- Telegraf instance created ---');
 let users: Record<string, any> = {};
 console.log('--- Users placeholder created ---');
-let globalTokenCache: any[] = [];
-let lastCacheUpdate = 0;
-const CACHE_TTL = 1000 * 60 * 2;
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
 
-// Per-user token cache to allow fetching tailored token lists per-user strategy
-const userTokenCache: Record<string, { tokens: any[]; ts: number }> = {};
-
 async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
-  const now = Date.now();
-  // If user's numeric strategy fields are all zero/undefined, prefer listener output
+  // No central caches. Always fetch live data per-request. If the strategy has no
+  // numeric constraints, prefer the fastTokenFetcher live sources (listener path).
   try {
-    const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
-    const hasNumericConstraint = numericKeys.some(k => {
+    const numericKeys = ['minMarketCap','minLiquidity','minVolume'];
+    const hasOtherNumericConstraint = numericKeys.some(k => {
       const v = strategy && (strategy as any)[k];
       return v !== undefined && v !== null && Number(v) > 0;
     });
-  console.log('[show_token] hasNumericConstraint=', hasNumericConstraint);
-  if (!hasNumericConstraint) {
-      const isEthHex = (s: string) => typeof s === 'string' && /^0x[0-9a-fA-F]{40}$/.test(s);
-      // Try reading per-user notification files produced by the listener (newest first)
-      try {
-        const notifDir = path.join(process.cwd(), 'out', 'notifications');
-        const stat = await fsp.stat(notifDir).catch(() => null);
-        if (stat) {
-          const files = await fsp.readdir(notifDir).catch(() => []);
-          files.sort().reverse();
-          for (const fn of files) {
-            try {
-              const fp = path.join(notifDir, fn);
-              const raw = await fsp.readFile(fp, 'utf8').catch(() => null);
-              if (!raw) continue;
-              const o = JSON.parse(raw);
-              if (o && String(o.user) === String(userId) && Array.isArray(o.candidateTokens) && o.candidateTokens.length>0) {
-                const matches: any[] = [];
-                for (const c of o.candidateTokens) {
-                  try {
-                    const v = Object.assign({}, c || {});
-                    const addr = String(v.tokenAddress || v.address || v.mint || '').trim();
-                    if (!addr) continue;
-                    if (isEthHex(addr)) continue; // skip non-Solana hex addresses
-                    matches.push({ ...v, tokenAddress: addr, address: addr, mint: addr });
-                  } catch(e){}
-                }
-                if (matches.length > 0) {
-                  const maxTrades = strategy && strategy.maxTrades ? Math.max(1, Number(strategy.maxTrades)) : undefined;
-                  return (typeof maxTrades === 'number') ? matches.slice(0, maxTrades) : matches;
-                }
-              }
-            } catch (e) { /* ignore per-file errors */ }
-          }
+    let minAgeIsConstraint = false;
+    try {
+      const ma = (strategy as any)?.minAge;
+      if (ma !== undefined && ma !== null) {
+        if (typeof ma === 'number' || !isNaN(Number(ma))) {
+          const num = Number(ma);
+          if (num > 2) minAgeIsConstraint = true; // >2 treated as minutes constraint
+        } else {
+          minAgeIsConstraint = true;
         }
-      } catch (e) { /* ignore and continue to other sources */ }
-
-      // If no per-user notification files, fall back to fastTokenFetcher (live sources)
+      }
+    } catch (e) {}
+    const hasNumericConstraint = hasOtherNumericConstraint || minAgeIsConstraint;
+    if (!hasNumericConstraint) {
+      // fast listener path: fetch live candidates and return limited by maxTrades
       try {
         const ff = await import('./src/fastTokenFetcher');
         const maxTrades = strategy && strategy.maxTrades ? Number(strategy.maxTrades) : undefined;
         const latest = await ff.fetchLatest5FromAllSources(maxTrades && !isNaN(maxTrades) ? Math.max(1, Math.floor(maxTrades)) : undefined).catch(() => null);
         const candidates: any[] = [];
         if (latest) {
-          const push = (a: any) => { if (!a) return; const s = String(a).trim(); if (!s) return; if (isEthHex(s)) return; candidates.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
+          const push = (a: any) => { if (!a) return; const s = String(a).trim(); if (!s) return; candidates.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
           (latest.heliusEvents || []).forEach(push);
           (latest.dexTop || []).forEach(push);
           (latest.heliusHistory || []).forEach(push);
         }
         if (maxTrades && !isNaN(Number(maxTrades)) && Number(maxTrades) > 0) return candidates.slice(0, Number(maxTrades));
         return candidates;
-      } catch (e) { /* fallback below */ }
-    }
-  } catch (e) {}
-  // If user has no strategy or empty filters, reuse global cache for efficiency
-  if (!strategy || Object.keys(strategy).length === 0) {
-    if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
-      try {
-        globalTokenCache = await fetchDexScreenerTokens('solana');
-        lastCacheUpdate = Date.now();
-      } catch (e: any) {
-        console.error('[getTokensForUser] Failed to refresh globalTokenCache:', e?.message || e);
+      } catch (e) {
+        return [];
       }
     }
-    return globalTokenCache;
-  }
+  } catch (e) {}
 
-  // Check per-user cache
-  const cached = userTokenCache[userId];
-  if (cached && now - cached.ts < CACHE_TTL) return cached.tokens;
-
-  // Build extra params from strategy fields (only numeric/boolean filters)
+  // Strategy has numeric constraints: query DexScreener per-request with params and
+  // perform optional on-chain enrichment only for the top candidates. No global caching.
   const extraParams: Record<string, string> = {};
   try {
       for (const f of STRATEGY_FIELDS) {
@@ -216,19 +174,10 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     } catch (e) {
       console.error('[getTokensForUser] enrichment error:', e?.message || e);
     }
-    userTokenCache[userId] = { tokens, ts: Date.now() };
     return tokens;
   } catch (e: any) {
-    console.error('[getTokensForUser] Failed to fetch tokens with extraParams, falling back to global cache:', e?.message || e);
-    if (!globalTokenCache.length || now - lastCacheUpdate > CACHE_TTL) {
-      try {
-        globalTokenCache = await fetchDexScreenerTokens('solana');
-        lastCacheUpdate = Date.now();
-      } catch (err: any) {
-        console.error('[getTokensForUser] Final fallback failed to refresh globalTokenCache:', err?.message || err);
-      }
-    }
-    return globalTokenCache;
+    console.error('[getTokensForUser] Failed to fetch tokens with extraParams:', e?.message || e);
+    return [];
   }
 }
 
@@ -761,6 +710,7 @@ console.log('--- About to launch bot ---');
       } catch (e) {
         console.warn('Failed to start fast token fetcher:', e);
       }
+  // Note: listener is available as a module export and can be started separately.
   // Background notifications reader: pick up listener-produced notifications and send to users
       (async function notificationPump(){
         const outDir = path.join(process.cwd(), 'out');
@@ -937,11 +887,61 @@ bot.command('show_token', async (ctx) => {
     if (!hasNumericConstraint) {
       // Fast path: return listener-produced candidates (or fastFetcher) without heavy enrichment
       await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...');
-      const tokens = await getTokensForUser(userId, user.strategy);
+      // Try to use the sequential listener's one-shot collector when available.
+      // If the listener module exists but returns no fresh mints, DO NOT fallback to DexScreener
+      // to avoid showing older tokens — queue a background enrich instead and inform the user.
+      let tokens: any[] = [];
+      let listenerAvailable = false;
+      try{
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const seq = require('./scripts/sequential_10s_per_program.js');
+        if(seq && typeof seq.collectFreshMints === 'function'){
+          listenerAvailable = true;
+          // convert user's strategy.minAge to seconds when present
+          let maxAgeSec: number | undefined = undefined;
+          try{
+            const ma = user.strategy && (user.strategy as any).minAge;
+            if(ma !== undefined && ma !== null){
+              // allow strings like '10s', '5m', or plain numbers
+              const s = String(ma).trim().toLowerCase();
+              const secMatch = s.match(/^([0-9]+)s$/);
+              const minMatch = s.match(/^([0-9]+)m$/);
+              if(secMatch) maxAgeSec = Number(secMatch[1]);
+              else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60;
+              else if(!isNaN(Number(s))){
+                const n = Number(s);
+                // treat small values (0,1,2) as seconds per prior convention
+                if(n <= 2) maxAgeSec = n;
+                else maxAgeSec = n * 60;
+              }
+            }
+          }catch(e){}
+          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: 20000, maxAgeSec }).catch(()=>[]);
+          tokens = (addrs || []).map((a:any)=>({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
+        }
+      }catch(e){ listenerAvailable = false; }
+      if(listenerAvailable){
+        if(!tokens || tokens.length===0){
+          try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch (e) { console.warn('[show_token] enqueue error:', e); }
+          await ctx.reply('🔔 لا توجد نتائج مستمع حديثة الآن؛ تم جدولة تحقق خلفي وستتلقى إشعاراً عند توفر نتائج.');
+          return;
+        }
+      } else {
+        // listener not available: fall back to existing behavior (DexScreener / fast fetch)
+        tokens = await getTokensForUser(userId, user.strategy);
+      }
       console.log('[show_token] fast-path tokens:', (tokens || []).length);
       // If these tokens are live candidates (from listener/fastFetcher), present immediately
       if (Array.isArray(tokens) && tokens.length && tokens.every(t => (t as any).sourceCandidates || (t as any).matched || (t as any).tokenAddress)) {
         console.log('[show_token] presenting live/sourceCandidates without heavy filter');
+        // debug: print token provenance & freshness hints
+        try{
+          for(const t of tokens){
+            try{
+              console.error('[show_token-debug] token', { addr: t.tokenAddress||t.address||t.mint, listenerCollected: !!t.__listenerCollected, freshness: t._canonicalAgeSeconds || t.ageSeconds || t.ageMinutes || null });
+            }catch(e){}
+          }
+        }catch(e){}
         // proceed to render below as live results
       } else {
         // no tokens to show

@@ -45,10 +45,17 @@ const PROGRAMS = [
   'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu'
 ];
 
+// RULES: per-program allowed transaction kinds. This map controls which transaction kinds
+// are normally processed for each program during the sequential listener.
+// To avoid missing any real mint launches we define a small set of kinds that must
+// always be processed regardless of the per-program rule. This allows us to be
+// conservative (filter noisy swaps) while never skipping explicit mint initializations.
 const RULES = {
-  default: { allow: ['initialize','pool_creation'] },
+  // Make default inclusive: capture explicit initializes and swap events to avoid missing real launches
+  default: { allow: ['initialize','pool_creation','swap'] },
   'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s': { allow: ['initialize'] },
-  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA': { allow: [] },
+  // Token program: allow initialize so we detect mint initializations routed through Tokenkeg
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA': { allow: ['initialize'] },
   'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4': { allow: ['pool_creation','swap'] },
   'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA': { allow: ['pool_creation','swap'] },
   'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK': { allow: ['pool_creation','swap'] },
@@ -56,9 +63,13 @@ const RULES = {
   'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr': { allow: ['swap'] },
   '11111111111111111111111111111111': { allow: ['swap'] },
   '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin': { allow: ['pool_creation','initialize','swap'] },
-  '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp': { allow: [] },
+  // If a program had an empty allow list previously we now include initialize to avoid skipping real mint events
+  '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp': { allow: ['initialize'] },
   'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu': { allow: ['swap'] }
 };
+
+// Kinds that should always be processed to avoid dropping real mint launches.
+const ALWAYS_PROCESS_KINDS = new Set(['initialize']);
 
 const DENY = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB','So11111111111111111111111111111111111111112','TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA']);
 
@@ -68,7 +79,69 @@ const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 120;
 const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 250;
 const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 2000;
 const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 5;
-const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 3;
+// reduce default to 1 to limit expensive per-mint signature probes
+const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 1;
+// Freshness and first-signature matching configuration
+const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // only accept mints whose first-tx within this many seconds (default 20s)
+// Collector: allow accumulating a small number of freshly-accepted mints and
+// printing them as a single JSON array. Useful for short-lived runs/testing.
+const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
+const EXIT_ON_COLLECT = (process.env.EXIT_ON_COLLECT === 'false') ? false : true;
+const LATEST_COLLECTED = [];
+// Capture-only mode: when true the listener writes a minimal capture JSON to disk
+// and skips per-user enrichment/strategy analysis (reduces latency to print/save).
+const CAPTURE_ONLY = (process.env.CAPTURE_ONLY === 'true');
+// TTL for caching first-signature probes (ms). Configurable via env, with a dynamic
+// adjustment when upstream rate-limits increase to reduce probe pressure.
+const FIRST_SIG_TTL_MS = Number(process.env.FIRST_SIG_TTL_MS) || 15000;
+let _lastFirstSigCleanup = 0;
+function computeFirstSigTTL(){
+  try{
+    const base = Number(process.env.FIRST_SIG_TTL_MS) || FIRST_SIG_TTL_MS;
+    // If we observe 429s, increase TTL to reduce probe frequency (capped multiplier)
+    const rateHits = Math.min(RPC_STATS.rateLimit429 || 0, 5);
+    const multiplier = 1 + (rateHits * 0.5); // each 429 increases TTL by 50%, up to 5 hits
+    return Math.max(1000, Math.floor(base * multiplier));
+  }catch(e){ return FIRST_SIG_TTL_MS; }
+}
+const FIRST_SIG_MATCH_WINDOW_SECS = Number(process.env.FIRST_SIG_MATCH_WINDOW_SECS) || 3; // allowed delta between firstSig.blockTime and tx.blockTime
+const FIRST_SIG_CACHE = new Map(); // mint -> { sig, blockTime, ts }
+
+async function getFirstSignatureCached(mint){
+  if(!mint) return null;
+  try{
+    const now = Date.now();
+    const ttl = computeFirstSigTTL();
+    const cached = FIRST_SIG_CACHE.get(mint);
+    if(cached && (now - cached.ts) < ttl) return { sig: cached.sig, blockTime: cached.blockTime };
+    // occasional cleanup of stale cache entries to avoid unbounded growth
+    try{
+      if(now - _lastFirstSigCleanup > 60000){
+        _lastFirstSigCleanup = now;
+        for(const [k,v] of FIRST_SIG_CACHE.entries()){
+          if(!v || !v.ts || (now - v.ts) > (ttl * 3)) FIRST_SIG_CACHE.delete(k);
+        }
+      }
+    }catch(e){}
+    // attempt a single lightweight probe (keep retries minimal to avoid rate limit)
+    try{
+      const res = await heliusRpc('getSignaturesForAddress', [mint, { limit: 1 }]);
+      if(Array.isArray(res) && res.length>0){
+        const entry = res[0];
+        const s = getSig(entry);
+        const bt = entry.blockTime || entry.block_time || entry.blocktime || null;
+        FIRST_SIG_CACHE.set(mint, { sig: s || null, blockTime: bt || null, ts: Date.now() });
+        return { sig: s || null, blockTime: bt || null };
+      }
+      FIRST_SIG_CACHE.set(mint, { sig: null, blockTime: null, ts: Date.now() });
+      return null;
+    }catch(e){
+      // cache negative briefly to avoid hammering
+      FIRST_SIG_CACHE.set(mint, { sig: null, blockTime: null, ts: Date.now() });
+      return null;
+    }
+  }catch(e){ return null; }
+}
 
 // Simple RPC statistics for diagnostics
 const RPC_STATS = { calls: 0, errors: 0, rateLimit429: 0, totalLatencyMs: 0 };
@@ -78,29 +151,80 @@ function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 // heliusRpc(method, params, useEnrich=false)
 // when useEnrich=true the call uses the second Helius key / URL for enrichment work
 async function heliusRpc(method, params){
-  RPC_STATS.calls++;
-  const start = Date.now();
-  // choose key and url round-robin
-  try{
-    const keyIdx = heliusCallCounter % Math.max(1, _HELIUS_KEYS.length);
-    const urlIdx = heliusCallCounter % Math.max(1, HELIUS_RPC_URLS.length);
-    heliusCallCounter = (heliusCallCounter + 1) >>> 0;
-    const url = HELIUS_RPC_URLS[urlIdx];
-    const hdrs = Object.assign({ 'Content-Type': 'application/json' }, _HELIUS_KEYS[keyIdx] ? { 'x-api-key': _HELIUS_KEYS[keyIdx] } : {});
-    const res = await axios.post(url, { jsonrpc:'2.0', id:1, method, params }, { headers: hdrs, timeout:15000 });
-    const latency = Date.now() - start; RPC_STATS.totalLatencyMs += latency;
-    if(res && res.status === 429) RPC_STATS.rateLimit429++;
-    return res.data && (res.data.result || res.data);
-  }catch(e){
-    const status = e.response && e.response.status;
-    if(status === 429) RPC_STATS.rateLimit429++;
-    RPC_STATS.errors++;
-    return { __error: (e.response && e.response.statusText) || e.message, status };
+  // lightweight retry/backoff with jitter for transient failures (including 429)
+  const maxRetries = Number(process.env.HELIUS_RPC_MAX_RETRIES || 2);
+  for(let attempt=0; attempt<=maxRetries; attempt++){
+    RPC_STATS.calls++;
+    const start = Date.now();
+    try{
+      const keyIdx = heliusCallCounter % Math.max(1, _HELIUS_KEYS.length);
+      const urlIdx = heliusCallCounter % Math.max(1, HELIUS_RPC_URLS.length);
+      heliusCallCounter = (heliusCallCounter + 1) >>> 0;
+      const url = HELIUS_RPC_URLS[urlIdx];
+      const hdrs = Object.assign({ 'Content-Type': 'application/json' }, _HELIUS_KEYS[keyIdx] ? { 'x-api-key': _HELIUS_KEYS[keyIdx] } : {});
+      const res = await axios.post(url, { jsonrpc:'2.0', id:1, method, params }, { headers: hdrs, timeout:15000 });
+      const latency = Date.now() - start; RPC_STATS.totalLatencyMs += latency;
+      if(res && res.status === 429) RPC_STATS.rateLimit429++;
+      return res.data && (res.data.result || res.data);
+    }catch(e){
+      const status = e.response && e.response.status;
+      if(status === 429) RPC_STATS.rateLimit429++;
+      RPC_STATS.errors++;
+      // retry on 429 or network errors, otherwise return immediately
+      if(attempt < maxRetries && (status === 429 || !status)){
+        const base = Number(process.env.HELIUS_RPC_RETRY_BASE_MS) || 150;
+        const backoff = base * Math.pow(2, attempt);
+        // add jitter
+        const jitter = Math.floor(Math.random() * Math.min(100, backoff));
+        await sleep(backoff + jitter);
+        continue;
+      }
+      return { __error: (e.response && e.response.statusText) || e.message, status };
+    }
   }
 }
 
 // Common helius getTransaction options
 const HELIUS_TX_OPTS = { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 };
+
+// Concurrency and retry tuning for getTransaction calls
+const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 4;
+const MAX_TX_RETRIES = Number(process.env.MAX_TX_RETRIES) || 2;
+const TX_RETRY_BASE_MS = Number(process.env.TX_RETRY_BASE_MS) || 150;
+
+// simple semaphore for limiting concurrent getTransaction calls
+let txActive = 0;
+const txQueue = [];
+function _acquireTxSlot(){
+  if(txActive < TX_CONCURRENCY){ txActive++; return Promise.resolve(); }
+  return new Promise(resolve=> txQueue.push(resolve));
+}
+function _releaseTxSlot(){
+  txActive = Math.max(0, txActive-1);
+  const next = txQueue.shift(); if(next) { txActive++; next(); }
+}
+
+// fetchTransaction: uses heliusRpc under the hood but adds concurrency limiting and retries/backoff
+async function fetchTransaction(sig){
+  await _acquireTxSlot();
+  try{
+    for(let attempt=0; attempt<=MAX_TX_RETRIES; attempt++){
+      const res = await heliusRpc('getTransaction', [sig, HELIUS_TX_OPTS]);
+      // heliusRpc returns an object with __error on failure
+      if(res && res.__error){
+        const status = res.status || null;
+        // if rate-limited or transient, retry with backoff
+        if(attempt < MAX_TX_RETRIES){
+          const backoff = TX_RETRY_BASE_MS * Math.pow(2, attempt);
+          await sleep(backoff);
+          continue;
+        }
+        return res; // last attempt, return error object
+      }
+      return res; // success
+    }
+  }finally{ _releaseTxSlot(); }
+}
 
 // Utility: normalize signature field from different shapes
 function getSig(entry){
@@ -114,6 +238,17 @@ function joinTxLogs(tx){
     const logs = (tx && tx.meta && Array.isArray(tx.meta.logMessages)) ? tx.meta.logMessages : [];
     return logs.join('\n').toLowerCase();
   }catch(e){ return ''; }
+}
+
+// Helper: compute canonical age in seconds for a mint using firstBlockTime if available,
+// otherwise fall back to transaction block time. Returns null when neither is present.
+function getCanonicalAgeSeconds(firstBlockTime, txBlockTime){
+  try{
+    const now = Date.now();
+  if(firstBlockTime) return (now - (Number(firstBlockTime) * 1000)) / 1000;
+  if(txBlockTime) return (now - (Number(txBlockTime) * 1000)) / 1000;
+  }catch(e){}
+  return null;
 }
 
 function extractMints(tx){
@@ -209,210 +344,8 @@ async function startSequentialListener(options){
   // require strategy filter once to avoid repeated module resolution cost
   let strategyFilter = null;
   try{ strategyFilter = require('../src/bot/strategy').filterTokensByStrategy; }catch(e){ strategyFilter = null; }
-  // Try to load fastTokenFetcher utilities for canonical/enriched candidate data
-  let fastFetcher = null;
-  try { fastFetcher = require('../dist/src/fastTokenFetcher'); } catch (e) { try { fastFetcher = require('../src/fastTokenFetcher'); } catch (ee) { fastFetcher = null; } }
-  // DEX-only enrichment mode: controllable via env var DEX_ONLY (set to 'false' to disable DEX enrichment)
-  const DEX_ONLY = (process.env.DEX_ONLY || 'true').toString().toLowerCase() !== 'false';
-
-  // DEX sources allowed (comma-separated in .env, e.g. DEX_SOURCES=raydium,solfi,pammbay)
-  const DEX_SOURCES = (String(process.env.DEX_SOURCES || '')).split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-  const TARGET_MINTS = Number(process.env.TARGET_MINTS) || 4; // how many distinct minted tokens to gather then exit
-  const dexResults = [];
-
-  // Pretty-print current dexResults to terminal (compact summary + JSON)
-  function printDexResultsSummary() {
-    try{
-      // compact JSON array
-      console.log('\n=== DEX RESULTS SUMMARY ===');
-      try{ console.log(JSON.stringify({ dexChannel: dexResults }, null, 2)); }catch(e){ console.log(JSON.stringify({ dexChannel: dexResults })); }
-      // friendly per-mint lines
-      for(const r of dexResults){
-        try{
-          const m = (r && r.mint) || 'unknown';
-          const prog = (r && r.program) || 'unknown';
-          const sig = (r && r.signature) || '';
-          const dex = (r && r.dex && r.dex.dex) || (r && r.dex) || {};
-          const liq = dex && (dex.liquidity !== undefined ? dex.liquidity : (dex && dex.tvl)) || null;
-          const vol = dex && (dex.volume !== undefined ? dex.volume : null) || null;
-          console.log(`- ${m}  | program=${prog} | sig=${sig}`);
-          console.log(`  Liquidity: ${liq === null ? 'N/A' : liq} | Volume: ${vol === null ? 'N/A' : vol}`);
-        }catch(e){ }
-      }
-      console.log('=== END DEX RESULTS SUMMARY ===\n');
-    }catch(e){ /* ignore printing errors */ }
-  }
-
-  // Dexscreener fallback: try token-pairs endpoint first, then search endpoint
-  async function fetchDexscreenerForMint(mint){
-    if(!mint) return null;
-    const tokenPairsBase = (process.env.DEXSCREENER_API_ENDPOINT_TOKEN_PAIRS || 'https://api.dexscreener.com/token-pairs/v1/solana').replace(/\/$/, '');
-    const searchBase = (process.env.DEXSCREENER_API_ENDPOINT_SEARCH || 'https://api.dexscreener.com/latest/dex/search?q=').replace(/\/$/, '');
-    const axiosOpts = { timeout: 8000 };
-    try{
-      // try token-pairs endpoint
-      const tpUrl = `${tokenPairsBase}/${mint}`;
-      try{
-        const r = await axios.get(tpUrl, axiosOpts);
-        const d = r && r.data;
-        const pairs = d && (d.pairs || d.pair || (Array.isArray(d) ? d : null));
-        if(Array.isArray(pairs) && pairs.length>0){
-          const first = pairs[0];
-          const liquidity = first.liquidityUsd || first.liquidity || first.tvl || null;
-          const volume = first.volumeUsd || first.volume || first.volume_24h || null;
-          return { liquidity: liquidity || null, volume: volume || null, raw: d };
-        }
-        if(d && (d.liquidityUsd || d.volumeUsd || d.tvl)){
-          return { liquidity: d.liquidityUsd || d.tvl || null, volume: d.volumeUsd || d.volume || null, raw: d };
-        }
-      }catch(e){ /* ignore token-pairs errors */ }
-
-      // fallback: search endpoint
-      try{
-        const q = encodeURIComponent(mint);
-        const sUrl = `${searchBase}${q}`;
-        const r2 = await axios.get(sUrl, axiosOpts);
-        const sd = r2 && r2.data;
-        const items = sd && (sd.pairs || sd.results || sd.tokens || sd.pairsList || null) || sd;
-        if(Array.isArray(items) && items.length>0){
-          for(const it of items){
-            const liquidity = it.liquidityUsd || it.liquidity || it.tvl || (it.pair && (it.pair.liquidityUsd || it.pair.tvl)) || null;
-            const volume = it.volumeUsd || it.volume || it.volume_24h || (it.pair && (it.pair.volumeUsd || it.pair.volume)) || null;
-            if(liquidity || volume) return { liquidity: liquidity || null, volume: volume || null, raw: it };
-          }
-          return { liquidity: null, volume: null, raw: items[0] };
-        }
-        if(sd && (sd.liquidityUsd || sd.volumeUsd)) return { liquidity: sd.liquidityUsd||null, volume: sd.volumeUsd||null, raw: sd };
-      }catch(e){ /* ignore search errors */ }
-    }catch(e){ }
-    return null;
-  }
-
-  // Local DEX enrichment helper (single-file). Uses fastFetcher if available to get DEX/pool/liquidity info.
-  // sourceHint: program id (protocol) that produced the mint — prefer pools matching it
-  async function dexEnrichForMint(mintAddr, sourceHint){
-    if(!mintAddr) return { ok:false, error:'no_mint' };
-    if(fastFetcher && typeof fastFetcher.handleNewMintEventCached === 'function'){
-      try{
-        // try with limited retries/backoff in case of transient 429 errors
-        let det = null;
-        for(let attempt=1; attempt<=3; attempt++){
-          try{
-            det = await fastFetcher.handleNewMintEventCached(mintAddr, 60).catch(()=>null);
-            break;
-          }catch(e){
-            const msg = String(e && (e.message||e.response&&e.response.status) || e);
-            if(msg && msg.includes('429')){
-              // backoff and retry
-              await sleep(200 * Math.pow(2, attempt-1));
-              continue;
-            }
-            break;
-          }
-        }
-        // normalize a compact dex-focused result
-        // filter pools by allowed DEX_SOURCES when provided
-        let pools = det && (det.pools || det.pairs || det.dex || null) || null;
-        if (pools && Array.isArray(pools) && DEX_SOURCES.length > 0) {
-          pools = pools.filter(p => {
-            try{
-              // discover several possible fields that indicate pool source or program
-              const src = (p.source || p.provider || p.sourceName || p.dex || '').toString().toLowerCase();
-              const prog = (p.program || p.programId || p.owner || p.ammProgram || '').toString().toLowerCase();
-              if (sourceHint && sourceHint.toString()){
-                const sh = sourceHint.toString().toLowerCase();
-                if(prog && prog.includes(sh)) return true;
-                if(src && src.includes(sh)) return true;
-              }
-              if (!src) return false;
-              return DEX_SOURCES.includes(src) || DEX_SOURCES.some(ds => src.includes(ds));
-            }catch(e){ return false; }
-          });
-        }
-        const dex = {
-          mint: mintAddr,
-          found: !!(det && (det.firstBlockTime || (pools && pools.length>0) || det.liquidity)),
-          firstBlockTime: det && det.firstBlockTime || null,
-          liquidity: (det && (det.liquidity || det.tvl || det.dexLiquidity)) || null,
-          pools: pools,
-          canonical: det || null
-        };
-        // If no pools found and user provided DEX_SOURCES, attempt a local log-based probe using Helius
-        if((!dex.found || !dex.pools || dex.pools.length===0) && DEX_SOURCES.length>0){
-          try{
-            const sigs = await heliusRpc('getSignaturesForAddress', [mintAddr, { limit: 3 }]);
-            if(Array.isArray(sigs) && sigs.length>0){
-              for(const s0 of sigs){
-                try{
-                  const sSig = getSig(s0);
-                  if(!sSig) continue;
-                  const tx = await heliusRpc('getTransaction', [sSig, HELIUS_TX_OPTS]);
-                  const logs = (tx && tx.meta && Array.isArray(tx.meta.logMessages))? tx.meta.logMessages.join('\n').toLowerCase() : '';
-                  // prefer matches that mention the sourceHint (program id) first
-                  if(sourceHint && logs.includes(String(sourceHint).toLowerCase())){
-                    const matches = (tx && tx.meta && tx.meta.logMessages) || [];
-                    const pool = { source: String(sourceHint), signature: sSig, sampleLogs: matches.slice(0,10) };
-                    dex.found = true;
-                    dex.pools = dex.pools && dex.pools.length? dex.pools.concat([pool]) : [pool];
-                    if(!dex.firstBlockTime) dex.firstBlockTime = s0.blockTime || s0.block_time || null;
-                    try{ if((dex.liquidity===null || dex.liquidity===undefined)){ const ds = await fetchDexscreenerForMint(mintAddr); if(ds){ dex.liquidity = ds.liquidity || null; dex.volume = ds.volume || null; dex.canonical = Object.assign({}, dex.canonical || {}, { dexscreener: ds.raw }); } } }catch(e){}
-                    return { ok:true, dex };
-                  }
-                  for(const ds of DEX_SOURCES){
-                    if(logs.includes(ds)){
-                      const matches = (tx && tx.meta && tx.meta.logMessages) || [];
-                      const pool = { source: ds, signature: sSig, sampleLogs: matches.slice(0,10) };
-                      dex.found = true;
-                      dex.pools = dex.pools && dex.pools.length? dex.pools.concat([pool]) : [pool];
-                      if(!dex.firstBlockTime) dex.firstBlockTime = s0.blockTime || s0.block_time || null;
-                      try{ if((dex.liquidity===null || dex.liquidity===undefined)){ const ds = await fetchDexscreenerForMint(mintAddr); if(ds){ dex.liquidity = ds.liquidity || null; dex.volume = ds.volume || null; dex.canonical = Object.assign({}, dex.canonical || {}, { dexscreener: ds.raw }); } } }catch(e){}
-                      return { ok:true, dex };
-                    }
-                  }
-                }catch(e){ /* ignore per-signature probe errors */ }
-              }
-            }
-          }catch(e){ /* ignore local probe errors */ }
-        }
-  try{ if((dex.liquidity===null || dex.liquidity===undefined) && dex.found){ const dsAll = await fetchDexscreenerForMint(mintAddr); if(dsAll){ dex.liquidity = dex.liquidity || dsAll.liquidity || null; dex.volume = dsAll.volume || null; dex.canonical = Object.assign({}, dex.canonical || {}, { dexscreener: dsAll.raw }); } } }catch(e){}
-  return { ok:true, dex };
-      }catch(e){ return { ok:false, error: String(e && e.message || e) }; }
-    }
-    // No fastFetcher available: fallback: try a lightweight local probe via Helius to detect DEX mentions in tx logs
-    try{
-      if(DEX_SOURCES.length>0){
-  const sigs = await heliusRpc('getSignaturesForAddress', [mintAddr, { limit: 3 }]);
-        if(Array.isArray(sigs) && sigs.length>0){
-          for(const s0 of sigs){
-            try{
-              const sSig = s0 && (s0.signature||s0.txHash||s0.sig||s0.txhash);
-              if(!sSig) continue;
-              const tx = await heliusRpc('getTransaction', [sSig, HELIUS_TX_OPTS]);
-              const logs = (tx && tx.meta && tx.meta.logMessages) ? tx.meta.logMessages.join('\n').toLowerCase() : '';
-              // prefer sourceHint matches
-              if(sourceHint && logs.includes(String(sourceHint).toLowerCase())){
-                const matches = (tx && tx.meta && tx.meta.logMessages) || [];
-                const pool = { source: String(sourceHint), signature: sSig, sampleLogs: matches.slice(0,10) };
-                const dex = { mint: mintAddr, found: true, firstBlockTime: s0.blockTime||s0.block_time||null, liquidity: null, pools: [pool], canonical: null };
-                try{ const dsLocal = await fetchDexscreenerForMint(mintAddr); if(dsLocal){ dex.liquidity = dsLocal.liquidity || null; dex.volume = dsLocal.volume || null; dex.canonical = Object.assign({}, dex.canonical || {}, { dexscreener: dsLocal.raw }); } }catch(e){}
-                return { ok:true, dex };
-              }
-              for(const ds of DEX_SOURCES){
-                if(logs.includes(ds)){
-                  const matches = (tx && tx.meta && tx.meta.logMessages) || [];
-                  const pool = { source: ds, signature: sSig, sampleLogs: matches.slice(0,10) };
-                  const dex = { mint: mintAddr, found: true, firstBlockTime: s0.blockTime||s0.block_time||null, liquidity: null, pools: [pool], canonical: null };
-                  try{ const dsLocal2 = await fetchDexscreenerForMint(mintAddr); if(dsLocal2){ dex.liquidity = dsLocal2.liquidity || null; dex.volume = dsLocal2.volume || null; dex.canonical = Object.assign({}, dex.canonical || {}, { dexscreener: dsLocal2.raw }); } }catch(e){}
-                  return { ok:true, dex };
-                }
-              }
-            }catch(e){}
-          }
-        }
-      }
-    }catch(e){}
-    return { ok:false, error:'no_fast_fetcher' };
-  }
+  
+  const TARGET_MINTS = Number(process.env.TARGET_MINTS) || 4;
   // track last signature per program to avoid reprocessing the same tx repeatedly
   const lastSigPerProgram = new Map();
   while(!stopped){
@@ -426,7 +359,8 @@ async function startSequentialListener(options){
     while(Date.now()<end){
           if (stopped) break;
           try{
-            if(!rule || !Array.isArray(rule.allow) || rule.allow.length===0) break;
+            // Don't skip programs that have empty allow lists; continue but ensure we don't miss explicit initialize events
+            if(!rule || !Array.isArray(rule.allow)) break;
       // fetch a small batch of recent signatures to process any new ones
       const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
             if(!Array.isArray(sigs)||sigs.length===0){ await sleep(250); continue; }
@@ -445,31 +379,74 @@ async function startSequentialListener(options){
             const sig = getSig(s); if(!sig) { await sleep(250); continue; }
             if(seenTxs.has(sig)) { await sleep(POLL_SLEEP_MS); continue; } seenTxs.add(sig);
             lastSigPerProgram.set(p, sig);
-            const tx = await heliusRpc('getTransaction', [sig, HELIUS_TX_OPTS]);
-            if(!tx || tx.__error) { await sleep(250); continue; }
+            const tx = await fetchTransaction(sig);
+            if(!tx || tx.__error) { await sleep(POLL_SLEEP_MS); continue; }
             const kind = txKindExplicit(tx); if(!kind) { await sleep(250); continue; }
-            if(!rule.allow.includes(kind)) { await sleep(250); continue; }
+            // Always process explicit 'initialize' transactions to avoid missing real mint launches
+            if(!(rule.allow.includes(kind) || kind === 'initialize')) { await sleep(250); continue; }
             const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) { await sleep(250); continue; }
+            // Fast-path capture-only: write minimal capture immediately and skip enrichment/acceptance heuristics.
+            if(CAPTURE_ONLY){
+              try{
+                const outDir = path.join(process.cwd(), 'out', 'capture_queue');
+                try{ fs.mkdirSync(outDir, { recursive: true }); }catch(e){}
+                const payload = { time:new Date().toISOString(), program:p, signature:sig, kind: (txKindExplicit(tx) || null), mints: mints.slice(0,10), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
+                const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
+                const filePath = path.join(outDir, fileName);
+                fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+                console.error('CAPTURED', filePath);
+                // update seen set and collector so consumer won't reprocess the same mints
+                for(const m of mints) seenMints.add(m);
+                for(const m of mints){ if(LATEST_COLLECTED.length < COLLECT_MAX && !LATEST_COLLECTED.includes(m)) LATEST_COLLECTED.push(m); }
+                if(LATEST_COLLECTED.length >= COLLECT_MAX){ try{ console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX))); console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() })); if(EXIT_ON_COLLECT){ console.error('Exiting because COLLECT_MAX reached'); process.exit(0); } }catch(e){} }
+              }catch(e){}
+              await sleep(120);
+              continue;
+            }
             const fresh = [];
             const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
             for(const m of mints){
               try{
                 if(seenMints.has(m)) continue;
-                // Strict check: confirm the mint's first signature equals this tx signature
                 let accept = false;
-                try{
-                  const firstSigs = await heliusRpc('getSignaturesForAddress', [m, { limit: 1 }]);
-                  if(Array.isArray(firstSigs) && firstSigs.length>0){
-                    const firstSig = getSig(firstSigs[0]);
-                    if(firstSig && firstSig === sig) accept = true;
-                  }
-                }catch(e){}
-                // If signature probe failed, fall back to log-based created-in-this-tx heuristic and previous seen check
-                if(!accept){
-                  const createdHere = isMintCreatedInThisTx(tx, m);
-                  if(!createdHere) continue;
-                  const prev = await mintPreviouslySeen(m, txBlock, sig);
-                  if(prev===false) accept = true;
+                // 1) Explicit initialize transactions — accept immediately if the mint is in the tx
+                if(kind === 'initialize'){
+                  accept = true;
+                } else if(kind === 'swap'){
+                  // 2) For swaps: accept only if this tx is the mint's first signature AND the firstSig's blockTime
+                  //    is close to txBlock (within FIRST_SIG_MATCH_WINDOW_SECS) and within MAX_MINT_AGE_SECS
+                  try{
+                    const first = await getFirstSignatureCached(m);
+                    if(first && first.sig && first.sig === sig){
+                      const ft = first.blockTime || null;
+                      if(ft && txBlock){
+                        const delta = Math.abs(Number(ft) - Number(txBlock));
+                        if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
+                          const ageSec = getCanonicalAgeSeconds(ft, txBlock);
+                          if(ageSec !== null && ageSec <= MAX_MINT_AGE_SECS) accept = true;
+                          else console.error(`REJECT_AGE mint=${m} age=${ageSec}s > ${MAX_MINT_AGE_SECS}s sig=${sig}`);
+                        }
+                      }
+                    }
+                  }catch(e){ /* ignore */ }
+                } else {
+                  // 3) For other kinds: only accept if there's a strong created-in-this-tx indicator AND it's fresh
+                  try{
+                    const createdHere = isMintCreatedInThisTx(tx, m);
+                    if(createdHere){
+                      const first = await getFirstSignatureCached(m);
+                      let ageSec = null;
+                        if(first && first.blockTime) ageSec = getCanonicalAgeSeconds(first.blockTime, txBlock);
+                        else if(txBlock) ageSec = getCanonicalAgeSeconds(null, txBlock);
+                        if(ageSec !== null && ageSec <= MAX_MINT_AGE_SECS){
+                        const prev = await mintPreviouslySeen(m, txBlock, sig);
+                        if(prev === false) accept = true;
+                        else console.error(`REJECT_PREVIOUS_SEEN mint=${m} prevSeen=true sig=${sig}`);
+                      } else {
+                        console.error(`REJECT_AGE_NO_FIRST mint=${m} age=${ageSec} sig=${sig}`);
+                      }
+                    }
+                  }catch(e){}
                 }
                 if(accept) fresh.push(m);
               }catch(e){}
@@ -508,105 +485,45 @@ async function startSequentialListener(options){
               }catch(e){}
             }
             for(const m of fresh) seenMints.add(m);
-            if (DEX_ONLY) {
-              // DEX-only flow: enrich only the first fresh mint via dexEnrichForMint and emit that result
-              const firstMint = fresh[0];
+            // Emit global event for listeners (no DEX enrichment)
+            const globalEvent = { time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
+            // No optional raw enrichment (PRINT_RAW_FRESH removed) — keep events lightweight
+            console.log(JSON.stringify(globalEvent));
+            // If capture-only mode is enabled, write a tiny capture file and skip enrichment
+            if(CAPTURE_ONLY){
               try{
-                const dexRes = await dexEnrichForMint(firstMint);
-                const dexEvent = { time: new Date().toISOString(), program: p, signature: sig, kind: kind, mint: firstMint, dex: dexRes };
-                // push into dexResults array and emit to dexChannel
-                try{ dexResults.push(dexEvent); }catch(e){}
-                try{ notifier.emit('dexChannel', dexEvent); }catch(e){}
-                // Also write the raw dexEvent to an append-only ndjson channel for external consumers
-                try{
-                  const outDir = path.join(process.cwd(), 'out');
-                  try{ fs.mkdirSync(outDir, { recursive: true }); } catch(e){}
-                  const channelFile = path.join(outDir, 'dex_channel.ndjson');
-                  try{ fs.appendFileSync(channelFile, JSON.stringify(dexEvent) + '\n', 'utf8'); } catch(e){}
-                }catch(e){}
-                // Start background rotation enrichment using provided DEX_SOURCES and/or dexRes canonical info
-                (async function backgroundEnrich(evt){
-                  try{
-                    // collect candidate source hints: prefer explicit DEX_SOURCES from env, else try canonical pools/programs
-                    const hints = Array.isArray(DEX_SOURCES) && DEX_SOURCES.length>0 ? DEX_SOURCES.slice() : [];
-                    try{
-                      const canonical = evt && evt.dex && evt.dex.dex && evt.dex.dex.canonical;
-                      if(canonical){
-                        // try to extract probable sources from canonical (pools/providers/program)
-                        try{
-                          const p = canonical.program || canonical.programId || canonical.owner || canonical.source || canonical.provider || null;
-                          if(p) hints.push(String(p).toLowerCase());
-                        }catch(e){}
-                        try{
-                          if(Array.isArray(canonical.pools)) for(const pp of canonical.pools){ if(pp && (pp.source||pp.provider||pp.program)) hints.push(String(pp.source||pp.provider||pp.program).toLowerCase()); }
-                        }catch(e){}
-                      }
-                    }catch(e){}
-                    // de-duplicate hints while preserving order
-                    const seenHints = new Set();
-                    const uniqHints = [];
-                    for(const h of hints){ try{ if(!h) continue; const s = String(h).toLowerCase(); if(!seenHints.has(s)){ seenHints.add(s); uniqHints.push(s); } }catch(e){} }
-                    // If no hints, add a fallback null attempt to run general dexscreener probe
-                    if(uniqHints.length===0) uniqHints.push(null);
-                    // Iterate hints with small delays to avoid immediate rate-limiting
-                    for(const hint of uniqHints){
-                      try{
-                        await sleep(150 * (Math.random()*3 + 1));
-                        const res = await dexEnrichForMint(evt.mint, hint);
-                        // append enrichment result to channel file
-                        try{
-                          const outDir2 = path.join(process.cwd(), 'out');
-                          const channelFile2 = path.join(outDir2, 'dex_channel.ndjson');
-                          const enriched = { time: new Date().toISOString(), program: evt.program, signature: evt.signature, mint: evt.mint, hint: hint, enrichment: res };
-                          try{ fs.appendFileSync(channelFile2, JSON.stringify(enriched) + '\n', 'utf8'); } catch(e){}
-                        }catch(e){}
-                        // if enrichment found pools/liq, stop further attempts for this event
-                        try{ if(res && res.ok && res.dex && res.dex.found) break; }catch(e){}
-                      }catch(e){}
-                    }
-                  }catch(e){}
-                })(dexEvent).catch(()=>{});
-                // print the new event (keep per-event output). Avoid printing the full summary every push
-                console.log(JSON.stringify(dexEvent));
-                // mark seen only when DEX found enrichment to avoid reprocessing
-                try{ if(dexRes && dexRes.ok && dexRes.dex && dexRes.dex.found) seenMints.add(firstMint); }catch(e){}
-                // if we've collected enough distinct DEX results, stop the whole listener and print summary
-                try{
-                  if (dexResults.length >= TARGET_MINTS) {
-                    console.error('TARGET_MINTS reached', dexResults.length);
-                    // Print a single final summary and stop
-                    try{ printDexResultsSummary(); }catch(e){}
-                    stopped = true;
-                    break;
-                  }
-                }catch(e){}
-              }catch(e){ console.error('DEX_ENRICH_ERROR', String(e && e.message || e)); }
-            } else {
-              // Emit global event for listeners
-      const globalEvent = { time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
-                // If requested, perform immediate raw enrichment for fresh mints (on this file only)
-                const doRaw = String(process.env.PRINT_RAW_FRESH || '').toLowerCase() === 'true';
-                if (doRaw) {
-                  try{
-                    const rawResults = [];
-                    for(const fm of (fresh.slice(0,5))) {
-                      try{
-                        const acct = await heliusRpc('getAccountInfo', [fm, { encoding: 'base64' }]);
-                        const sigs = await heliusRpc('getSignaturesForAddress', [fm, { limit: 5 }]);
-                        let tx0 = null;
-                        try{
-                          if(Array.isArray(sigs) && sigs.length>0){ const s0 = sigs[0]; const sSig = getSig(s0); if(sSig) tx0 = await heliusRpc('getTransaction', [sSig, HELIUS_TX_OPTS]); }
-                        }catch(e){}
-                        rawResults.push({ mint: fm, account: acct, signatures: Array.isArray(sigs)?sigs:sigs, sampleFirstTx: tx0 });
-                      }catch(e){ rawResults.push({ mint: fm, __error: String(e && e.message || e) }); }
-                    }
-                    globalEvent.rawEnrich = rawResults;
-                  }catch(e){ /* ignore raw enrich errors */ }
-                }
-                console.log(JSON.stringify(globalEvent));
-      // emit program-level event
-      try{ notifier.emit('programEvent', globalEvent); }catch(e){}
+                const outDir = path.join(process.cwd(), 'out', 'capture_queue');
+                try{ fs.mkdirSync(outDir, { recursive: true }); }catch(e){}
+                const payload = { time:new Date().toISOString(), program:p, signature:sig, kind:kind, fresh:fresh.slice(0,10), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
+                const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
+                const filePath = path.join(outDir, fileName);
+                fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+                console.error('CAPTURED', filePath);
+              }catch(e){}
+              // still update collector and seen set but skip heavy enrichment
+              try{ for(const m of fresh) seenMints.add(m); }catch(e){}
+              await sleep(120);
+              continue;
             }
+            // Collector: push accepted fresh mints (first up-to COLLECT_MAX unique entries)
+            try{
+              for(const m of fresh){
+                if(LATEST_COLLECTED.length >= COLLECT_MAX) break;
+                if(!LATEST_COLLECTED.includes(m)) LATEST_COLLECTED.push(m);
+              }
+              if(LATEST_COLLECTED.length >= COLLECT_MAX){
+                try{
+                  console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX)));
+                  console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
+                }catch(e){}
+                if(EXIT_ON_COLLECT){
+                  try{ console.error('Exiting because COLLECT_MAX reached'); }catch(e){}
+                  process.exit(0);
+                }
+              }
+            }catch(e){}
+            // emit program-level event
+            try{ notifier.emit('programEvent', globalEvent); }catch(e){}
             // Also evaluate per-user strategies (if any) and emit per-user matches
             try{
               const strategyFilterLocal = strategyFilter; // cached above
@@ -618,38 +535,18 @@ async function startSequentialListener(options){
                 // include listener source metadata so strategy filters can preserve/inspect realtime origin
                 const tok = { address: mintAddr, tokenAddress: mintAddr, mint: mintAddr, sourceProgram: p, sourceSignature: sig, sampleLogs: (tx.meta&&tx.meta.logMessages||[]).slice(0,10), sourceCandidates: true };
                 try{
-                  // Prefer fastTokenFetcher enrichment if available to get canonical age, liquidity, sources
-                  if (fastFetcher && typeof fastFetcher.handleNewMintEventCached === 'function') {
-                    try{
-                      const det = await fastFetcher.handleNewMintEventCached(mintAddr, 60).catch(() => null);
-                      if (det) {
-                        if (det.firstBlockTime) {
-                          try { tok.freshnessDetails = { firstTxMs: Number(det.firstBlockTime) * 1000 }; } catch(e){}
-                          try { tok._canonicalAgeSeconds = (Date.now() - (Number(det.firstBlockTime) * 1000)) / 1000; } catch(e){}
-                        }
-                        if (det.metadataExists !== undefined) tok.metadataExists = det.metadataExists;
-                        if (det.supply !== undefined) tok.supply = det.supply;
+                  // Lightweight on-chain first-signature probe to compute freshness only
+                  try{
+                    const sigs = await heliusRpc('getSignaturesForAddress', [mintAddr, { limit: 1 }]);
+                    if (Array.isArray(sigs) && sigs.length > 0) {
+                      const s0 = sigs[0];
+                      const bt = s0.blockTime || s0.block_time || s0.blocktime || null;
+                      if (bt) {
+                        try { tok.freshnessDetails = { firstTxMs: Number(bt) * 1000 }; } catch(e){}
+                        try { tok._canonicalAgeSeconds = getCanonicalAgeSeconds(bt, null); } catch(e){}
                       }
-                    }catch(e){}
-                    try{
-                      const cache = (fastFetcher.getGlobalFetchCache && fastFetcher.getGlobalFetchCache()) || [];
-                      const found = cache.find(c => String((c.tokenAddress||c.address||c.mint||'')).toLowerCase() === String(mintAddr).toLowerCase());
-                      if (found) tok = Object.assign({}, found, tok);
-                    }catch(e){}
-                  } else {
-                    // fallback: cheap on-chain first-signature probe
-                    try{
-                      const sigs = await heliusRpc('getSignaturesForAddress', [mintAddr, { limit: 1 }]);
-                      if (Array.isArray(sigs) && sigs.length > 0) {
-                        const s0 = sigs[0];
-                        const bt = s0.blockTime || s0.block_time || s0.blocktime || null;
-                        if (bt) {
-                          try { tok.freshnessDetails = { firstTxMs: Number(bt) * 1000 }; } catch(e){}
-                          try { tok._canonicalAgeSeconds = (Date.now() - (Number(bt) * 1000)) / 1000; } catch(e){}
-                        }
-                      }
-                    }catch(e){}
-                  }
+                    }
+                  }catch(e){}
                 }catch(e){}
                 return tok;
               }));
@@ -742,6 +639,96 @@ async function startSequentialListener(options){
 }
 
 module.exports.startSequentialListener = startSequentialListener;
+// Lightweight one-shot collector: run the minimal discovery loop until we collect
+// `maxCollect` fresh mints or `timeoutMs` elapses. Returns an array of mint addresses.
+async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec = undefined } = {}){
+  const collected = [];
+  const seenMintsLocal = new Set();
+  const stopAt = Date.now() + (Number(timeoutMs) || 20000);
+  try{
+    for(const p of PROGRAMS){
+      if(Date.now() > stopAt) break;
+      try{
+        const sigs = await heliusRpc('getSignaturesForAddress', [p, { limit: SIG_BATCH_LIMIT }]);
+        if(!Array.isArray(sigs) || sigs.length===0) continue;
+        for(const s of sigs){
+          if(Date.now() > stopAt) break;
+          const sig = getSig(s); if(!sig) continue;
+          const tx = await fetchTransaction(sig);
+          if(!tx || tx.__error) continue;
+          const kind = txKindExplicit(tx); if(!kind) continue;
+          const rule = RULES[p] || RULES.default;
+          if(!(rule.allow.includes(kind) || kind === 'initialize')) continue;
+          const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) continue;
+          const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
+          for(const m of mints){
+            if(collected.length >= maxCollect) break;
+            if(seenMintsLocal.has(m)) continue;
+            let accept = false;
+            if(kind === 'initialize'){
+              // treat initialize as a creation indicator but still require freshness and not previously seen
+              try{
+                const first = await getFirstSignatureCached(m);
+                const ft = first && first.blockTime ? first.blockTime : null;
+                const ageSecInit = getCanonicalAgeSeconds(ft, txBlock);
+        const allowAge = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : MAX_MINT_AGE_SECS;
+        if(ageSecInit !== null && ageSecInit <= allowAge){
+                  const prevInit = await mintPreviouslySeen(m, txBlock, sig);
+                  if(prevInit === false) accept = true;
+                  else console.error(`REJECT_PREVIOUS_SEEN init mint=${m} prevSeen=true sig=${sig}`);
+                } else {
+                  console.error(`REJECT_AGE init mint=${m} age=${ageSecInit} sig=${sig}`);
+                }
+              }catch(e){}
+            }
+            else if(kind === 'swap'){
+              try{
+                const first = await getFirstSignatureCached(m);
+                if(first && first.sig && first.sig === sig){
+                  const ft = first.blockTime || null;
+                  if(ft && txBlock){
+                    const delta = Math.abs(Number(ft) - Number(txBlock));
+                    if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
+                      const ageSec = getCanonicalAgeSeconds(ft, txBlock);
+            if(ageSec !== null && ageSec <= allowAge) accept = true;
+                    }
+                  }
+                }
+              }catch(e){}
+            } else {
+              try{
+                const createdHere = isMintCreatedInThisTx(tx, m);
+                if(createdHere){
+                  const first = await getFirstSignatureCached(m);
+                  let ageSec = null;
+                  if(first && first.blockTime) ageSec = getCanonicalAgeSeconds(first.blockTime, txBlock);
+                  else if(txBlock) ageSec = getCanonicalAgeSeconds(null, txBlock);
+          if(ageSec !== null && ageSec <= allowAge){
+                    const prev = await mintPreviouslySeen(m, txBlock, sig);
+                    if(prev === false) accept = true;
+                  }
+                }
+              }catch(e){}
+            }
+            if(accept){
+              collected.push(m); seenMintsLocal.add(m);
+              try{
+                const firstCached = await getFirstSignatureCached(m).catch(()=>null);
+                const ft = firstCached && firstCached.blockTime ? firstCached.blockTime : null;
+                const ageSec = getCanonicalAgeSeconds(ft, txBlock);
+                console.error(`COLLECT_DEBUG accept program=${p} kind=${kind} mint=${m} age=${ageSec} firstBlock=${ft} txBlock=${txBlock} sig=${sig}`);
+              }catch(e){}
+            }
+          }
+          if(collected.length >= maxCollect) break;
+        }
+      }catch(e){}
+      if(collected.length >= maxCollect) break;
+    }
+  }catch(e){}
+  return Array.from(new Set(collected)).slice(0, maxCollect);
+}
+module.exports.collectFreshMints = collectFreshMints;
 // If script is executed directly, run immediately (CLI usage preserved)
 if (require.main === module) {
   startSequentialListener().catch(e => { console.error('Listener failed:', e && e.message || e); process.exit(1); });

@@ -310,8 +310,10 @@ function parseDuration(v) {
     if (v === undefined || v === null || v === '')
         return undefined;
     if (typeof v === 'number') {
-        // Backwards compatibility: plain numbers are treated as minutes (legacy behaviour)
-        return Math.floor(Number(v) * 60);
+    // Treat plain numeric values as seconds (explicit and unambiguous)
+    const n = Number(v);
+    if (isNaN(n)) return undefined;
+    return Math.floor(n);
     }
     const s = String(v).trim().toLowerCase();
     const match = s.match(/^([0-9]+(?:\.[0-9]+)?)\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hr|hrs|hours|d|day|days)?$/);
@@ -1738,7 +1740,16 @@ function buildTokenMessage(token, botUsername, pairAddress, userId) {
         }
     }
     // --- Extra fields ---
-    msg += buildExtraFields(token);
+    // include a small set of extra fields if they help users (but avoid raw debug dumps)
+    const debugFields = ['freshnessScore','freshnessDetails','poolOpenTimeMs','ageSeconds','jupiterCheck'];
+    const extras = {};
+    for (const k of debugFields)
+        if (token[k] !== undefined)
+            extras[k] = token[k];
+    if (Object.keys(extras).length) {
+        msg += '\n<b>Details:</b>\n';
+        msg += buildExtraFields(extras);
+    }
     // --- Description ---
     if (token.description)
         msg += `\n<em>${token.description}</em>\n`;
@@ -1751,7 +1762,28 @@ function buildTokenMessage(token, botUsername, pairAddress, userId) {
     msg += `\n${memecoinEmoji} <b>Solana Memecoin Community</b> | ${solEmoji} <b>Powered by DexScreener</b>\n`;
     // --- Inline keyboard (all links/buttons at the bottom) ---
     const { inlineKeyboard } = buildInlineKeyboard(token, botUsername, pairAddress, userId);
-    return { msg, inlineKeyboard };
+    // Also produce a Markdown variant for clients that prefer Markdown (returned for inspection)
+    const esc = (s) => String(s).replace(/[_*\[\]()~`>#+\-=|{}.!]/g, '\\$&');
+    let msgMd = '';
+    msgMd += `🪙 ${name ? esc(name) : 'Unknown'}` + (symbol ? ` \`${esc(symbol)}\`` : '') + '\n';
+    msgMd += `🔗 Address: \`${esc(address || 'N/A')}\`\n\n`;
+    msgMd += `💰 Market Cap: ${esc(String(nice(fmtField(marketCap, 'marketCap'))))} USD\n`;
+    msgMd += `💧 Liquidity: ${esc(String(nice(fmtField(liquidity, 'liquidity'))))} USD\n`;
+    msgMd += `🔊 Volume 24h: ${esc(String(nice(fmtField(volume, 'volume'))))} USD\n`;
+    msgMd += `⏱️ Age: ${esc(String(ageDisplay))}\n`;
+    msgMd += `📈 Price: ${esc(String(fmtField(price, 'price')))} USD\n`;
+    if (Object.keys(extras).length) {
+        msgMd += '\n**Details:**\n';
+        for (const k of Object.keys(extras)) {
+            try {
+                msgMd += `- ${esc(k)}: \`${esc(String(typeof extras[k] === 'object' ? JSON.stringify(extras[k]) : String(extras[k])))}\`\n`;
+            }
+            catch (e) { }
+        }
+    }
+    msgMd += `\n🚀 Solana Memecoin Community | 🟣 Powered by DexScreener\n`;
+
+    return { msg, msgMarkdown: msgMd, inlineKeyboard };
 }
 function progressBar(percent, size = 10, fill = '█', empty = '░') {
     const filled = Math.round((percent / 100) * size);
