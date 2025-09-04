@@ -1,4 +1,6 @@
 import path from 'path';
+// listener-only guard to avoid disk I/O in hot paths
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
 import fs from 'fs';
 const fsp = fs.promises;
 
@@ -25,6 +27,16 @@ export async function hasPendingBuy(userId: string, tokenAddress: string): Promi
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   try {
+    // In listener-only mode avoid disk access; use in-memory fallback store
+    if (LISTENER_ONLY_MODE) {
+      try {
+        if (!(global as any).__inMemorySentTokens) (global as any).__inMemorySentTokens = new Map<string, any[]>();
+        const store: Map<string, any[]> = (global as any).__inMemorySentTokens;
+        const userTrades = store.get(userId) || [];
+        return (userTrades || []).some((t: any) => t.mode === 'buy' && t.token === tokenAddress && t.status === 'success' &&
+          !(userTrades || []).some((s: any) => s.mode === 'sell' && s.token === tokenAddress && s.status === 'success'));
+      } catch (e) { return false; }
+    }
     const stat = await fsp.stat(userFile).catch(() => false);
     if (!stat) return false;
     const data = await fsp.readFile(userFile, 'utf8');

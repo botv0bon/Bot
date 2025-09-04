@@ -7,6 +7,8 @@ import { unifiedBuy, unifiedSell } from '../tradeSources';
 import fs from 'fs';
 const fsp = fs.promises;
 import path from 'path';
+// listener-only guard to avoid disk I/O in hot paths
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
 
 export async function registerBuyWithTarget(user: any, token: any, buyResult: any, targetPercent = 10) {
   // تأكد من وجود معرف المستخدم داخل الكائن
@@ -24,10 +26,19 @@ export async function registerBuyWithTarget(user: any, token: any, buyResult: an
   const userFile = path.join(sentTokensDir, `${userId}.json`);
   let userTrades: any[] = [];
   try {
-    const stat = await fsp.stat(userFile).catch(() => false);
-    if (stat) {
-      const data = await fsp.readFile(userFile, 'utf8');
-      userTrades = JSON.parse(data || '[]');
+    // In listener-only mode, prefer in-memory store; otherwise read from disk
+    if (LISTENER_ONLY_MODE) {
+      try {
+        if (!(global as any).__inMemorySentTokens) (global as any).__inMemorySentTokens = new Map<string, any[]>();
+        const store: Map<string, any[]> = (global as any).__inMemorySentTokens;
+        userTrades = store.get(userId) || [];
+      } catch (e) { userTrades = []; }
+    } else {
+      const stat = await fsp.stat(userFile).catch(() => false);
+      if (stat) {
+        const data = await fsp.readFile(userFile, 'utf8');
+        userTrades = JSON.parse(data || '[]');
+      }
     }
   } catch {}
   // تعريف نوع موحد للتداول
@@ -141,8 +152,18 @@ export async function registerBuyWithTarget(user: any, token: any, buyResult: an
       });
     }
   }
-  // persist trades using queued async writer
-  try { await writeJsonFile(userFile, userTrades); } catch {}
+  // persist trades using queued async writer. In listener-only mode, update in-memory store only.
+  try {
+    if (LISTENER_ONLY_MODE) {
+      try {
+        if (!(global as any).__inMemorySentTokens) (global as any).__inMemorySentTokens = new Map<string, any[]>();
+        const store: Map<string, any[]> = (global as any).__inMemorySentTokens;
+        store.set(userId, userTrades.slice(-500));
+      } catch (e) {}
+    } else {
+      await writeJsonFile(userFile, userTrades).catch(() => {});
+    }
+  } catch {}
 }
 /**
  * مراقبة صفقات الشراء للمستخدم وتنفيذ البيع تلقائياً عند تحقق الشروط

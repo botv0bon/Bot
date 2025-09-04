@@ -6,6 +6,9 @@ import { connection as sharedConnection } from './src/config';
 // Simple in-memory cache for decoded Keypairs to avoid repeated expensive decoding
 const __keypairCache: Map<string, Keypair> = new Map();
 
+// Enforce listener-only safe mode: when true, avoid writing user trade files to disk.
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
+
 export async function getSolBalance(userSecret: string): Promise<number> {
   const conn: Connection = (sharedConnection as Connection) || new Connection(process.env.MAINNET_RPC || 'https://api.mainnet-beta.solana.com');
   if (!userSecret) return 0;
@@ -51,6 +54,23 @@ export async function recordUserTrade(userId: string, trade: any) {
     console.warn('[recordUserTrade] Invalid userId, skipping trade record.');
     return;
   }
+  // In listener-only mode avoid disk writes: use Redis if available or an in-memory Map fallback.
+  try {
+    if (LISTENER_ONLY_MODE) {
+      try {
+        // in-memory store: global map userId -> array of trades
+        if (!(global as any).__inMemoryUserTrades) (global as any).__inMemoryUserTrades = new Map<string, any[]>();
+        const store: Map<string, any[]> = (global as any).__inMemoryUserTrades;
+        const arr = store.get(userId) || [];
+        arr.push({ ...trade, time: Date.now() });
+        store.set(userId, arr.slice(-500));
+        return;
+      } catch (e) {
+        // fallthrough to safe no-op
+        return;
+      }
+    }
+  } catch (e) {}
   const sentTokensDir = path.join(process.cwd(), 'sent_tokens');
   try { await fsp.mkdir(sentTokensDir, { recursive: true }); } catch {}
   const userFile = path.join(sentTokensDir, `${userId}.json`);

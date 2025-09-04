@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+// @ts-nocheck
 require('dotenv').config();
+/** @type {any} */
 const axios = require('axios');
 
 // Helius RPC configuration: support rotating API keys and RPC URLs to reduce pressure
@@ -32,6 +34,12 @@ const EventEmitter = require('events');
 const notifier = new EventEmitter();
 // export notifier when required as a module
 try{ module.exports = module.exports || {}; module.exports.notifier = notifier; }catch(e){}
+// in-memory per-user notification queues (temporary background memory)
+try{ if(!global.__inMemoryNotifQueues) global.__inMemoryNotifQueues = new Map(); }catch(e){}
+const INMEM_NOTIF_MAX = Number(process.env.NOTIF_INMEM_MAX || 50);
+// optional helper: attempt to require message builder
+let _tokenUtils = null;
+try{ _tokenUtils = require('../src/utils/tokenUtils'); }catch(e){}
 
 const PROGRAMS = [
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
@@ -76,13 +84,15 @@ const DENY = new Set(['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v','Es9vMFrzaC
 // Configurable timings (ms) via environment variables
 const PER_PROGRAM_DURATION_MS = Number(process.env.PER_PROGRAM_DURATION_MS) || 10000;
 const INNER_SLEEP_MS = Number(process.env.INNER_SLEEP_MS) || 120;
-const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 250;
+const POLL_SLEEP_MS = Number(process.env.POLL_SLEEP_MS) || 800;
 const CYCLE_SLEEP_MS = Number(process.env.CYCLE_SLEEP_MS) || 2000;
-const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 5;
-// reduce default to 1 to limit expensive per-mint signature probes
-const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 1;
+// Increase defaults during testing to avoid overly-strict rejection of valid mints
+const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 20;
+// raise default to allow checking a few historical signatures for accuracy
+const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 8;
 // Freshness and first-signature matching configuration
-const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // only accept mints whose first-tx within this many seconds (default 20s)
+// Proposal 1: widen default window slightly to capture marginally delayed mints
+const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 25; // seconds
 // Collector: allow accumulating a small number of freshly-accepted mints and
 // printing them as a single JSON array. Useful for short-lived runs/testing.
 const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
@@ -162,7 +172,9 @@ async function heliusRpc(method, params){
       heliusCallCounter = (heliusCallCounter + 1) >>> 0;
       const url = HELIUS_RPC_URLS[urlIdx];
       const hdrs = Object.assign({ 'Content-Type': 'application/json' }, _HELIUS_KEYS[keyIdx] ? { 'x-api-key': _HELIUS_KEYS[keyIdx] } : {});
-      const res = await axios.post(url, { jsonrpc:'2.0', id:1, method, params }, { headers: hdrs, timeout:15000 });
+      // make helius timeout configurable (default 5000ms) to favor low-latency responses
+      const heliusTimeout = Number(process.env.HELIUS_RPC_TIMEOUT_MS) || 5000;
+      const res = await axios.post(url, { jsonrpc:'2.0', id:1, method, params }, { headers: hdrs, timeout: heliusTimeout });
       const latency = Date.now() - start; RPC_STATS.totalLatencyMs += latency;
       if(res && res.status === 429) RPC_STATS.rateLimit429++;
       return res.data && (res.data.result || res.data);
@@ -188,7 +200,7 @@ async function heliusRpc(method, params){
 const HELIUS_TX_OPTS = { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 };
 
 // Concurrency and retry tuning for getTransaction calls
-const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 4;
+const TX_CONCURRENCY = Number(process.env.TX_CONCURRENCY) || 10;
 const MAX_TX_RETRIES = Number(process.env.MAX_TX_RETRIES) || 2;
 const TX_RETRY_BASE_MS = Number(process.env.TX_RETRY_BASE_MS) || 150;
 
@@ -593,30 +605,55 @@ async function startSequentialListener(options){
                     const userEvent = { time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs, kind: kind, candidateTokens: candidateTokens.slice(0,10) };
                     // Detailed log for matches
                     console.error('MATCH', JSON.stringify(userEvent));
-                    // Emit notification event (in-process) and also write a backup notification file
-                    try{ notifier.emit('notification', userEvent); }catch(e){}
-                    // Optional backup: write notifications to disk for external consumers when enabled
-                    const writeBackup = (process.env.NOTIFY_WRITE_BACKUP === undefined) ? true : (String(process.env.NOTIFY_WRITE_BACKUP) !== 'false');
-                    if (writeBackup) {
-                      try{
-                        const outDir = path.join(process.cwd(), 'out');
-                        try{ fs.mkdirSync(outDir, { recursive: true }); } catch(e){}
-                        const notifDir = path.join(outDir, 'notifications');
-                        try{ fs.mkdirSync(notifDir, { recursive: true }); } catch(e){}
-                        const fileName = Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json';
-                        const filePath = path.join(notifDir, fileName);
-                        fs.writeFileSync(filePath, JSON.stringify(userEvent, null, 2), 'utf8');
-                      }catch(e){}
-                    }
-                    // Optional Redis enqueue for faster consumption when REDIS_URL is set (kept for external consumers)
-                    if (process.env.REDIS_URL) {
-                      try {
-                        const IORedis = require('ioredis');
-                        const r = new IORedis(process.env.REDIS_URL);
-                        await r.lpush('notifications', JSON.stringify(userEvent));
-                        r.disconnect();
-                      } catch (re) { /* ignore redis errors */ }
-                    }
+                    // Build a Telegram-ready payload using tokenUtils if available
+                    let payload = { time: userEvent.time, program: p, signature: sig, matched: matchAddrs, tokens: userEvent.candidateTokens };
+                    try{
+                      if(_tokenUtils && typeof _tokenUtils.buildTokenMessage === 'function'){
+                        // build a preview for the first matched token to include rich HTML and keyboard
+                        const firstAddr = (userEvent.candidateTokens && userEvent.candidateTokens[0]) || null;
+                        if(firstAddr){
+                          const tokenObj = firstAddr; // already a lightweight token object
+                          const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
+                          const pairAddress = tokenObj.pairAddress || tokenObj.tokenAddress || tokenObj.address || tokenObj.mint || '';
+                          try{
+                            const built = _tokenUtils.buildTokenMessage(tokenObj, botUsername, pairAddress, uid);
+                            if(built && built.msg){ payload.html = built.msg; payload.inlineKeyboard = built.inlineKeyboard || (built.inlineKeyboard ? built.inlineKeyboard : built.inlineKeyboard); }
+                          }catch(e){}
+                        }
+                      }
+                    }catch(e){}
+                    // Push into in-memory per-user queue (temporary background store)
+                    try{
+                      const q = global.__inMemoryNotifQueues;
+                      if(q){
+                        const key = String(uid);
+                        if(!q.has(key)) q.set(key, []);
+                        const arr = q.get(key) || [];
+                        arr.unshift(payload);
+                        // trim
+                        if(arr.length > INMEM_NOTIF_MAX) arr.length = INMEM_NOTIF_MAX;
+                        q.set(key, arr);
+                      }
+                    }catch(e){}
+                    // Emit in-process notification for same-process bots
+                    try{ notifier.emit('notification', payload); }catch(e){}
+                    // Optional: if Redis configured, LPUSH for cross-process delivery
+                    try{
+                      const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_URI || null;
+                      if(REDIS_URL){
+                        try{
+                          const { createClient } = require('redis');
+                          const rc = createClient({ url: REDIS_URL });
+                          rc.on && rc.on('error', ()=>{});
+                          await rc.connect().catch(()=>{});
+                          const listKey = `listener:notifications:${uid}`;
+                          await rc.lPush(listKey, JSON.stringify(payload)).catch(()=>{});
+                          const maxlen = Number(process.env.NOTIF_REDIS_MAX_PER_USER || 50);
+                          try{ if(maxlen>0) await rc.lTrim(listKey, 0, maxlen-1).catch(()=>{}); }catch(e){}
+                          try{ await rc.disconnect().catch(()=>{}); }catch(e){}
+                        }catch(e){}
+                      }
+                    }catch(e){}
                   }
                 }catch(e){ /* per-user errors shouldn't break main loop */ }
               }
@@ -661,17 +698,18 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
           if(!(rule.allow.includes(kind) || kind === 'initialize')) continue;
           const mints = extractMints(tx).filter(x=>x && !DENY.has(x)); if(mints.length===0) continue;
           const txBlock = (s.blockTime||s.block_time||s.blocktime)||(tx&&tx.blockTime)||null;
-          for(const m of mints){
+            for(const m of mints){
             if(collected.length >= maxCollect) break;
             if(seenMintsLocal.has(m)) continue;
             let accept = false;
+            // allowAge is used in multiple branches below; compute once per-mint so it's in scope
+            const allowAge = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : MAX_MINT_AGE_SECS;
             if(kind === 'initialize'){
               // treat initialize as a creation indicator but still require freshness and not previously seen
               try{
                 const first = await getFirstSignatureCached(m);
                 const ft = first && first.blockTime ? first.blockTime : null;
                 const ageSecInit = getCanonicalAgeSeconds(ft, txBlock);
-        const allowAge = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : MAX_MINT_AGE_SECS;
         if(ageSecInit !== null && ageSecInit <= allowAge){
                   const prevInit = await mintPreviouslySeen(m, txBlock, sig);
                   if(prevInit === false) accept = true;

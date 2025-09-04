@@ -1,51 +1,23 @@
-import fs from 'fs';
-import path from 'path';
-const fsp = fs.promises;
 import { HELIUS_ENRICH_LIMIT } from '../config';
 
-// Lightweight background queue for expensive token enrichment requested by users.
-// Jobs are appended to an NDJSON file for audit and processed with a single-worker
-// loop to avoid flooding external providers.
+// Lightweight in-memory background queue for expensive token enrichment requested by users.
+// Jobs are stored in-process only to avoid any disk-based central cache files.
 
 export type EnrichJob = { userId: string; strategy: any; requestTs: number; chatId?: number };
 
-const QUEUE_DIR = path.join(process.cwd(), 'queue');
-const QUEUE_FILE = path.join(QUEUE_DIR, 'jobs.ndjson');
-const PROCESSED_FILE = path.join(QUEUE_DIR, 'processed.ndjson');
-
+const QUEUE_IN_MEMORY: EnrichJob[] = [];
 let running = false;
 let telegramRef: any | null = null;
 let usersRef: Record<string, any> | null = null;
 let workerOpts = { concurrency: 1, intervalMs: 2000 };
 
-async function ensureQueueDir() {
-  try { await fsp.mkdir(QUEUE_DIR, { recursive: true }); } catch {}
-}
-
-async function appendNdjson(file: string, obj: any) {
-  await ensureQueueDir();
-  const line = JSON.stringify(obj) + '\n';
-  await fsp.appendFile(file, line, 'utf8');
-}
-
 export async function enqueueEnrichJob(job: EnrichJob) {
   try {
-    await appendNdjson(QUEUE_FILE, job);
+    QUEUE_IN_MEMORY.push(job);
+    return true;
   } catch (e) {
-    console.error('[enrichQueue] Failed to persist job:', e);
-  }
-  // in-memory quick push handled by worker loop which re-reads file; for now just persistence
-  return true;
-}
-
-async function loadJobsFromFile(): Promise<EnrichJob[]> {
-  try {
-    const stat = await fsp.stat(QUEUE_FILE).catch(() => false);
-    if (!stat) return [];
-    const data = await fsp.readFile(QUEUE_FILE, 'utf8');
-    return data.split('\n').filter(Boolean).map(l => JSON.parse(l) as EnrichJob);
-  } catch (e) {
-    return [];
+    console.error('[enrichQueue] enqueue failed:', e);
+    return false;
   }
 }
 
@@ -55,25 +27,20 @@ export async function startEnrichQueue(telegram: any, users: Record<string, any>
   workerOpts = { ...workerOpts, ...(opts || {}) };
   if (running) return;
   running = true;
-  console.log('[enrichQueue] started with opts', workerOpts);
+  console.log('[enrichQueue] started (in-memory) with opts', workerOpts);
 
   (async () => {
     while (running) {
-  try {
-  const jobs = await loadJobsFromFile();
-  if (jobs.length) console.log('[enrichQueue] found jobs:', jobs.length);
+      try {
+        const jobs = QUEUE_IN_MEMORY.splice(0, QUEUE_IN_MEMORY.length);
         if (!jobs.length) {
           await new Promise(r => setTimeout(r, workerOpts.intervalMs));
           continue;
         }
 
-        // process jobs one by one to be conservatively gentle with providers
+        // process jobs sequentially
         const job = jobs.shift();
         if (!job) { await new Promise(r => setTimeout(r, workerOpts.intervalMs)); continue; }
-
-  // mark as processed (append to processed file)
-  const processedRecord: any = { job, startedAt: Date.now() };
-  try { await appendNdjson(PROCESSED_FILE, processedRecord); } catch {}
 
         // perform enrichment and notify user (best-effort)
         try {
@@ -140,30 +107,18 @@ export async function startEnrichQueue(telegram: any, users: Record<string, any>
             try { await telegramRef.sendMessage(chatId, 'ℹ️ Background: No tokens matched your strategy at this time.'); } catch (e) {}
           }
 
-          // write processed record with results length
-          processedRecord.finishedAt = Date.now();
-          processedRecord.resultCount = filtered ? filtered.length : 0;
-          try { await appendNdjson(PROCESSED_FILE, processedRecord); } catch {}
-         } catch (e) {
-           console.error('[enrichQueue] Job processing error:', e);
-         }
- 
-         // truncate the queue file by removing the first processed line(s)
-         try {
-           const raw = await fsp.readFile(QUEUE_FILE, 'utf8');
-           const lines = raw.split('\n').filter(Boolean);
-           lines.shift();
-           await fsp.writeFile(QUEUE_FILE, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
-         } catch (e) {}
- 
-         // small pause before next job
-         await new Promise(r => setTimeout(r, 500));
-       } catch (e) {
-         console.error('[enrichQueue] Loop error:', e);
-         await new Promise(r => setTimeout(r, workerOpts.intervalMs));
-       }
-     }
-   })();
- }
- 
- export function stopEnrichQueue() { running = false; }
+        } catch (e) {
+          console.error('[enrichQueue] Job processing error:', e);
+        }
+
+        // small pause before next job
+        await new Promise(r => setTimeout(r, 500));
+      } catch (e) {
+        console.error('[enrichQueue] Loop error:', e);
+        await new Promise(r => setTimeout(r, workerOpts.intervalMs));
+      }
+    }
+  })();
+}
+
+export function stopEnrichQueue() { running = false; }

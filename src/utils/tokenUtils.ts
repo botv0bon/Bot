@@ -116,6 +116,9 @@ import {
 } from '../config';
 import { getSolscanApiKey, getJupiterApiKey } from '../config';
 
+// Mirror listener-only guard used elsewhere: when true, avoid making outbound HTTP/RPC calls
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
+
 
 // ========== General Constants ==========
 const EMPTY_VALUES = [undefined, null, '-', '', 'N/A', 'null', 'undefined'];
@@ -146,48 +149,15 @@ const firstTxCache: Map<string, { ts: number; expiresAt: number }> = new Map();
 const FIRST_TX_CACHE_MS = Number(process.env.FIRST_TX_CACHE_MS || 10 * 60 * 1000);
 const FIRST_TX_CACHE_FILE = process.env.FIRST_TX_CACHE_FILE || path.join(process.cwd(), '.first_tx_cache.json');
 
-function saveFirstTxCacheToDisk() {
-  try {
-    const obj: Record<string, { ts: number; expiresAt: number }> = {};
-    for (const [k, v] of firstTxCache.entries()) obj[k] = v;
-    fs.writeFileSync(FIRST_TX_CACHE_FILE, JSON.stringify({ savedAt: Date.now(), data: obj }), { encoding: 'utf8' });
-  } catch (e) {
-    // don't fail the process for cache persistence errors
-  }
-}
-
-function loadFirstTxCacheFromDisk() {
-  try {
-    if (!fs.existsSync(FIRST_TX_CACHE_FILE)) return;
-    const raw = fs.readFileSync(FIRST_TX_CACHE_FILE, { encoding: 'utf8' });
-    const parsed = JSON.parse(raw || '{}');
-    const data = parsed && parsed.data ? parsed.data : parsed;
-    if (!data || typeof data !== 'object') return;
-    const now = Date.now();
-    for (const k of Object.keys(data)) {
-      try {
-        const v = data[k];
-        if (!v || typeof v.ts !== 'number' || typeof v.expiresAt !== 'number') continue;
-        if (v.expiresAt < now) continue;
-        firstTxCache.set(k, { ts: v.ts, expiresAt: v.expiresAt });
-      } catch (e) { continue; }
-    }
-  } catch (e) {
-    // ignore disk load errors
-  }
-}
-
-// Load persisted cache on module init (best-effort)
-try { loadFirstTxCacheFromDisk(); } catch (e) {}
-
+// No disk persistence for firstTxCache per listener-only / no-central-cache requirement
 export function getCachedFirstTx(mint: string): number | null {
   const v = firstTxCache.get(mint);
   if (!v) return null;
-  if (v.expiresAt < Date.now()) { firstTxCache.delete(mint); try { saveFirstTxCacheToDisk(); } catch {} return null; }
+  if (v.expiresAt < Date.now()) { firstTxCache.delete(mint); return null; }
   return v.ts;
 }
 export function setCachedFirstTx(mint: string, ts: number) {
-  try { firstTxCache.set(mint, { ts, expiresAt: Date.now() + FIRST_TX_CACHE_MS }); try { saveFirstTxCacheToDisk(); } catch {} } catch {}
+  try { firstTxCache.set(mint, { ts, expiresAt: Date.now() + FIRST_TX_CACHE_MS }); } catch {}
 }
 
 
@@ -322,36 +292,9 @@ export async function retryAsync<T>(fn: () => Promise<T>, retries = 0, delayMs =
 
 // ========== Fetch token data from CoinGecko and DexScreener ==========
 export async function fetchSolanaFromCoinGecko(): Promise<any> {
-  const url = 'https://api.coingecko.com/api/v3/coins/solana';
-  try {
-    return await retryAsync(async () => {
-      const response = await axios.get(url);
-      const data = response.data;
-      return {
-        name: data.name,
-        symbol: data.symbol,
-        priceUsd: data.market_data?.current_price?.usd,
-        marketCap: data.market_data?.market_cap?.usd,
-        volume: data.market_data?.total_volume?.usd,
-        holders: data.community_data?.facebook_likes || '-',
-        age: data.genesis_date,
-        verified: true,
-        description: data.description?.en,
-        imageUrl: data.image?.large,
-        links: [
-          ...(data.links?.homepage?.[0] ? [{ label: 'Website', url: data.links.homepage[0], type: 'website' }] : []),
-          ...(data.links?.twitter_screen_name ? [{ label: 'Twitter', url: `https://twitter.com/${data.links.twitter_screen_name}`, type: 'twitter' }] : []),
-          ...(data.links?.subreddit ? [{ label: 'Reddit', url: `https://reddit.com${data.links.subreddit}`, type: 'reddit' }] : []),
-        ],
-        address: 'N/A',
-        pairAddress: 'N/A',
-        url: data.links?.blockchain_site?.[0] || '',
-      };
-    }, 3, 3000);
-  } catch (err) {
-    console.error('CoinGecko fetch error:', err);
-    return null;
-  }
+  // CoinGecko disabled in listener-only mode to avoid external network calls outside the program-listener.
+  console.log('[fetchSolanaFromCoinGecko] disabled in listener-only mode');
+  return null;
 }
 
 
@@ -383,55 +326,13 @@ export let STRATEGY_FIELDS: StrategyField[] = [
  * If the API does not support filtering, filtering will be done locally.
  */
 export async function fetchDexScreenerProfiles(chainId?: string, extraParams?: Record<string, string>): Promise<any[]> {
-  let url = 'https://api.dexscreener.com/token-profiles/latest/v1';
-  const params: Record<string, string> = {};
-  if (chainId) params.chainId = chainId;
-  if (extraParams) Object.assign(params, extraParams);
-  const query = Object.keys(params).map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
-  if (query) url += `?${query}`;
-  try {
-    const response = await axios.get(url);
-    let data = Array.isArray(response.data) ? response.data : [];
-    // Always apply local chain filtering to ensure we only return profiles for the requested chain
-    if (chainId && data.length) {
-      try {
-        const want = String(chainId).toLowerCase();
-        data = data.filter((t: any) => {
-          if (!t) return false;
-          const ci = t.chainId || t.chain || t.network || '';
-          return String(ci).toLowerCase() === want;
-        });
-      } catch (e) {
-        // fall back to raw data if unexpected format
-      }
-    }
-    return data;
-  } catch (err: any) {
-    // Log more details
-    const msg = err?.message || err?.toString() || 'Unknown error';
-    const status = err?.response?.status;
-    const urlInfo = url;
-    console.error(`DexScreener token-profiles fetch error: ${msg} (status: ${status}) [${urlInfo}]`);
-    // Optionally, throw or return a special error object
-    throw new Error(`Failed to fetch token profiles from DexScreener: ${msg}`);
-  }
+  // DexScreener profiles disabled. Listener-only mode: return empty list.
+  return [];
 }
 
 export async function fetchDexScreenerPairsForSolanaTokens(tokenAddresses: string[]): Promise<any[]> {
-  const chainId = 'solana';
-  const allPairs: any[] = [];
-  for (const tokenAddress of tokenAddresses) {
-    const url = `https://api.dexscreener.com/token-pairs/v1/${chainId}/${tokenAddress}`;
-    try {
-      const response = await axios.get(url);
-      if (Array.isArray(response.data)) {
-        allPairs.push(...response.data);
-      }
-    } catch (err) {
-      // Ignore individual errors
-    }
-  }
-  return allPairs;
+  // DexScreener pairs disabled. Listener-only mode: return empty list.
+  return [];
 }
 
 /**
@@ -440,230 +341,22 @@ export async function fetchDexScreenerPairsForSolanaTokens(tokenAddresses: strin
  * @param extraParams Optional query params (e.g. { limit: '100' })
  */
 export async function fetchDexScreenerTokens(chainId: string = 'solana', extraParams?: Record<string, string>): Promise<any[]> {
-  // 1. Fetch tokens from token-profiles with filtering at API level
-  const profiles = await fetchDexScreenerProfiles(chainId, extraParams ?? { limit: '100' });
-  // 2. Fetch pairs (market data) for each token
-  const tokenAddresses = profiles.map((t: any) => t.tokenAddress).filter(Boolean);
-  const pairs = await fetchDexScreenerPairsForSolanaTokens(tokenAddresses);
-
-  // 3. Merge data: for each token, merge profile with pairs (market data)
-  const allTokens: Record<string, any> = {};
-  for (const profile of profiles) {
-    const addr = profile.tokenAddress;
-    if (!addr) continue;
-    allTokens[addr] = { ...profile };
+  // Listener-only implementation: query the program-listener for fresh mints
+  try {
+    // require the listener module relative to this util
+    // tslint:disable-next-line:no-var-requires
+    const seq = require('../../scripts/sequential_10s_per_program.js');
+    if (!seq || typeof seq.collectFreshMints !== 'function') return [];
+    const maxCollect = Number(extraParams?.limit ? Math.max(1, Number(extraParams.limit)) : 50);
+    const timeoutMs = 20000;
+    const maxAgeSec = undefined;
+    const addrs: string[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec }).catch(() => []);
+    if (!Array.isArray(addrs) || addrs.length === 0) return [];
+    return addrs.map((a: any) => ({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
+  } catch (e) {
+    console.error('[fetchDexScreenerTokens] listener fetch failed:', e?.message || e);
+    return [];
   }
-  // Add pairs (market data)
-  for (const pair of pairs) {
-    // Each pair has baseToken.address
-    const addr = getField(pair, 'baseToken.address', 'tokenAddress', 'address', 'mint', 'pairAddress');
-    if (!addr) continue;
-    if (!allTokens[addr]) allTokens[addr] = {};
-    // Merge pair data with token
-    for (const key of Object.keys(FIELD_MAP)) {
-      if (allTokens[addr][key] === undefined || EMPTY_VALUES.includes(allTokens[addr][key])) {
-        const val = getField(pair, key);
-        if (!EMPTY_VALUES.includes(val)) allTokens[addr][key] = val;
-      }
-    }
-    // Get some fields from baseToken if missing
-    if (pair.baseToken && typeof pair.baseToken === 'object') {
-      for (const key of Object.keys(FIELD_MAP)) {
-        if (allTokens[addr][key] === undefined || EMPTY_VALUES.includes(allTokens[addr][key])) {
-          const val = getField(pair.baseToken, key);
-          if (!EMPTY_VALUES.includes(val)) allTokens[addr][key] = val;
-        }
-      }
-    }
-    // liquidity: may be in pair.liquidity.usd or pair.liquidity
-    if ((allTokens[addr].liquidity === undefined || EMPTY_VALUES.includes(allTokens[addr].liquidity)) && pair.liquidity) {
-      if (typeof pair.liquidity === 'object' && typeof pair.liquidity.usd === 'number') allTokens[addr].liquidity = pair.liquidity.usd;
-      else if (typeof pair.liquidity === 'number') allTokens[addr].liquidity = pair.liquidity;
-    }
-    // priceUsd
-    if ((allTokens[addr].priceUsd === undefined || EMPTY_VALUES.includes(allTokens[addr].priceUsd)) && pair.priceUsd) {
-      allTokens[addr].priceUsd = pair.priceUsd;
-    }
-    // marketCap
-    if ((allTokens[addr].marketCap === undefined || EMPTY_VALUES.includes(allTokens[addr].marketCap)) && pair.fdv) {
-      allTokens[addr].marketCap = pair.fdv;
-    }
-    if ((allTokens[addr].marketCap === undefined || EMPTY_VALUES.includes(allTokens[addr].marketCap)) && pair.marketCap) {
-      allTokens[addr].marketCap = pair.marketCap;
-    }
-
-    // ====== استخراج الحقول الزمنية ======
-    // الأولوية: pair.pairCreatedAt > pair.createdAt > pair.baseToken.createdAt > profile.createdAt > profile.genesis_date
-    let createdTs =
-      pair.pairCreatedAt ||
-      pair.createdAt ||
-      (pair.baseToken && pair.baseToken.createdAt) ||
-      (allTokens[addr].createdAt) ||
-      (allTokens[addr].genesis_date);
-
-    // إذا كان نص تاريخ، حوّله إلى timestamp
-    if (typeof createdTs === 'string' && !isNaN(Date.parse(createdTs))) {
-      createdTs = Date.parse(createdTs);
-    }
-    // إذا كان بالثواني وليس ملي ثانية
-    if (typeof createdTs === 'number' && createdTs < 1e12 && createdTs > 1e9) {
-      createdTs = createdTs * 1000;
-    }
-    // إذا كان بالسنوات (مثلاً genesis_date)
-    if (typeof createdTs === 'string' && /^\d{4}-\d{2}-\d{2}/.test(createdTs)) {
-      createdTs = Date.parse(createdTs);
-    }
-    // حساب العمر بالدقائق
-    let ageMinutes = undefined;
-    if (typeof createdTs === 'number' && createdTs > 0) {
-      ageMinutes = Math.floor((Date.now() - createdTs) / 60000);
-    }
-    allTokens[addr].pairCreatedAt = pair.pairCreatedAt || null;
-    allTokens[addr].poolOpenTime = createdTs || null;
-    allTokens[addr].ageMinutes = ageMinutes;
-  }
-
-  // --- Normalization pass: ensure each token has a stable address/name and a numeric ageMinutes (in minutes)
-  for (const addr of Object.keys(allTokens)) {
-    const t = allTokens[addr];
-    // Ensure canonical address field exists
-    if (!t.address) t.address = addr;
-    if (!t.tokenAddress) t.tokenAddress = addr;
-    if (!t.pairAddress) t.pairAddress = t.pairAddress || addr;
-
-    // Ensure name/symbol fallbacks
-    if (!t.name) t.name = (t.baseToken && t.baseToken.name) || t.tokenName || t.title || '';
-    if (!t.symbol) t.symbol = (t.baseToken && t.baseToken.symbol) || t.ticker || '';
-
-    // Normalize poolOpenTime to a millisecond timestamp when possible
-    let ct = t.poolOpenTime || t.createdAt || t.genesis_date || t.pairCreatedAt || null;
-    if (typeof ct === 'string' && /^\n+\d{4}-\d{2}-\d{2}/.test(ct)) {
-      ct = Date.parse(ct);
-    }
-    if (typeof ct === 'number' && ct > 0 && ct < 1e12 && ct > 1e9) {
-      // seconds -> ms
-      ct = ct * 1000;
-    }
-    // If ct now looks like ms timestamp, compute minutes and seconds
-    if (typeof ct === 'number' && ct > 1e12) {
-      t.poolOpenTime = ct;
-      t.ageMinutes = Math.floor((Date.now() - ct) / 60000);
-      t.ageSeconds = Math.floor((Date.now() - ct) / 1000);
-    } else if (typeof t.ageMinutes === 'number' && !isNaN(t.ageMinutes)) {
-      // already set (assume minutes) -> normalize and provide seconds
-      t.ageMinutes = Math.floor(t.ageMinutes);
-      t.ageSeconds = Math.floor(t.ageMinutes * 60);
-    } else {
-      // give a safe undefined rather than various formats
-      t.ageMinutes = undefined;
-      t.ageSeconds = undefined;
-    }
-  }
-
-  // 4. If not enough data, use CoinGecko fallback (same logic as before)
-  let cgTokens: any[] = [];
-  let coinGeckoFailed = false;
-  if (Object.keys(allTokens).length === 0) {
-    try {
-      const solanaToken = await fetchSolanaFromCoinGecko();
-      if (solanaToken) cgTokens.push(solanaToken);
-      const listUrl = 'https://api.coingecko.com/api/v3/coins/list?include_platform=true';
-      const listResponse = await retryAsync(() => axios.get(listUrl), 3, 3000);
-      const allTokensList = listResponse.data;
-      const solanaTokens = allTokensList.filter((t: any) => t.platforms && t.platforms.solana);
-      const limited = solanaTokens.slice(0, 10);
-      const details = await Promise.all(limited.map(async (t: any) => {
-        try {
-          const url = `https://api.coingecko.com/api/v3/coins/${t.id}`;
-          const response = await retryAsync(() => axios.get(url), 3, 3000);
-          const data = response.data;
-          return {
-            name: data.name,
-            symbol: data.symbol,
-            priceUsd: data.market_data?.current_price?.usd,
-            marketCap: data.market_data?.market_cap?.usd,
-            volume: data.market_data?.total_volume?.usd,
-            holders: data.community_data?.facebook_likes || '-',
-            age: data.genesis_date,
-            verified: true,
-            description: data.description?.en,
-            imageUrl: data.image?.large,
-            links: [
-              ...(data.links?.homepage?.[0] ? [{ label: 'Website', url: data.links.homepage[0], type: 'website' }] : []),
-              ...(data.links?.twitter_screen_name ? [{ label: 'Twitter', url: `https://twitter.com/${data.links.twitter_screen_name}`, type: 'twitter' }] : []),
-              ...(data.links?.subreddit ? [{ label: 'Reddit', url: `https://reddit.com${data.links.subreddit}`, type: 'reddit' }] : []),
-            ],
-            address: t.platforms.solana,
-            pairAddress: t.platforms.solana,
-            url: data.links?.blockchain_site?.[0] || '',
-            // الحقول الزمنية من CoinGecko
-            poolOpenTime: data.genesis_date ? Date.parse(data.genesis_date) : null,
-            ageMinutes: data.genesis_date ? Math.floor((Date.now() - Date.parse(data.genesis_date)) / 60000) : null,
-          };
-        } catch (err) {
-          return null;
-        }
-      }));
-      cgTokens = cgTokens.concat(details.filter(Boolean));
-    } catch (err) {
-      coinGeckoFailed = true;
-      console.error('CoinGecko Solana tokens fetch error:', err);
-    }
-    if (coinGeckoFailed || cgTokens.length === 0) {
-      console.warn('CoinGecko unavailable, no tokens fetched.');
-      cgTokens = [];
-    }
-    // Add them to allTokens
-    for (const t of cgTokens) {
-      const addr = t.address || t.tokenAddress || t.mint || t.pairAddress;
-      if (!addr) continue;
-      allTokens[addr] = { ...t };
-    }
-  }
-  // Ensure each token has poolOpenTimeMs and ageSeconds where possible
-  for (const addr of Object.keys(allTokens)) {
-    const t = allTokens[addr];
-    // ensure poolOpenTimeMs if we have poolOpenTime
-    if (t.poolOpenTime && typeof t.poolOpenTime === 'number') {
-      // convert seconds -> ms if needed
-      let ct = t.poolOpenTime;
-      if (ct > 0 && ct < 1e12 && ct > 1e9) ct = ct * 1000;
-      t.poolOpenTimeMs = ct;
-      if (typeof ct === 'number' && ct > 0) {
-        t.ageSeconds = Math.floor((Date.now() - ct) / 1000);
-        t.ageMinutes = Math.floor((Date.now() - ct) / 60000);
-      }
-    }
-    if (t.ageMinutes === undefined && typeof t.ageSeconds === 'number') {
-      t.ageMinutes = Math.floor((t.ageSeconds || 0) / 60);
-    }
-  }
-    // Final filter: only include tokens that match the requested chain and have a numeric price.
-    try {
-      const wantChain = String(chainId || '').toLowerCase();
-      const candidates = Object.values(allTokens).filter((t: any) => {
-        try {
-          // chain filtering when chainId present on profile/pair
-          if (wantChain) {
-            const ci = (t.chainId || t.chain || t.network || '');
-            if (ci && String(ci).toLowerCase() !== wantChain) return false;
-            // fallback: for solana require base58-like address when no chainId present
-            if (!ci && wantChain === 'solana') {
-              const addrStr = String(t.address || t.tokenAddress || t.mint || '');
-              if (!/[1-9A-HJ-NP-Za-km-z]{32,44}/.test(addrStr)) return false;
-            }
-          }
-          // price presence: require numeric price (priceUsd or price)
-          const price = t.priceUsd ?? t.price ?? t.price_usd ?? t.priceUsd;
-          if (price === undefined || price === null || price === '-' || price === '') return false;
-          if (typeof price === 'string' && isNaN(Number(price))) return false;
-          return true;
-        } catch (e) { return false; }
-      });
-      return candidates;
-    } catch (e) {
-      return Object.values(allTokens);
-    }
 }
 
 
@@ -684,6 +377,8 @@ const enrichmentMetrics: {
 async function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
 async function getFirstTxTimestampFromRpc(address: string): Promise<number | null> {
+  // Avoid RPC/network calls in listener-only mode; return null to indicate unknown.
+  if (LISTENER_ONLY_MODE) return null;
   // Check lightweight global first-tx cache
   try {
     const cached = getCachedFirstTx(address);
@@ -759,6 +454,8 @@ async function getFirstTxTimestampFromRpc(address: string): Promise<number | nul
 }
 
 async function getFirstTxTimestampFromHelius(address: string): Promise<number | null> {
+  // Avoid Helius HTTP/RPC calls in listener-only mode to keep active flows local.
+  if (LISTENER_ONLY_MODE) return null;
   // Prefer Helius RPC (if provided) which is typically higher-rate for paid keys.
   const heliusRpc = HELIUS_RPC_URL || process.env.MAINNET_RPC;
   const apiUrlTemplate = HELIUS_PARSE_HISTORY_URL || '';
@@ -1036,6 +733,7 @@ async function getFirstTxTimestampFromHelius(address: string): Promise<number | 
 }
 
 async function getFirstTxTimestampFromSolscan(address: string): Promise<number | null> {
+  if (LISTENER_ONLY_MODE) return null;
   try {
   const base = SOLSCAN_API_URL;
   if (!base) return null;
@@ -1083,14 +781,14 @@ export async function checkOnChainActivity(address: string): Promise<{ firstTxMs
     // Prefer Helius / RPC path since they tend to return parsed transactions or block times
     let ts: number | null = null;
     try {
-      ts = await getFirstTxTimestampFromHelius(address);
+      if (!LISTENER_ONLY_MODE) ts = await getFirstTxTimestampFromHelius(address);
     } catch (e) {
       ts = null;
     }
     // If Helius did not yield a result, fall back to RPC (skip Solscan per config)
     if (!ts) {
       try {
-        ts = await getFirstTxTimestampFromRpc(address);
+        if (!LISTENER_ONLY_MODE) ts = await getFirstTxTimestampFromRpc(address);
       } catch (e) { ts = null; }
     }
     if (!ts) {
@@ -1130,6 +828,7 @@ export async function getFirstOnchainTimestamp(address: string, opts?: { timeout
 
     for (const o of order) {
       try {
+        if (LISTENER_ONLY_MODE) continue;
         if (o === 'hel') {
           const ts = await withTimeout(getFirstTxTimestampFromHelius(address), timeoutMs, 'firsttx-helius');
           if (ts) { resultMs = ts; source = 'hel'; break; }
@@ -1252,11 +951,13 @@ export async function enrichTokenTimestamps(tokens: any[], opts?: { batchSize?: 
     const results: Array<number | null> = [];
     for (const addr of batch) {
       try {
-        // Prefer Helius first, then RPC fallback. Solscan disabled per operator request.
+        // In listener-only mode avoid heavy external enrichment; leave ts=null
         let ts = null as number | null;
-        try { ts = await getFirstTxTimestampFromHelius(addr); } catch (e) { ts = null; }
-        if (!ts) {
-          try { ts = await getFirstTxTimestampFromRpc(addr); } catch (e) { ts = null; }
+        if (!LISTENER_ONLY_MODE) {
+          try { ts = await getFirstTxTimestampFromHelius(addr); } catch (e) { ts = null; }
+          if (!ts) {
+            try { ts = await getFirstTxTimestampFromRpc(addr); } catch (e) { ts = null; }
+          }
         }
         results.push(ts);
       } catch (e) {
@@ -1311,21 +1012,19 @@ export async function officialEnrich(token: any, opts?: { amountUsd?: number; ti
       // Ensure token has canonical address
       const addr = token.tokenAddress || token.address || token.mint || token.pairAddress;
       if (!addr) return token;
-      // Run the timestamp enrichment which will set poolOpenTimeMs/age fields
-      try {
-        await enrichTokenTimestamps([token], { batchSize: 1, delayMs: 0 });
-      } catch (e) {
-        // continue even if enrichment failed for this token
-      }
-      // Jupiter check: use minJupiterUsd when provided to avoid converting here
-      try {
-        const minJupiterUsd = typeof opts?.amountUsd === 'number' ? Number(opts!.amountUsd) : undefined;
-        const jres = await finalJupiterCheck(addr, 0, { minJupiterUsd, timeoutMs: opts?.timeoutMs || 3000 });
-        token.jupiter = jres.data || null;
-        token.jupiterCheck = { ok: jres.ok, reason: jres.reason || null };
-      } catch (e) {
-        token.jupiter = null;
-      }
+        // In listener-only mode skip heavy enrichment and external Jupiter checks
+        if (!LISTENER_ONLY_MODE) {
+          try { await enrichTokenTimestamps([token], { batchSize: 1, delayMs: 0 }); } catch (e) {}
+          try {
+            const minJupiterUsd = typeof opts?.amountUsd === 'number' ? Number(opts!.amountUsd) : undefined;
+            const jres = await finalJupiterCheck(addr, 0, { minJupiterUsd, timeoutMs: opts?.timeoutMs || 3000 });
+            token.jupiter = jres.data || null;
+            token.jupiterCheck = { ok: jres.ok, reason: jres.reason || null };
+          } catch (e) { token.jupiter = null; }
+        } else {
+          token.jupiter = null;
+          token.jupiterCheck = { ok: true, reason: 'listener-only' };
+        }
       // Recompute freshness score after enrichment
       try { await computeFreshnessScore(token); } catch (e) {}
       return token;
@@ -1769,6 +1468,8 @@ export function logTrade(trade: {
  */
 export async function finalJupiterCheck(mint: string, buyAmountSol: number, opts?: { minJupiterUsd?: number; requireRoute?: boolean; timeoutMs?: number }) {
   try {
+    // Avoid external HTTP calls in listener-only mode; optimistically allow but mark reason
+    if (LISTENER_ONLY_MODE) return { ok: true, reason: 'listener-only' };
   const cfgMod = await import('../config');
   const cfg = (cfgMod as any) && ((cfgMod as any).default || cfgMod);
   const { JUPITER_QUOTE_API } = cfg || {};

@@ -56,6 +56,12 @@ const USE_WS = HELIUS_USE_WEBSOCKET;
 const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
 const SUBSCRIBE_SPLTOKEN = HELIUS_SUBSCRIBE_SPLTOKEN;
 
+// Enforce listener-only safe mode: when true, avoid making outbound HTTP calls
+// or quick external checks (DexScreener/CoinGecko/etc). Controlled via env
+// LISTENER_ONLY_MODE or LISTENER_ONLY. Default to true to follow repo policy.
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
+
+
 // Protocol rules dynamic loader (shared with other listeners)
 import * as fs from 'fs';
 import * as path from 'path';
@@ -101,6 +107,7 @@ const _recentAccepted: Map<string, number> = new Map();
 // Simple HTTP GET with retry/backoff for transient errors (used for quick checks)
 async function httpGetWithRetry(url: string, opts: any = {}) {
   try {
+  if (LISTENER_ONLY_MODE) return null;
     const axios = require('axios');
     const maxAttempts = Number(process.env.HELIUS_HTTP_RETRY_COUNT ?? 3);
     const baseMs = Number(process.env.HELIUS_HTTP_RETRY_BASE_MS ?? 300);
@@ -126,6 +133,7 @@ async function httpGetWithRetry(url: string, opts: any = {}) {
 // Retry wrapper for tokenUtils.officialEnrich to handle transient Helius 429s
 async function retryOfficialEnrich(tuMod: any, tokenObj: any, opts: { timeoutMs?: number } = {}) {
   try {
+  if (LISTENER_ONLY_MODE) return null;
     const maxAttempts = Number(process.env.HELIUS_OFFICIAL_ENRICH_RETRY_COUNT ?? 3);
     const baseMs = Number(process.env.HELIUS_OFFICIAL_ENRICH_RETRY_BASE_MS ?? 300);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -155,6 +163,7 @@ async function retryOfficialEnrich(tuMod: any, tokenObj: any, opts: { timeoutMs?
 // Quick external checks to decide if a low-confidence mint has real trading activity.
 async function quickIsTraded(mintAddr: string) {
   try {
+  if (LISTENER_ONLY_MODE) return false;
     const now = Math.floor(Date.now()/1000);
     const key = String(mintAddr).toLowerCase();
     const cached = _quickCheckCache.get(key);
@@ -210,6 +219,7 @@ async function quickIsTraded(mintAddr: string) {
 // Dex-only quick check: returns true only if Dexscreener reports pairs/liquidity.
 async function quickIsTradedByDex(mintAddr: string) {
   try {
+  if (LISTENER_ONLY_MODE) return false;
     const now = Math.floor(Date.now()/1000);
     const key = String(mintAddr).toLowerCase();
     const cached = _quickCheckCache.get(key);
@@ -231,6 +241,7 @@ async function quickIsTradedByDex(mintAddr: string) {
 // Quick check whether a mint is actually young (recently created/first-seen)
 async function quickIsMintYoung(mintAddr: string, maxAgeSec = HELIUS_MAX_MINT_AGE_S) {
   try {
+  if (LISTENER_ONLY_MODE) return false;
     const now = Math.floor(Date.now()/1000);
     const key = String(mintAddr).toLowerCase();
     const cached = _quickCheckCache.get(key);

@@ -97,6 +97,11 @@ export function hashTokenAddress(addr: string) {
   return String(addr || '').toLowerCase().trim();
 }
 
+// Enforce listener-only safe mode: when true, avoid making outbound HTTP calls
+// (DexScreener / CoinGecko boosts) and avoid disk-based fallbacks for sent_tokens.
+// Controlled via env LISTENER_ONLY_MODE or LISTENER_ONLY. Default to true.
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
+
 async function ensureSentDir() {
   const sent = path.join(process.cwd(), 'sent_tokens');
   try {
@@ -117,6 +122,14 @@ export async function readSentHashes(userId: string): Promise<Set<string>> {
       }
     } catch (e) {
       // fall through to file-based fallback
+    }
+    // In listener-only mode we must not read disk-based central caches. Use in-memory fallback instead.
+    if (LISTENER_ONLY_MODE) {
+      try {
+        if (!(global as any).__inMemorySentTokens) (global as any).__inMemorySentTokens = new Map<string, Set<string>>();
+        const store: Map<string, Set<string>> = (global as any).__inMemorySentTokens;
+        return new Set(Array.from(store.get(userId) || []));
+      } catch (e) { return new Set(); }
     }
     const sentDir = await ensureSentDir();
     const file = path.join(sentDir, `${userId}.json`);
@@ -146,6 +159,16 @@ export async function appendSentHash(userId: string, hash: string) {
       }
     } catch (e) {
       // fall through to file-based fallback
+    }
+    // In listener-only mode avoid writing disk-based sent_tokens. Use in-memory Map fallback.
+    if (LISTENER_ONLY_MODE) {
+      try {
+        if (!(global as any).__inMemorySentTokens) (global as any).__inMemorySentTokens = new Map<string, Set<string>>();
+        const store: Map<string, Set<string>> = (global as any).__inMemorySentTokens;
+        if (!store.has(userId)) store.set(userId, new Set<string>());
+        store.get(userId)!.add(String(hash));
+        return;
+      } catch (e) { return; }
     }
     const sentDir = await ensureSentDir();
     const file = path.join(sentDir, `${userId}.json`);
@@ -996,6 +1019,10 @@ export async function captureHeliusAndVerify(durationMs = 60000) {
 // =========================
 
 async function fetchDexBoostsRaw(timeout = 3000) {
+  // If running in listener-only mode, avoid external DexScreener calls.
+  if (LISTENER_ONLY_MODE) {
+    return { __meta: makeSourceMeta('dexscreener', false, { error: 'listener-only' }), data: [] } as any;
+  }
   const url = DEXBOOSTS;
   const start = Date.now();
   try {
@@ -1003,6 +1030,8 @@ async function fetchDexBoostsRaw(timeout = 3000) {
     const limiter = getHostLimiter(host, Number(process.env.DEXSCREENER_CONCURRENCY || 2));
     const res = await limiter(async () => {
       return await retryWithBackoff(async () => {
+        // double-check listener-only before making network call
+        if (LISTENER_ONLY_MODE) throw Object.assign(new Error('listener-only'), { __metaErr: 'listener-only' });
         const p = axios.get(url, { timeout });
         const wrap = await withTimeout(p, timeout + 200);
         if (!wrap.ok) throw Object.assign(new Error(String((wrap as any).error || 'timeout')), { __metaErr: (wrap as any).error });
@@ -2006,23 +2035,28 @@ export async function runFastDiscoveryCli(opts?: { topN?: number; timeoutMs?: nu
 
               // final fallback to solscan if configured
               try {
-                const solscanUrl = `${SOLSCAN_API_URL}/token/${t.mint}/transactions`;
-                const headers: any = {};
-                const sk = getSolscanApiKey(true);
-                if (sk) { headers['x-api-key'] = sk; try { const { maskKey } = await import('./config'); console.log(`[FastFetcher->Solscan] using key=${maskKey(sk)}`); } catch (e) {} }
-                const sresWrap = await withTimeout(axios.get(solscanUrl, { timeout: timeoutMs, headers }), timeoutMs + 200);
-                if (!sresWrap.ok) {
-                  // mark as solscan failure
+                // Avoid Solscan network fallback when in listener-only mode
+                if (LISTENER_ONLY_MODE) {
+                  // Skip Solscan call to honor listener-only constraint
                 } else {
-                  const sres = sresWrap.result as any;
-                  const arr = sres.data ?? [];
-                  const first = Array.isArray(arr) ? arr[0] : null;
-                  const bt = first?.blockTime || first?.time || first?.timestamp || null;
-                  if (bt) {
-                    const meta = makeSourceMeta('solscan', true, { latencyMs: Date.now() - nowSec * 1000, raw: first });
-                    results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null, __meta: meta });
-                    hostState[hk] = state;
-                    return;
+                  const solscanUrl = `${SOLSCAN_API_URL}/token/${t.mint}/transactions`;
+                  const headers: any = {};
+                  const sk = getSolscanApiKey(true);
+                  if (sk) { headers['x-api-key'] = sk; try { const { maskKey } = await import('./config'); console.log(`[FastFetcher->Solscan] using key=${maskKey(sk)}`); } catch (e) {} }
+                  const sresWrap = await withTimeout(axios.get(solscanUrl, { timeout: timeoutMs, headers }), timeoutMs + 200);
+                  if (!sresWrap.ok) {
+                    // mark as solscan failure
+                  } else {
+                    const sres = sresWrap.result as any;
+                    const arr = sres.data ?? [];
+                    const first = Array.isArray(arr) ? arr[0] : null;
+                    const bt = first?.blockTime || first?.time || first?.timestamp || null;
+                    if (bt) {
+                      const meta = makeSourceMeta('solscan', true, { latencyMs: Date.now() - nowSec * 1000, raw: first });
+                      results.push({ mint: t.mint, firstBlockTime: Number(bt), ageSeconds: nowSec - Number(bt), source: 'solscan', earliestSignature: (first && (first.signature || (first as any).txHash || (first as any).tx_hash)) || null, __meta: meta });
+                      hostState[hk] = state;
+                      return;
+                    }
                   }
                 }
               } catch (e) {

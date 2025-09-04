@@ -8,12 +8,12 @@ import { loadUsers, loadUsersSync, saveUsers, walletKeyboard, getErrorMessage, l
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
 import { filterTokensByStrategy, registerBuyWithTarget, monitorAndAutoSellTrades } from './src/bot/strategy';
 import { autoExecuteStrategyForUser } from './src/autoStrategyExecutor';
-import { STRATEGY_FIELDS, notifyUsers, fetchDexScreenerTokens, fetchDexScreenerProfiles, fetchDexScreenerPairsForSolanaTokens, withTimeout } from './src/utils/tokenUtils';
+import { STRATEGY_FIELDS, notifyUsers, withTimeout } from './src/utils/tokenUtils';
 import { buildPreviewMessage } from './src/utils/tokenUtils';
-import { enqueueEnrichJob, startEnrichQueue } from './src/bot/enrichQueue';
+// Background enrich/queue disabled: listener-only operation per user requirement.
 import { registerBuySellHandlers } from './src/bot/buySellHandlers';
 import { normalizeStrategy } from './src/utils/strategyNormalizer';
-import { startFastTokenFetcher } from './src/fastTokenFetcher';
+// fast token fetcher disabled: listener-only operation
 import { generateKeypair, exportSecretKey, parseKey } from './src/wallet';
 
 // Install a small console filter to suppress noisy 429/retry messages coming from HTTP libs
@@ -53,6 +53,9 @@ const HELIUS_BATCH_DELAY_MS = Number(process.env.HELIUS_BATCH_DELAY_MS ?? 250);
 const HELIUS_ENRICH_LIMIT = Number(process.env.HELIUS_ENRICH_LIMIT ?? 25);
 const ONCHAIN_FRESHNESS_TIMEOUT_MS = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS ?? 5000);
 console.log('--- dotenv loaded ---');
+// Enforce listener-only safe mode: when true, avoid making disk-based reads/writes in active user paths.
+// Controlled via env LISTENER_ONLY_MODE or LISTENER_ONLY. Default to true.
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN);
 if (!TELEGRAM_TOKEN) {
@@ -67,116 +70,37 @@ let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
 
 async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
-  // No central caches. Always fetch live data per-request. If the strategy has no
-  // numeric constraints, prefer the fastTokenFetcher live sources (listener path).
+  // Listener-only token source: always use the program-listener collector
   try {
-    const numericKeys = ['minMarketCap','minLiquidity','minVolume'];
-    const hasOtherNumericConstraint = numericKeys.some(k => {
-      const v = strategy && (strategy as any)[k];
-      return v !== undefined && v !== null && Number(v) > 0;
-    });
-    let minAgeIsConstraint = false;
+    // Convert strategy.maxTrades -> maxCollect
+    const maxCollect = Math.max(1, Number(strategy?.maxTrades || 3));
+    // Convert minAge field to seconds if present
+    let maxAgeSec: number | undefined = undefined;
     try {
-      const ma = (strategy as any)?.minAge;
+      const ma = strategy && (strategy as any).minAge;
       if (ma !== undefined && ma !== null) {
-        if (typeof ma === 'number' || !isNaN(Number(ma))) {
-          const num = Number(ma);
-          if (num > 2) minAgeIsConstraint = true; // >2 treated as minutes constraint
-        } else {
-          minAgeIsConstraint = true;
+        const s = String(ma).trim().toLowerCase();
+        const secMatch = s.match(/^([0-9]+)s$/);
+        const minMatch = s.match(/^([0-9]+)m$/);
+        if (secMatch) maxAgeSec = Number(secMatch[1]);
+        else if (minMatch) maxAgeSec = Number(minMatch[1]) * 60;
+        else if (!isNaN(Number(s))) {
+          const n = Number(s);
+          if (n <= 2) maxAgeSec = n; else maxAgeSec = n * 60;
         }
       }
     } catch (e) {}
-    const hasNumericConstraint = hasOtherNumericConstraint || minAgeIsConstraint;
-    if (!hasNumericConstraint) {
-      // fast listener path: fetch live candidates and return limited by maxTrades
-      try {
-        const ff = await import('./src/fastTokenFetcher');
-        const maxTrades = strategy && strategy.maxTrades ? Number(strategy.maxTrades) : undefined;
-        const latest = await ff.fetchLatest5FromAllSources(maxTrades && !isNaN(maxTrades) ? Math.max(1, Math.floor(maxTrades)) : undefined).catch(() => null);
-        const candidates: any[] = [];
-        if (latest) {
-          const push = (a: any) => { if (!a) return; const s = String(a).trim(); if (!s) return; candidates.push({ address: s, tokenAddress: s, mint: s, sourceCandidates: true }); };
-          (latest.heliusEvents || []).forEach(push);
-          (latest.dexTop || []).forEach(push);
-          (latest.heliusHistory || []).forEach(push);
-        }
-        if (maxTrades && !isNaN(Number(maxTrades)) && Number(maxTrades) > 0) return candidates.slice(0, Number(maxTrades));
-        return candidates;
-      } catch (e) {
-        return [];
-      }
-    }
-  } catch (e) {}
-
-  // Strategy has numeric constraints: query DexScreener per-request with params and
-  // perform optional on-chain enrichment only for the top candidates. No global caching.
-  const extraParams: Record<string, string> = {};
-  try {
-      for (const f of STRATEGY_FIELDS) {
-        if (!(f.key in strategy)) continue;
-        const v = strategy[f.key];
-        if (v === undefined || v === null) continue;
-        // collect filter param to pass through to DexScreener
-        extraParams[f.key] = String(v);
-      }
-    } catch (e) {}
-
-    // Try to fetch with user-specific params. If it fails, fall back to global cache.
-  try {
-    const tokens = await fetchDexScreenerTokens('solana', extraParams);
-    // If strategy references age, apply fast numeric pre-filters (exclude age)
-    try {
-      const needsAge = Object.keys(strategy).some(k => k.toLowerCase().includes('age'));
-      if (needsAge) {
-        // Build a shallow strategy copy without age-related fields
-        const fastStrategy: Record<string, any> = {};
-        for (const k of Object.keys(strategy)) {
-          if (String(k).toLowerCase().includes('age')) continue;
-          fastStrategy[k] = strategy[k];
-        }
-        // Use tokenUtils.autoFilterTokens for quick numeric filtering
-        const tokenUtils = await import('./src/utils/tokenUtils');
-        const prefilteredVerbose = (() => {
-          try { return tokenUtils.autoFilterTokensVerbose(tokens, fastStrategy); } catch { return { passed: tokens, rejected: [] }; }
-        })();
-        const resolvedPrefiltered = Array.isArray(prefilteredVerbose) ? prefilteredVerbose : (prefilteredVerbose && prefilteredVerbose.passed ? prefilteredVerbose.passed : tokens);
-        // enrich only top candidates (by liquidity then volume)
-  // per-user overrides with env defaults
-  const enrichLimit = Number(strategy?.heliusEnrichLimit ?? HELIUS_ENRICH_LIMIT ?? 25);
-  const heliusBatchSize = Number(strategy?.heliusBatchSize ?? HELIUS_BATCH_SIZE ?? 8);
-  const heliusBatchDelayMs = Number(strategy?.heliusBatchDelayMs ?? HELIUS_BATCH_DELAY_MS ?? 250);
-        // sort candidates by liquidity (fallback to volume or marketCap)
-        const ranked = resolvedPrefiltered.slice().sort((a: any, b: any) => {
-          const la = (a.liquidity || a.liquidityUsd || 0) as number;
-          const lb = (b.liquidity || b.liquidityUsd || 0) as number;
-          if (lb !== la) return lb - la;
-          const va = (a.volume || a.volumeUsd || 0) as number;
-          const vb = (b.volume || b.volumeUsd || 0) as number;
-          return vb - va;
-        });
-        const toEnrich = ranked.slice(0, enrichLimit);
-        const { enrichTokenTimestamps, withTimeout } = await import('./src/utils/tokenUtils');
-        try {
-          const timeoutMs = Number(ONCHAIN_FRESHNESS_TIMEOUT_MS || 5000);
-          await withTimeout(enrichTokenTimestamps(toEnrich, { batchSize: heliusBatchSize, delayMs: heliusBatchDelayMs }), timeoutMs, 'getTokens-enrich');
-        } catch (e: any) {
-          // Keep a concise log and proceed with un-enriched token list to avoid blocking handlers
-          console.warn('[getTokensForUser] enrichment skipped/timeout:', e?.message || e);
-        }
-        // Merge enriched timestamps back into tokens list for returned set
-        const enrichedMap = new Map(toEnrich.map((t: any) => [(t.tokenAddress || t.address || t.mint || t.pairAddress), t]));
-        for (let i = 0; i < tokens.length; i++) {
-          const key = tokens[i].tokenAddress || tokens[i].address || tokens[i].mint || tokens[i].pairAddress;
-          if (enrichedMap.has(key)) tokens[i] = enrichedMap.get(key);
-        }
-      }
-    } catch (e) {
-      console.error('[getTokensForUser] enrichment error:', e?.message || e);
-    }
+    // Require the sequential listener collector and use it as the sole source
+    // of tokens. This avoids any external API or cache usage.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const seq = require('./scripts/sequential_10s_per_program.js');
+    if (!seq || typeof seq.collectFreshMints !== 'function') return [];
+    const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec }).catch(() => []);
+    if (!Array.isArray(addrs) || addrs.length === 0) return [];
+    const tokens = (addrs || []).map((a: any) => ({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
     return tokens;
-  } catch (e: any) {
-    console.error('[getTokensForUser] Failed to fetch tokens with extraParams:', e?.message || e);
+  } catch (e) {
+    console.error('[getTokensForUser] listener fetch failed:', e?.message || e);
     return [];
   }
 }
@@ -371,14 +295,23 @@ setInterval(async () => {
     const sentTokensDir = process.cwd() + '/sent_tokens';
     const userFile = `${sentTokensDir}/${userId}.json`;
     try {
-      if (!(await fsp.stat(userFile).catch(() => false))) continue;
+      if (LISTENER_ONLY_MODE) {
+        // In listener-only mode avoid reading user sent_tokens files on disk.
+        // Assume in-memory/Redis suppression is handled elsewhere.
+      } else {
+        if (!(await fsp.stat(userFile).catch(() => false))) continue;
+      }
     } catch {
       continue;
     }
     let userTrades: any[] = [];
     try {
-      const data = await fsp.readFile(userFile, 'utf8');
-      userTrades = JSON.parse(data || '[]');
+      if (!LISTENER_ONLY_MODE) {
+        const data = await fsp.readFile(userFile, 'utf8');
+        userTrades = JSON.parse(data || '[]');
+      } else {
+        userTrades = [];
+      }
     } catch {}
     const executed = userTrades.filter((t: any) => t.mode === 'sell' && t.status === 'success' && t.auto && !t.notified);
     for (const sellOrder of executed) {
@@ -386,7 +319,7 @@ setInterval(async () => {
       (sellOrder as any).notified = true;
     }
     try {
-      await writeJsonFile(userFile, userTrades);
+  if (!LISTENER_ONLY_MODE) await writeJsonFile(userFile, userTrades);
     } catch (e) {
       console.error('[monitorAndAutoSellTrades] Failed to write user trades for', userFile, e);
     }
@@ -532,165 +465,104 @@ console.log('--- About to launch bot ---');
     try {
       users = await loadUsers();
       console.log('--- Users loaded (async) ---');
-      try { startEnrichQueue(bot.telegram, users, { intervalMs: 2000 }); } catch (err) { console.warn('Failed to start enrich queue early:', err); }
+  // startEnrichQueue disabled: listener is the only allowed source
 
-      // Start background notification pump early so it runs even if bot.launch hangs.
+      // Disable background file/redis polling notification pump. Instead listen to
+      // in-process notifier events emitted by the listener and deliver messages
+      // immediately to users (no central caches or disk reads).
       try {
-        const startNotificationPump = async () => {
-          const outDir = path.join(process.cwd(), 'out');
-          const notifFile = path.join(outDir, 'notifications.json');
-          const notifDir = path.join(outDir, 'notifications');
-          try { await fsp.mkdir(outDir, { recursive: true }); } catch (e) {}
-          try { await fsp.mkdir(notifDir, { recursive: true }); } catch (e) {}
-          console.log('[notificationPump] notifDir path:', notifDir, 'legacy file:', notifFile);
-          // suppression map: userId -> Map(addr -> lastSentTs)
-          const sentNotifications: Record<string, Map<string, number>> = {};
-          // For testing defaults, use 1 minute unless overridden in env
-          const suppressionMinutes = Number(process.env.NOTIF_SUPPRESSION_MINUTES ?? 1);
-          const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
-          async function collectNotificationsFromRedis(){
-            const out: any[] = [];
-            if(!process.env.REDIS_URL) return out;
+  // in-memory suppression map (userId -> Map(addr -> lastSentTs))
+  const sentNotifications: Record<string, Map<string, number>> = {};
+        const suppressionMinutes = Number(process.env.NOTIF_SUPPRESSION_MINUTES ?? 1);
+        const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
+        // require the exported notifier from the listener script (if it's loaded in-process)
+        let listenerNotifier: any = null;
+        try{ const seqMod = require('./scripts/sequential_10s_per_program.js'); listenerNotifier = seqMod && seqMod.notifier ? seqMod.notifier : null; }catch(e){}
+        // register handler on the exported notifier if present
+        if(listenerNotifier && typeof listenerNotifier.on === 'function'){
+          listenerNotifier.on('notification', async (userEvent:any) => {
             try{
-              const IORedis = require('ioredis');
-              const r = new IORedis(process.env.REDIS_URL);
-              while(true){
-                const item = await r.rpop('notifications');
-                if(!item) break;
-                try{ out.push(JSON.parse(item)); } catch(e) { /* ignore parse errors */ }
+              const uid = String(userEvent && userEvent.user);
+              if(!uid) return;
+              const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled === false) return;
+              if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
+              // derive addresses to check suppression from matched or tokens
+              const matchAddrs = Array.isArray(userEvent.matched) && userEvent.matched.length ? userEvent.matched : (Array.isArray(userEvent.tokens) ? (userEvent.tokens.map((t:any)=>t.tokenAddress||t.address||t.mint).filter(Boolean)) : []);
+              const maxTrades = Number(user.strategy?.maxTrades || 3);
+              const toSend = [] as string[];
+              for(const a of (matchAddrs || []).slice(0, maxTrades)){
+                const last = sentNotifications[uid].get(a) || 0;
+                if(suppressionMs>0 && (Date.now()-last) < suppressionMs) continue;
+                toSend.push(a);
               }
-              r.disconnect();
-            }catch(e){ console.warn('[notificationPump] redis collect failed', e?.message||e); }
-            return out;
+              if(toSend.length===0) return;
+              // prefer pre-built HTML payload if present
+              try{
+                const chatId = uid;
+                if(userEvent.html && typeof userEvent.html === 'string'){
+                  const options: any = { parse_mode: 'HTML', disable_web_page_preview: false };
+                  if(userEvent.inlineKeyboard) options.reply_markup = { inline_keyboard: userEvent.inlineKeyboard };
+                  await (bot.telegram as any).sendMessage(chatId, userEvent.html, options).catch(()=>{});
+                } else {
+                  // fallback: simple list message
+                  let text = `🔔 <b>Matched tokens for your strategy</b>\nProgram: <code>${userEvent.program}</code>\nSignature: <code>${userEvent.signature}</code>\n\n`;
+                  text += `Matched (${toSend.length}):\n`;
+                  for(const a of toSend.slice(0,10)) text += `• <code>${a}</code>\n`;
+                  text += `\nTime: ${new Date().toISOString()}`;
+                  await (bot.telegram as any).sendMessage(chatId, text, { parse_mode: 'HTML', disable_web_page_preview: true }).catch(()=>{});
+                }
+                for(const a of toSend) sentNotifications[uid].set(a, Date.now());
+              }catch(e){ /* swallow */ }
+            }catch(e){ /* swallow per-event errors */ }
+          });
+        }
+        // also drain in-memory queues (if listener and bot are same process) at startup
+        try{
+          const q = (global as any).__inMemoryNotifQueues;
+          if(q && q instanceof Map){
+            for(const [k, arr] of q.entries()){
+              try{
+                const items = Array.isArray(arr) ? arr.slice(0) : [];
+                for(const it of items.reverse()){
+                  try{ listenerNotifier && listenerNotifier.emit && listenerNotifier.emit('notification', it); }catch(e){}
+                }
+                // clear after drain
+                q.set(k, []);
+              }catch(e){}
+            }
           }
-          async function collectNotificationsFromFiles(){
-            const out: any[] = [];
-            try{
-              const files = await fsp.readdir(notifDir).catch(()=>[]);
-              // process files in time order
-              files.sort();
-              for(const fname of files){
-                const p = path.join(notifDir, fname);
-                try{
-                  const raw = await fsp.readFile(p, 'utf8').catch(()=>null);
-                  if(!raw) { try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}; continue; }
-                  try{ const obj = JSON.parse(raw); if(obj) out.push(obj); } catch(e){}
-                  try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}
-                }catch(e){}
-              }
-            }catch(e){ /* ignore */ }
-            return out;
-          }
-          async function pumpOnce(){
-            try{
-              console.log('[notificationPump] pumpOnce triggered');
-              let arr: any[] = [];
-              // 1) collect from Redis (if available)
-              try{ const fromRedis = await collectNotificationsFromRedis(); if(Array.isArray(fromRedis) && fromRedis.length) arr = arr.concat(fromRedis); } catch(e){}
-              // 2) collect from append-only files
-              try{ const fromFiles = await collectNotificationsFromFiles(); if(Array.isArray(fromFiles) && fromFiles.length) arr = arr.concat(fromFiles); } catch(e){}
-              // 3) legacy file fallback (notifications.json)
-              if(arr.length === 0){
-                try{
-                  const raw = await fsp.readFile(notifFile, 'utf8').catch(()=>null);
-                  if(raw){ try{ const legacy = JSON.parse(raw||'[]'); if(Array.isArray(legacy) && legacy.length) arr = arr.concat(legacy); } catch(e){} }
-                }catch(e){}
-              }
-              if(!Array.isArray(arr) || arr.length===0) { console.log('[notificationPump] no notifications found'); return; }
-              console.log('[notificationPump] collected', arr.length, 'notification(s)');
-              // group by user
-              const byUser: Record<string, any[]> = {};
-              for(const n of arr){ if(!n || !n.user) continue; if(!byUser[n.user]) byUser[n.user]=[]; byUser[n.user].push(n); }
-              // process per user
-              for(const uid of Object.keys(byUser)){
-                try{
-                  const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled===false) continue;
-                  const maxTrades = Number(user.strategy?.maxTrades || 3);
-                  const items = byUser[uid].slice(0, maxTrades);
-                  // convert matched addresses to token objects; use listener matches as authoritative
-                  const addrs = [].concat(...items.map(it => it.matched || it.matchAddrs || []));
-                  const uniq = Array.from(new Set(addrs)).slice(0, maxTrades);
-                  let tokens: any[] = uniq.map(a=>({ tokenAddress: a, address: a, mint: a }));
-                  // Enrich each address individually via DexScreener (best-effort). Do NOT drop tokens lacking Dex data.
+        }catch(e){}
+        // Optionally start a Redis consumer loop if REDIS_URL provided (cross-process delivery)
+        try{
+          const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_URI || null;
+          if(REDIS_URL){
+            (async function startRedisConsumer(){
+              try{
+                const { createClient } = require('redis');
+                const rc = createClient({ url: REDIS_URL });
+                rc.on && rc.on('error', ()=>{});
+                await rc.connect().catch(()=>{});
+                const pollInterval = Number(process.env.NOTIF_REDIS_POLL_MS || 1000);
+                while(true){
                   try{
-                    for (let i = 0; i < tokens.length; i++){
-                      const t = tokens[i];
-                      const addr = String(t.tokenAddress || t.address || t.mint || '');
+                    // iterate users map keys and BRPOP each list with 1s timeout
+                    for(const uid of Object.keys(users || {})){
                       try{
-                        // Try token profile first
-                        const profiles = await fetchDexScreenerProfiles('solana', { tokenAddress: addr });
-                        if (Array.isArray(profiles) && profiles.length > 0) {
-                          tokens[i] = { ...t, ...profiles[0] };
-                          continue;
+                        const key = `listener:notifications:${uid}`;
+                        const res = await rc.rPop(key).catch(()=>null);
+                        if(res){
+                          try{ const payload = JSON.parse(res); listenerNotifier && listenerNotifier.emit && listenerNotifier.emit('notification', payload); }catch(e){}
                         }
-                        // Fallback: try pairs API to get market data
-                        const pairs = await fetchDexScreenerPairsForSolanaTokens([addr]).catch(() => []);
-                        if (Array.isArray(pairs) && pairs.length > 0) {
-                          const p = pairs[0];
-                          const enriched: any = { ...t };
-                          if (p.priceUsd || p.price) enriched.priceUsd = p.priceUsd || p.price;
-                          enriched.pairAddress = p.pairAddress || p.pair_address || p.pairId || p.pairId || enriched.pairAddress;
-                          enriched.url = enriched.url || (enriched.pairAddress ? `https://dexscreener.com/solana/${enriched.pairAddress}` : undefined) || enriched.url;
-                          tokens[i] = enriched;
-                        }
-                      }catch(e){ /* per-address enrichment failed - keep original token object */ }
+                      }catch(e){}
                     }
-                  }catch(e){ /* ignore top-level dex failures */ }
-                  // Send up to maxTrades preview messages
-                          // prepare sentNotifications map for user
-                          if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
-                          // optional Redis client for persistent suppression
-                          let __redisClient: any = null;
-                          async function getRedisClient(){
-                            if(__redisClient) return __redisClient;
-                            if(!process.env.REDIS_URL) return null;
-                            try{ const IORedis = require('ioredis'); __redisClient = new IORedis(process.env.REDIS_URL); return __redisClient; }catch(e){ return null; }
-                          }
-                          // aggregate tokens for this user into a single message with inline buttons
-                          const finalTokens = [];
-                          for(const tok of tokens.slice(0, maxTrades)){
-                            try{
-                              const addr = tok.tokenAddress || tok.address || tok.mint || '';
-                              const lastMap = sentNotifications[uid];
-                              let suppressed = false;
-                              try{ const rc = await getRedisClient(); if(rc){ const key = `sent:${uid}:${addr}`; const v = await rc.get(key).catch(()=>null); if(v) suppressed = true; } }catch(e){}
-                              const last = lastMap.get(addr) || 0;
-                              if(!suppressed && suppressionMs > 0 && (Date.now() - last) < suppressionMs) suppressed = true;
-                              if(suppressed) { console.log(`[notificationPump] skipping ${addr} for user ${uid} (suppressed)`); continue; }
-                              finalTokens.push(tok);
-                            }catch(e){ }
-                          }
-                          if(finalTokens.length === 0) continue;
-                          try{
-                            // build aggregated message
-                            const lines = finalTokens.map(t => {
-                              const title = (t.name || t.symbol) ? `${t.name || ''}${t.symbol ? ' ('+t.symbol+')' : ''}` : t.tokenAddress.slice(0,8);
-                              const price = t.priceUsd ? `${Number(t.priceUsd).toFixed(4)} USD` : 'N/A';
-                              const liq = t.liquidityUsd ? `${Math.round(Number(t.liquidityUsd)).toLocaleString()} USD` : 'N/A';
-                              const shortSig = (t.sourceSignature||'').substring(0,8);
-                              const dex = t.url || (t.pairAddress ? `https://dexscreener.com/solana/${t.pairAddress}` : '');
-                              return `• <b>${title}</b> <code>${t.tokenAddress}</code>\n  السعر: ${price} | سيولة: ${liq}\n  مصدر: ${t.sourceProgram || 'listener'} | <code>${shortSig}</code>${dex? '\n  🔗 '+dex : ''}`;
-                            }).join('\n\n');
-                            const keyboard = { inline_keyboard: [ finalTokens.slice(0,5).map(t=>({ text: `${t.symbol||t.name||t.tokenAddress.slice(0,6)}`, callback_data: `view|${uid}|${t.tokenAddress}` })), [{ text: 'إيقاف الإشعارات لهذه الإستراتيجية', callback_data: `mute|${uid}|strategy` }] ] };
-                            const chatId = uid;
-                            const aggMsg = `🔔 <b>نتائج استراتيجيتك (${finalTokens.length})</b>\n\n${lines}`;
-                            await (bot.telegram as any).sendMessage(chatId, aggMsg, { parse_mode: 'HTML', reply_markup: keyboard });
-                            // mark suppression for sent tokens
-                            const rc = await getRedisClient();
-                            for(const t of finalTokens){ const a = t.tokenAddress || t.address || t.mint || ''; sentNotifications[uid].set(a, Date.now()); try{ if(rc && suppressionMs>0){ const key = `sent:${uid}:${a}`; const ex = Math.max(1, Math.round(suppressionMs/1000)); await rc.set(key, '1', 'EX', ex).catch(()=>{}); } }catch(e){} }
-                            console.log(`[notificationPump] sent aggregated notification for ${finalTokens.length} token(s) to user ${uid}`);
-                          }catch(e){ console.error('[notificationPump] failed to send aggregated preview to', uid, e?.message||e); }
-                }catch(e){ console.error('[notificationPump] per-user processing failed', e); }
-              }
-              // clear legacy file if it existed
-              try{ await fsp.writeFile(notifFile, JSON.stringify([], null, 2), 'utf8'); } catch(e){ }
-            }catch(e){ /* ignore top-level pump errors */ }
+                    await new Promise(r=>setTimeout(r, pollInterval));
+                  }catch(e){ await new Promise(r=>setTimeout(r, 1000)); }
+                }
+              }catch(e){ console.error('[redisNotifConsumer] failed', e && e.message || e); }
+            })();
           }
-          setInterval(pumpOnce, 3000);
-          try { pumpOnce().catch(e=>console.error('[notificationPump] initial pump error', e)); } catch(e) { console.error('[notificationPump] initial pump scheduling failed', e); }
-        };
-        startNotificationPump().catch(e=>console.error('[notificationPump] start failed', e));
-      } catch (e) { console.error('[notificationPump] failed to initialize', e); }
+        }catch(e){}
+      } catch (e) { console.error('[notificationPump] replacement handler failed', e); }
     } catch (e) { console.error('Failed to load users async:', e); users = loadUsersSync(); }
 
     // Register centralized buy/sell handlers now that users are loaded
@@ -700,155 +572,11 @@ console.log('--- About to launch bot ---');
     console.log('✅ Bot launched successfully (polling)');
       try {
         // Start fast token fetcher to prioritize some users (1s polling)
-        const fast = startFastTokenFetcher(users, bot.telegram, { intervalMs: 1000 });
-        // Optionally keep a reference: globalThis.__fastFetcher = fast;
-        // Caller may call fast.stop() to stop it.
-        try {
-          // Start background enrich queue conservatively
-          startEnrichQueue(bot.telegram, users, { intervalMs: 2000 });
-        } catch (err) { console.warn('Failed to start enrich queue:', err); }
+  // Do NOT start fast token fetcher or enrich queue - listener is the single source of truth per requirement.
       } catch (e) {
         console.warn('Failed to start fast token fetcher:', e);
       }
-  // Note: listener is available as a module export and can be started separately.
-  // Background notifications reader: pick up listener-produced notifications and send to users
-      (async function notificationPump(){
-        const outDir = path.join(process.cwd(), 'out');
-        const notifFile = path.join(outDir, 'notifications.json');
-        const notifDir = path.join(outDir, 'notifications');
-        console.log('[notificationPump] notifDir path:', notifDir, 'legacy file:', notifFile);
-        try { await fsp.mkdir(outDir, { recursive: true }); } catch (e) {}
-        try { await fsp.mkdir(notifDir, { recursive: true }); } catch (e) {}
-        // suppression map: userId -> Map(addr -> lastSentTs)
-        const sentNotifications: Record<string, Map<string, number>> = {};
-  // For testing defaults, use 1 minute unless overridden in env
-  const suppressionMinutes = Number(process.env.NOTIF_SUPPRESSION_MINUTES ?? 1);
-  const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
-  async function collectNotificationsFromRedis(){
-    const out = [];
-    if(!process.env.REDIS_URL) return out;
-    try{
-      const IORedis = require('ioredis');
-      const r = new IORedis(process.env.REDIS_URL);
-      while(true){
-        const item = await r.rpop('notifications');
-        if(!item) break;
-        try{ out.push(JSON.parse(item)); } catch(e) { /* ignore parse errors */ }
-      }
-      r.disconnect();
-    }catch(e){ console.warn('[notificationPump] redis collect failed', e?.message||e); }
-    return out;
-  }
-  async function collectNotificationsFromFiles(){
-    const out = [];
-    try{
-      const files = await fsp.readdir(notifDir).catch(()=>[]);
-      files.sort();
-      for(const fname of files){
-        const p = path.join(notifDir, fname);
-        try{
-          const raw = await fsp.readFile(p, 'utf8').catch(()=>null);
-          if(!raw) { try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}; continue; }
-          try{ const obj = JSON.parse(raw); if(obj) out.push(obj); } catch(e){}
-          try{ await fsp.unlink(p).catch(()=>{}); } catch(e){}
-        }catch(e){}
-      }
-    }catch(e){ /* ignore */ }
-    return out;
-  }
-    async function pumpOnce(){
-          try{
-      console.log('[notificationPump] pumpOnce triggered');
-            let arr = [];
-            try{ const fromRedis = await collectNotificationsFromRedis(); if(Array.isArray(fromRedis) && fromRedis.length) arr = arr.concat(fromRedis); } catch(e){}
-            try{ const fromFiles = await collectNotificationsFromFiles(); if(Array.isArray(fromFiles) && fromFiles.length) arr = arr.concat(fromFiles); } catch(e){}
-            if(arr.length === 0){
-              try{
-                const raw = await fsp.readFile(notifFile, 'utf8').catch(()=>null);
-                if(raw){ try{ const legacy = JSON.parse(raw||'[]'); if(Array.isArray(legacy) && legacy.length) arr = arr.concat(legacy); } catch(e){} }
-              }catch(e){}
-            }
-            if(!Array.isArray(arr) || arr.length===0) { console.log('[notificationPump] notifications array empty'); return; }
-      console.log('[notificationPump] collected', arr.length, 'notification(s)');
-            // group by user
-            const byUser: Record<string, any[]> = {};
-            for(const n of arr){ if(!n || !n.user) continue; if(!byUser[n.user]) byUser[n.user]=[]; byUser[n.user].push(n); }
-            // process per user
-            for(const uid of Object.keys(byUser)){
-              try{
-                const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled===false) continue;
-                const maxTrades = Number(user.strategy?.maxTrades || 3);
-                const items = byUser[uid].slice(0, maxTrades);
-                // convert matched addresses to token objects; use listener matches as authoritative
-                const addrs = [].concat(...items.map(it => it.matched || it.matchAddrs || []));
-                const uniq = Array.from(new Set(addrs)).slice(0, maxTrades);
-                let tokens: any[] = uniq.map(a=>({ tokenAddress: a, address: a, mint: a }));
-                // Enrich each address individually via DexScreener (best-effort). Do NOT drop tokens lacking Dex data.
-                try{
-                  for (let i = 0; i < tokens.length; i++){
-                    const t = tokens[i];
-                    const addr = String(t.tokenAddress || t.address || t.mint || '');
-                    try{
-                      // Try token profile first
-                      const profiles = await fetchDexScreenerProfiles('solana', { tokenAddress: addr });
-                      if (Array.isArray(profiles) && profiles.length > 0) {
-                        tokens[i] = { ...t, ...profiles[0] };
-                        continue;
-                      }
-                      // Fallback: try pairs API to get market data
-                      const pairs = await fetchDexScreenerPairsForSolanaTokens([addr]).catch(() => []);
-                      if (Array.isArray(pairs) && pairs.length > 0) {
-                        const p = pairs[0];
-                        const enriched: any = { ...t };
-                        if (p.priceUsd || p.price) enriched.priceUsd = p.priceUsd || p.price;
-                        enriched.pairAddress = p.pairAddress || p.pair_address || p.pairId || p.pairId || enriched.pairAddress;
-                        enriched.url = enriched.url || (enriched.pairAddress ? `https://dexscreener.com/solana/${enriched.pairAddress}` : undefined) || enriched.url;
-                        tokens[i] = enriched;
-                      }
-                    }catch(e){ /* per-address enrichment failed - keep original token object */ }
-                  }
-                }catch(e){ /* ignore top-level dex failures */ }
-                // aggregate tokens for this user into a single message with inline buttons
-                if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
-                const finalTokens2 = [];
-                for(const tok of tokens.slice(0, maxTrades)){
-                  try{
-                    const addr = tok.tokenAddress || tok.address || tok.mint || '';
-                    const lastMap = sentNotifications[uid];
-                    const last = lastMap.get(addr) || 0;
-                    if (suppressionMs > 0 && (Date.now() - last) < suppressionMs) { console.log(`[notificationPump] skipping ${addr} for user ${uid} (recently sent)`); continue; }
-                    finalTokens2.push(tok);
-                  }catch(e){}
-                }
-                if(finalTokens2.length>0){
-                  try{
-                    const lines = finalTokens2.map(t => {
-                      const title = (t.name || t.symbol) ? `${t.name || ''}${t.symbol ? ' ('+t.symbol+')' : ''}` : t.tokenAddress.slice(0,8);
-                      const price = t.priceUsd ? `${Number(t.priceUsd).toFixed(4)} USD` : 'N/A';
-                      const liq = t.liquidityUsd ? `${Math.round(Number(t.liquidityUsd)).toLocaleString()} USD` : 'N/A';
-                      const shortSig = (t.sourceSignature||'').substring(0,8);
-                      const dex = t.url || (t.pairAddress ? `https://dexscreener.com/solana/${t.pairAddress}` : '');
-                      return `• <b>${title}</b> <code>${t.tokenAddress}</code>\n  السعر: ${price} | سيولة: ${liq}\n  مصدر: ${t.sourceProgram || 'listener'} | <code>${shortSig}</code>${dex? '\n  🔗 '+dex : ''}`;
-                    }).join('\n\n');
-                    const keyboard = { inline_keyboard: [ finalTokens2.slice(0,5).map(t=>({ text: `${t.symbol||t.name||t.tokenAddress.slice(0,6)}`, callback_data: `view|${uid}|${t.tokenAddress}` })), [{ text: 'إيقاف الإشعارات لهذه الإستراتيجية', callback_data: `mute|${uid}|strategy` }] ] };
-                    const chatId = uid;
-                    const aggMsg = `🔔 <b>نتائج استراتيجيتك (${finalTokens2.length})</b>\n\n${lines}`;
-                    await (bot.telegram as any).sendMessage(chatId, aggMsg, { parse_mode: 'HTML', reply_markup: keyboard });
-                    for(const t of finalTokens2){ const a = t.tokenAddress||t.address||t.mint||''; sentNotifications[uid].set(a, Date.now()); }
-                    console.log(`[notificationPump] sent aggregated notification for ${finalTokens2.length} token(s) to user ${uid}`);
-                  }catch(e){ console.error('[notificationPump] failed to send aggregated preview to', uid, e?.message||e); }
-                }
-              }catch(e){ console.error('[notificationPump] per-user processing failed', e); }
-            }
-            // after processing, clear legacy file if it existed
-            try{ await fsp.writeFile(notifFile, JSON.stringify([], null, 2), 'utf8'); } catch(e){ }
-          }catch(e){ /* ignore */ }
-        }
-  // run pump every 3s
-  setInterval(pumpOnce, 3000);
-  // run once immediately at startup to pick up any existing notifications
-  try { pumpOnce().catch(e=>console.error('[notificationPump] initial pump error', e)); } catch(e) { console.error('[notificationPump] initial pump scheduling failed', e); }
-      })();
+  // Note: background disk/redis notification pump disabled — using in-process notifier for immediate delivery.
   } catch (err: any) {
     if (err?.response?.error_code === 409) {
       console.error('❌ Bot launch failed: Conflict 409. Make sure the bot is not running elsewhere or stop all other sessions.');
@@ -922,13 +650,14 @@ bot.command('show_token', async (ctx) => {
       }catch(e){ listenerAvailable = false; }
       if(listenerAvailable){
         if(!tokens || tokens.length===0){
-          try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch (e) { console.warn('[show_token] enqueue error:', e); }
-          await ctx.reply('🔔 لا توجد نتائج مستمع حديثة الآن؛ تم جدولة تحقق خلفي وستتلقى إشعاراً عند توفر نتائج.');
+          // Per listener-only mode, do not enqueue external enrich jobs. Inform the user to wait for listener events.
+          await ctx.reply('🔔 لا توجد نتائج مستمع حديثة الآن؛ يرجى الانتظار بينما يستمر مصدر الاستماع بجمع النتائج.');
           return;
         }
       } else {
-        // listener not available: fall back to existing behavior (DexScreener / fast fetch)
-        tokens = await getTokensForUser(userId, user.strategy);
+        // Listener not available: per requirement do NOT fallback to external fetchers or caches.
+        await ctx.reply('⚠️ مستمع البرامج غير متاح حالياً؛ لا يمكن جلب البيانات من مصادر خارجية وفق سياسة التشغيل. برجاء التأكد من تشغيل مصدر الاستماع أو حاول لاحقاً.');
+        return;
       }
       console.log('[show_token] fast-path tokens:', (tokens || []).length);
       // If these tokens are live candidates (from listener/fastFetcher), present immediately
@@ -947,8 +676,8 @@ bot.command('show_token', async (ctx) => {
         // no tokens to show
       }
       if (!tokens || tokens.length === 0) {
-        try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch (e) { console.warn('[show_token] enqueue error:', e); }
-        await ctx.reply('🔔 No recent listener results found; a background verification has been queued and you will be notified if matches appear.');
+        // Listener-only: no background enrichment queued. Inform the user to wait for fresh listener events.
+        await ctx.reply('🔔 No recent listener results found; please wait for the listener to collect fresh mints.');
         return;
       }
       const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
@@ -984,9 +713,35 @@ bot.command('show_token', async (ctx) => {
     }
 
     if (!accurate || accurate.length === 0) {
-      // Nothing matched after the deeper check — queue a background enrich and inform user
-      try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch (e) { console.warn('[show_token] enqueue error:', e); }
-      await ctx.reply('🔔 No matches found after a deeper check; a background verification has been queued and you will be notified if matches appear.');
+      // Nothing matched after the deeper check — as a last-resort try the listener one-shot collector
+      try{
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const seq = require('./scripts/sequential_10s_per_program.js');
+        if(seq && typeof seq.collectFreshMints === 'function'){
+          const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
+          // derive maxAgeSec from user's minAge
+          let maxAgeSec: number | undefined = undefined;
+          try{
+            const ma = user.strategy && (user.strategy as any).minAge;
+            if(ma !== undefined && ma !== null){
+              const s = String(ma).trim().toLowerCase();
+              const secMatch = s.match(/^([0-9]+)s$/);
+              const minMatch = s.match(/^([0-9]+)m$/);
+              if(secMatch) maxAgeSec = Number(secMatch[1]);
+              else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60;
+              else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; }
+            }
+          }catch(e){}
+          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec }).catch(()=>[]);
+          if(Array.isArray(addrs) && addrs.length > 0){
+            // Return raw payload so user sees actual live mints discovered
+            try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} }
+            return;
+          }
+        }
+      }catch(e){ /* ignore collector errors */ }
+      // Listener-only: no background enrich queued. Inform the user to wait for listener events.
+      await ctx.reply('🔔 No matches found after a deeper check; please wait for the listener to produce fresh results.');
       return;
     }
 
@@ -1008,7 +763,6 @@ bot.command('show_token', async (ctx) => {
     return;
   } catch (e) {
     console.error('[show_token] fast-preview error:', e?.stack || e);
-    try { await enqueueEnrichJob({ userId, strategy: user.strategy, requestTs: Date.now(), chatId: ctx.chat?.id }); } catch {}
-    await ctx.reply('❗ Internal error while producing a fast preview; a background check was queued.');
+  await ctx.reply('❗ Internal error while producing a fast preview; please try again later or wait for listener events.');
   }
 });
