@@ -69,6 +69,17 @@ console.log('--- Users placeholder created ---');
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
 
+// Helper: decide if a given user should operate in listener-only (no enrichment) mode.
+function userIsListenerOnly(user: any) {
+  try {
+    if (LISTENER_ONLY_MODE) return true;
+    if (!user) return false;
+    const strat = user.strategy || {};
+    if (strat && (strat.noEnrich === true || strat.listenerOnly === true)) return true;
+    return false;
+  } catch (e) { return Boolean(LISTENER_ONLY_MODE); }
+}
+
 async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
   // Listener-only token source: always use the program-listener collector
   try {
@@ -85,8 +96,8 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
         if (secMatch) maxAgeSec = Number(secMatch[1]);
         else if (minMatch) maxAgeSec = Number(minMatch[1]) * 60;
         else if (!isNaN(Number(s))) {
-          const n = Number(s);
-          if (n <= 2) maxAgeSec = n; else maxAgeSec = n * 60;
+          // Plain numeric values are seconds
+          maxAgeSec = Number(s);
         }
       }
     } catch (e) {}
@@ -95,9 +106,38 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const seq = require('./scripts/sequential_10s_per_program.js');
     if (!seq || typeof seq.collectFreshMints !== 'function') return [];
-    const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec }).catch(() => []);
-    if (!Array.isArray(addrs) || addrs.length === 0) return [];
-    const tokens = (addrs || []).map((a: any) => ({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
+  const strictOverride = (strategy && (strategy as any).collectorStrict !== undefined) ? Boolean((strategy as any).collectorStrict) : undefined;
+  const items = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(() => []);
+    if (!Array.isArray(items) || items.length === 0) return [];
+    const tokens = (items || []).map((it: any) => {
+      if (!it) return null;
+      if (typeof it === 'string') return { tokenAddress: it, address: it, mint: it, sourceCandidates: true, __listenerCollected: true };
+      const addr = it.tokenAddress || it.address || it.mint || null;
+      return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
+    }).filter(Boolean);
+    // If user specified a minAge, enforce it strictly here (same semantics as listener)
+    try{
+      const parseDuration = require('./src/utils/tokenUtils').parseDuration;
+      const ma = strategy && (strategy as any).minAge;
+      const minAgeSeconds = ma !== undefined && ma !== null ? parseDuration(ma) : undefined;
+      if (!isNaN(Number(minAgeSeconds)) && minAgeSeconds !== undefined && minAgeSeconds !== null && Number(minAgeSeconds) > 0) {
+        const accepted = tokens.filter((t: any) => {
+          try{
+            // prefer _canonicalAgeSeconds (seconds)
+            let ageSec: number | undefined = undefined;
+            if (t && t._canonicalAgeSeconds !== undefined && t._canonicalAgeSeconds !== null) ageSec = Number(t._canonicalAgeSeconds);
+            else if (t && t.ageSeconds !== undefined && t.ageSeconds !== null) ageSec = Number(t.ageSeconds);
+            else if (t && t.firstBlockTime) {
+              const ftMs = Number(t.firstBlockTime);
+              if (!isNaN(ftMs) && ftMs > 0) ageSec = (Date.now() - ftMs) / 1000;
+            }
+            if (ageSec === undefined || isNaN(ageSec)) return false; // strict: require known on-chain age
+            return ageSec >= Number(minAgeSeconds);
+          }catch(e){ return false; }
+        });
+        return accepted;
+      }
+    }catch(e){}
     return tokens;
   } catch (e) {
     console.error('[getTokensForUser] listener fetch failed:', e?.message || e);
@@ -133,6 +173,19 @@ const mainReplyKeyboard = Markup.keyboard([
   ['💼 Wallet', '⚙️ Strategy'],
   ['📊 Show Tokens', '🤝 Invite Friends']
 ]).resize();
+
+// Add a quick toggle button for collector strictness to main keyboard if desired
+function collectorToggleKeyboard(user: any) {
+  try{
+    const cur = user && user.strategy && (user.strategy as any).collectorStrict;
+    const label = cur === false ? 'Collector: Defer' : (cur === true ? 'Collector: Strict' : 'Collector: Default');
+    return Markup.keyboard([
+      ['💼 Wallet', '⚙️ Strategy'],
+      ['📊 Show Tokens', '🤝 Invite Friends'],
+      [label]
+    ]).resize();
+  }catch(e){ return mainReplyKeyboard; }
+}
 
 bot.start(async (ctx) => {
   await ctx.reply(
@@ -190,7 +243,37 @@ bot.hears('⚙️ Strategy', async (ctx) => {
 
 bot.hears('📊 Show Tokens', async (ctx) => {
   console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
-  ctx.reply('To view tokens matching your strategy, use the /show_token command.');
+  // Invoke same behavior as /show_token for a fast preview
+  try {
+    // Delegate to the existing command handler by calling the logic inline
+    const userId = String(ctx.from?.id);
+    const user = users[userId];
+    if (!user || !user.strategy || user.strategy.enabled === false) {
+      try { await ctx.reply('🔎 Showing latest live mints (you have no strategy set). Use /strategy to configure filters.'); } catch(e){}
+    }
+    // reuse getTokensForUser to fetch listener candidates
+    const strategyRef = (user && user.strategy) ? user.strategy : {};
+    const tokens = await getTokensForUser(userId, strategyRef).catch(()=>[]);
+    if (!tokens || tokens.length === 0) {
+      await ctx.reply('No live tokens found right now. Try again in a few seconds.');
+      return;
+    }
+    // build a richer per-token preview using buildPreviewMessage
+    let text = `🔔 <b>Live tokens (preview)</b>\nFound ${tokens.length} candidates:\n`;
+    for (const t of tokens.slice(0, Math.max(1, Number(strategyRef?.maxTrades || 3)))) {
+      try {
+        const preview = buildPreviewMessage(t);
+        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
+        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+      } catch (e) {
+        const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
+        text += `• <code>${addr}</code>\n`;
+      }
+    }
+    await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any));
+  } catch (e) {
+    try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
+  }
 });
 
 bot.hears('🤝 Invite Friends', async (ctx) => {
@@ -198,6 +281,40 @@ bot.hears('🤝 Invite Friends', async (ctx) => {
   const userId = String(ctx.from?.id);
   const inviteLink = `https://t.me/${ctx.me}?start=${userId}`;
   await ctx.reply(`🤝 Share this link to invite your friends:\n${inviteLink}`);
+});
+
+bot.hears(/Collector:\s*(Strict|Defer|Default)/i, async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId] || {};
+  const cur = user.strategy && (user.strategy as any).collectorStrict;
+  // cycle: undefined -> false -> true -> undefined
+  let next: any = undefined;
+  if (cur === undefined) next = false;
+  else if (cur === false) next = true;
+  else next = undefined;
+  if (!user.strategy) user.strategy = {};
+  (user.strategy as any).collectorStrict = next;
+  users[userId] = user;
+  try { saveUsers(users); } catch (e) {}
+  const label = next === false ? 'Collector: Defer' : (next === true ? 'Collector: Strict' : 'Collector: Default');
+  await ctx.reply(`Collector strictness set to: ${label}`);
+  try { await ctx.reply('Keyboard updated', collectorToggleKeyboard(user)); } catch (e) {}
+});
+
+bot.command('toggle_collector_strict', async (ctx) => {
+  const userId = String(ctx.from?.id);
+  const user = users[userId] || {};
+  const cur = user.strategy && (user.strategy as any).collectorStrict;
+  let next: any = undefined;
+  if (cur === undefined) next = false;
+  else if (cur === false) next = true;
+  else next = undefined;
+  if (!user.strategy) user.strategy = {};
+  (user.strategy as any).collectorStrict = next;
+  users[userId] = user;
+  try { saveUsers(users); } catch (e) {}
+  const label = next === false ? 'Defer' : (next === true ? 'Strict' : 'Default');
+  await ctx.reply(`collectorStrict toggled to: ${label}`);
 });
 
 bot.command('notify_tokens', async (ctx) => {
@@ -210,7 +327,13 @@ bot.command('notify_tokens', async (ctx) => {
   }
   const now = Date.now();
   const tokens = await getTokensForUser(userId, user.strategy);
-  const filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
+  let filteredTokens = [] as any[];
+  if (userIsListenerOnly(user)) {
+    // Preserve the listener-provided candidates without background enrichment
+    filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
+  } else {
+    filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
+  }
   if (!filteredTokens.length) {
     await ctx.reply('No tokens currently match your strategy.');
     return;
@@ -500,7 +623,7 @@ console.log('--- About to launch bot ---');
               try{
                 const chatId = uid;
                 if(userEvent.html && typeof userEvent.html === 'string'){
-                  const options: any = { parse_mode: 'HTML', disable_web_page_preview: false };
+                  const options: any = ({ parse_mode: 'HTML', disable_web_page_preview: false } as any);
                   if(userEvent.inlineKeyboard) options.reply_markup = { inline_keyboard: userEvent.inlineKeyboard };
                   await (bot.telegram as any).sendMessage(chatId, userEvent.html, options).catch(()=>{});
                 } else {
@@ -509,7 +632,7 @@ console.log('--- About to launch bot ---');
                   text += `Matched (${toSend.length}):\n`;
                   for(const a of toSend.slice(0,10)) text += `• <code>${a}</code>\n`;
                   text += `\nTime: ${new Date().toISOString()}`;
-                  await (bot.telegram as any).sendMessage(chatId, text, { parse_mode: 'HTML', disable_web_page_preview: true }).catch(()=>{});
+                  await (bot.telegram as any).sendMessage(chatId, text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)).catch(()=>{});
                 }
                 for(const a of toSend) sentNotifications[uid].set(a, Date.now());
               }catch(e){ /* swallow */ }
@@ -573,6 +696,15 @@ console.log('--- About to launch bot ---');
       try {
         // Start fast token fetcher to prioritize some users (1s polling)
   // Do NOT start fast token fetcher or enrich queue - listener is the single source of truth per requirement.
+      // Start the sequential listener in-process so users receive live pushes from the listener
+      try{
+        const seq = require('./scripts/sequential_10s_per_program.js');
+        if(seq && typeof seq.startSequentialListener === 'function'){
+          // run listener without blocking (it manages its own loop)
+          (async ()=>{ try{ await seq.startSequentialListener(); }catch(e){ try{ console.error('[listener] failed to start:', e && e.message || e); }catch(_){} } })();
+          console.log('[listener] startSequentialListener invoked in-process');
+        }
+      }catch(e){ console.warn('Failed to start listener in-process:', e); }
       } catch (e) {
         console.warn('Failed to start fast token fetcher:', e);
       }
@@ -601,20 +733,23 @@ bot.command('show_token', async (ctx) => {
   console.log(`[show_token] User: ${String(ctx.from?.id)}`);
   const userId = String(ctx.from?.id);
   const user = users[userId];
-  if (!user || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ You must set a strategy first using /strategy');
-    return;
+  // Allow preview even if the user has not configured a strategy yet.
+  // For users without a strategy we'll show live listener candidates (fast preview)
+  // and invite them to configure a strategy for filtered results.
+  if (!user || !user.strategy || user.strategy.enabled === false) {
+    try { await ctx.reply('🔎 Showing latest live mints (you have no strategy set). Use /strategy to configure filters.'); } catch(e){}
   }
   try {
     // If user's numeric strategy fields are all zero/undefined, present listener/live candidates immediately
+    const strategyRef = (user && user.strategy) ? user.strategy : {};
     const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
     const hasNumericConstraint = numericKeys.some(k => {
-      const v = user.strategy && (user.strategy as any)[k];
+      const v = strategyRef && (strategyRef as any)[k];
       return v !== undefined && v !== null && Number(v) > 0;
     });
     if (!hasNumericConstraint) {
       // Fast path: return listener-produced candidates (or fastFetcher) without heavy enrichment
-      await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...');
+      try { await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...'); } catch(e){}
       // Try to use the sequential listener's one-shot collector when available.
       // If the listener module exists but returns no fresh mints, DO NOT fallback to DexScreener
       // to avoid showing older tokens — queue a background enrich instead and inform the user.
@@ -628,7 +763,7 @@ bot.command('show_token', async (ctx) => {
           // convert user's strategy.minAge to seconds when present
           let maxAgeSec: number | undefined = undefined;
           try{
-            const ma = user.strategy && (user.strategy as any).minAge;
+            const ma = strategyRef && (strategyRef as any).minAge;
             if(ma !== undefined && ma !== null){
               // allow strings like '10s', '5m', or plain numbers
               const s = String(ma).trim().toLowerCase();
@@ -644,7 +779,8 @@ bot.command('show_token', async (ctx) => {
               }
             }
           }catch(e){}
-          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: 20000, maxAgeSec }).catch(()=>[]);
+          const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
+          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
           tokens = (addrs || []).map((a:any)=>({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
         }
       }catch(e){ listenerAvailable = false; }
@@ -698,14 +834,41 @@ bot.command('show_token', async (ctx) => {
     }
 
     // Deep, accurate check path: fetch user-tailored tokens (may include on-chain enrichment) and apply strategy filter
+    // If the user prefers listener-only/no-enrich, skip heavy enrichment and present listener candidates
+    if (userIsListenerOnly(user)) {
+      try { await ctx.reply('🔎 You are in listener-only mode (no enrichment). Presenting live listener candidates...'); } catch(e){}
+      const tokens = await getTokensForUser(userId, user.strategy);
+      if (tokens && tokens.length) {
+        const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
+        const maxShow = Math.min(maxTrades, 10, tokens.length);
+        let msg = `✅ Live listener-only results: <b>${tokens.length}</b> token(s) available (showing up to ${maxShow}):\n`;
+        for (const t of tokens.slice(0, maxShow)) {
+          try { const preview = buildPreviewMessage(t); const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`; } catch (e) { const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<code>${addr}</code>\n`; }
+        }
+        try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch(e) { try { await ctx.reply('✅ Found live listener-only tokens.'); } catch(_){} }
+        return;
+      }
+      // If no tokens from getTokensForUser, try collector one-shot raw addresses as a last resort
+      try{
+        const seq = require('./scripts/sequential_10s_per_program.js');
+        if(seq && typeof seq.collectFreshMints === 'function'){
+          const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
+          let maxAgeSec: number | undefined = undefined;
+          try{ const ma = user.strategy && (user.strategy as any).minAge; if(ma !== undefined && ma !== null){ const s = String(ma).trim().toLowerCase(); const secMatch = s.match(/^([0-9]+)s$/); const minMatch = s.match(/^([0-9]+)m$/); if(secMatch) maxAgeSec = Number(secMatch[1]); else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60; else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; } } }catch(e){}
+          const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
+          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
+          if(Array.isArray(addrs) && addrs.length > 0){ try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} } return; }
+        }
+      }catch(e){}
+      await ctx.reply('🔔 No live listener results available at the moment; please wait.');
+      return;
+    }
+
+    // perform accurate filtering for non-listener-only users
     await ctx.reply('🔎 Performing an accurate strategy check — this may take a few seconds. Please wait...');
-    // getTokensForUser will fetch Dex tokens and perform limited enrichment where needed
     const tokens = await getTokensForUser(userId, user.strategy);
-    // Apply strategy filter with full checks (allow enrichment inside the filter)
     let accurate: any[] = [];
     try {
-      // Limit the accurate filter to a short timeout to avoid Telegraf's 90s handler cap.
-      // If it times out, enqueue a background job and inform the user.
       accurate = await withTimeout(filterTokensByStrategy(tokens, user.strategy, { fastOnly: false }), 7000, 'show_token-filter');
     } catch (e) {
       console.error('[show_token] accurate filter failed or timed out', e?.message || e);
@@ -732,7 +895,8 @@ bot.command('show_token', async (ctx) => {
               else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; }
             }
           }catch(e){}
-          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec }).catch(()=>[]);
+          const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
+          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
           if(Array.isArray(addrs) && addrs.length > 0){
             // Return raw payload so user sees actual live mints discovered
             try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} }

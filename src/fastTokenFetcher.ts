@@ -259,7 +259,7 @@ export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: 
                 const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
                 try {
                   const finalStrategy = normalizeStrategy(u.strategy);
-                  const finalOk = await (require('./bot/strategy').filterTokensByStrategy([token], finalStrategy));
+                  const finalOk = await (require('./bot/strategy').filterTokensByStrategy([token], finalStrategy, { preserveSources: true }));
                   if (!finalOk || finalOk.length === 0) continue;
                   const amount = Number(u.strategy.buyAmount);
                   const result = await unifiedBuy(addr, amount, u.secret);
@@ -1778,7 +1778,7 @@ export async function handleNewMintEvent(mintOrObj: any, users?: UsersMap, teleg
           if (!u || !u.strategy || u.strategy.enabled === false) continue;
           const strat = normalizeStrategy(u.strategy);
           const tokenObj = { mint, address: mint, metadataExists, supply, firstBlockTime: detection.firstBlockTime, ageSeconds: detection.ageSeconds };
-          const matches = await filterTokensByStrategy([tokenObj], strat);
+          const matches = await filterTokensByStrategy([tokenObj], strat, { preserveSources: true });
           if (Array.isArray(matches) && matches.length) {
             try {
               const h = hashTokenAddress(mint);

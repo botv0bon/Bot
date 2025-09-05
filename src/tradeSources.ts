@@ -1,17 +1,20 @@
 // tradeSources.ts
-//
-// هذا الملف يحتوي على دالتي unifiedBuy و unifiedSell فقط.
-// كل دالة تستقبل عنوان العملة، الكمية، وسر المستخدم وتنفذ عملية شراء أو بيع آمنة عبر Jupiter مع محاكاة قبل التنفيذ.
-// يجب استدعاء كل دالة بشكل منفرد لكل مستخدم حسب استراتيجيته.
-// مثال الاستخدام:
 //   await unifiedBuy(mint, amount, userSecret);
 //   await unifiedSell(mint, amount, userSecret);
 
 import { sendJupiterTransaction } from "./utils/jupiter.transaction.sender";
 import { VersionedTransaction, Connection } from "@solana/web3.js";
 
+const AUTO_EXEC_SANDBOX = (process.env.AUTO_EXEC_SANDBOX === 'true');
+
 export async function unifiedBuy(mint: string, amount: number, userSecret: string): Promise<{ tx?: string; simulationError?: any; error?: string }> {
 	try {
+		if(AUTO_EXEC_SANDBOX){
+			// Sandbox mode: do not send transactions; return simulated tx id
+			const fake = `sandbox-buy-${mint.slice(0,6)}-${Date.now()}`;
+			console.error(`[SANDBOX unifiedBuy] simulated tx=${fake} mint=${mint} amount=${amount}`);
+			return { tx: fake };
+		}
 		const tx = await sendJupiterTransaction({ mint, amount, userSecret, side: "buy" });
 		if (!tx || !tx.serializedTx) throw new Error("لم يتم توليد المعاملة");
 		const connection = new Connection("https://api.mainnet-beta.solana.com");
@@ -29,6 +32,11 @@ export async function unifiedBuy(mint: string, amount: number, userSecret: strin
 
 export async function unifiedSell(mint: string, amount: number, userSecret: string): Promise<{ tx?: string; simulationError?: any; error?: string }> {
 	try {
+		if(AUTO_EXEC_SANDBOX){
+			const fake = `sandbox-sell-${mint.slice(0,6)}-${Date.now()}`;
+			console.error(`[SANDBOX unifiedSell] simulated tx=${fake} mint=${mint} amount=${amount}`);
+			return { tx: fake };
+		}
 		const tx = await sendJupiterTransaction({ mint, amount, userSecret, side: "sell" });
 		if (!tx || !tx.serializedTx) throw new Error("لم يتم توليد المعاملة");
 		const connection = new Connection("https://api.mainnet-beta.solana.com");

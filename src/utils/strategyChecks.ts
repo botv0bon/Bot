@@ -13,8 +13,15 @@ export function validateStrategy(strategy: any): string[] {
   if (strategy.buyAmount !== undefined && (typeof strategy.buyAmount !== 'number' || isNaN(strategy.buyAmount) || strategy.buyAmount <= 0)) {
     issues.push('buyAmount should be a positive number.');
   }
-  if (strategy.minAge !== undefined && (isNaN(Number(strategy.minAge)) || Number(strategy.minAge) < 0)) {
-    issues.push('minAge should be a non-negative number (minutes).');
+  if (strategy.minAge !== undefined) {
+    // allow numeric (seconds) or strings like '30s','2m'
+    const v = strategy.minAge;
+    const parsed = (typeof v === 'number') ? v : (isNaN(Number(v)) ? null : Number(v));
+    if (parsed === null && typeof v !== 'string') {
+      issues.push('minAge should be a non-negative number (seconds) or a duration string like "30s" or "2m".');
+    } else if (parsed !== null && Number(parsed) < 0) {
+      issues.push('minAge should be non-negative.');
+    }
   }
   if (strategy.minVolume !== undefined && (isNaN(Number(strategy.minVolume)) || Number(strategy.minVolume) < 0)) {
     issues.push('minVolume should be a non-negative number (USD).');

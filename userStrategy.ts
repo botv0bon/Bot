@@ -175,7 +175,11 @@ export async function executeHoneyStrategy(
   const filteredTokens = settings.tokens.filter(token => {
   // Example: Filter by volume and age (can be expanded for other fields)
     if (typeof token.volume !== 'undefined' && user.strategy?.minVolume && token.volume < user.strategy.minVolume) return false;
-    if (typeof token.ageMinutes !== 'undefined' && user.strategy?.minAge && token.ageMinutes < user.strategy.minAge) return false;
+    if (typeof token.ageMinutes !== 'undefined' && user.strategy?.minAge) {
+      // token.ageMinutes is in minutes; user.strategy.minAge is normalized to seconds -> convert token to seconds
+      const tokenAgeSeconds = Number(token.ageMinutes) * 60;
+      if (tokenAgeSeconds < Number(user.strategy.minAge)) return false;
+    }
     return true;
   });
   for (const token of filteredTokens) {

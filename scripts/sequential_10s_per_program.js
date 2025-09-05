@@ -92,7 +92,7 @@ const SIG_BATCH_LIMIT = Number(process.env.SIG_BATCH_LIMIT) || 20;
 const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 8;
 // Freshness and first-signature matching configuration
 // Proposal 1: widen default window slightly to capture marginally delayed mints
-const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 25; // seconds
+const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // seconds
 // Collector: allow accumulating a small number of freshly-accepted mints and
 // printing them as a single JSON array. Useful for short-lived runs/testing.
 const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
@@ -433,10 +433,10 @@ async function startSequentialListener(options){
                       const ft = first.blockTime || null;
                       if(ft && txBlock){
                         const delta = Math.abs(Number(ft) - Number(txBlock));
+                        // If the first-signature matches and timing is close, accept the mint as a candidate
+                        // and defer strict age-based decisions to per-user strategy filters (user.strategy.minAge).
                         if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
-                          const ageSec = getCanonicalAgeSeconds(ft, txBlock);
-                          if(ageSec !== null && ageSec <= MAX_MINT_AGE_SECS) accept = true;
-                          else console.error(`REJECT_AGE mint=${m} age=${ageSec}s > ${MAX_MINT_AGE_SECS}s sig=${sig}`);
+                          accept = true;
                         }
                       }
                     }
@@ -446,17 +446,10 @@ async function startSequentialListener(options){
                   try{
                     const createdHere = isMintCreatedInThisTx(tx, m);
                     if(createdHere){
-                      const first = await getFirstSignatureCached(m);
-                      let ageSec = null;
-                        if(first && first.blockTime) ageSec = getCanonicalAgeSeconds(first.blockTime, txBlock);
-                        else if(txBlock) ageSec = getCanonicalAgeSeconds(null, txBlock);
-                        if(ageSec !== null && ageSec <= MAX_MINT_AGE_SECS){
-                        const prev = await mintPreviouslySeen(m, txBlock, sig);
-                        if(prev === false) accept = true;
-                        else console.error(`REJECT_PREVIOUS_SEEN mint=${m} prevSeen=true sig=${sig}`);
-                      } else {
-                        console.error(`REJECT_AGE_NO_FIRST mint=${m} age=${ageSec} sig=${sig}`);
-                      }
+                      // Strong creation indicator -> accept candidate and defer strict age filtering to user strategies.
+                      const prev = await mintPreviouslySeen(m, txBlock, sig);
+                      if(prev === false) accept = true;
+                      else console.error(`REJECT_PREVIOUS_SEEN mint=${m} prevSeen=true sig=${sig}`);
                     }
                   }catch(e){}
                 }
@@ -653,6 +646,36 @@ async function startSequentialListener(options){
                           try{ await rc.disconnect().catch(()=>{}); }catch(e){}
                         }catch(e){}
                       }
+                      // Optional auto-execution hook: when explicitly enabled via env var, trigger
+                      // per-user auto execution (buy) for matched tokens. Disabled by default to
+                      // avoid accidental trading. Set ENABLE_AUTO_EXEC_FROM_LISTENER=true to enable.
+            try{
+              const AUTO_EXEC_ENABLED = (process.env.ENABLE_AUTO_EXEC_FROM_LISTENER === 'true');
+              const AUTO_EXEC_CONFIRM_USER_IDS = (process.env.AUTO_EXEC_CONFIRM_USER_IDS || '').toString().split(',').map(s=>s.trim()).filter(Boolean);
+              if(AUTO_EXEC_ENABLED){
+                          try{
+                            const shouldAuto = user && user.strategy && user.strategy.autoBuy !== false && Number(user.strategy && user.strategy.buyAmount) > 0;
+                            const hasCredentials = user && (user.wallet || user.secret);
+                            // require user to be explicitly confirmed in AUTO_EXEC_CONFIRM_USER_IDS
+                            const userConfirmed = AUTO_EXEC_CONFIRM_USER_IDS.length === 0 ? false : AUTO_EXEC_CONFIRM_USER_IDS.includes(String(uid));
+                            if(shouldAuto && hasCredentials && userConfirmed){
+                              try{
+                                const autoExecMod = require('../src/autoStrategyExecutor');
+                                const autoExec = autoExecMod && (autoExecMod.autoExecuteStrategyForUser || autoExecMod.default || null);
+                                if(typeof autoExec === 'function'){
+                                  // run in background, do not block main listener loop
+                                  const execTokens = Array.isArray(matched) ? matched.slice(0, Number(user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 1) : [];
+                                  (async () => {
+                                    try{ await autoExec(user, execTokens, 'buy'); }catch(e){ try{ console.error('[listener:autoExec] error', (e && e.message) || e); }catch(_){} }
+                                  })();
+                                }
+                              }catch(e){ /* ignore auto-exec errors */ }
+                            } else if(shouldAuto && hasCredentials && !userConfirmed){
+                              try{ console.error(`[listener:autoExec] user=${uid} not in AUTO_EXEC_CONFIRM_USER_IDS - skipping auto-exec`); }catch(e){}
+                            }
+                          }catch(e){}
+                        }
+                      }catch(e){}
                     }catch(e){}
                   }
                 }catch(e){ /* per-user errors shouldn't break main loop */ }
@@ -678,7 +701,7 @@ async function startSequentialListener(options){
 module.exports.startSequentialListener = startSequentialListener;
 // Lightweight one-shot collector: run the minimal discovery loop until we collect
 // `maxCollect` fresh mints or `timeoutMs` elapses. Returns an array of mint addresses.
-async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec = undefined } = {}){
+async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec = undefined, strictOverride = undefined } = {}){
   const collected = [];
   const seenMintsLocal = new Set();
   const stopAt = Date.now() + (Number(timeoutMs) || 20000);
@@ -703,20 +726,37 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
             if(seenMintsLocal.has(m)) continue;
             let accept = false;
             // allowAge is used in multiple branches below; compute once per-mint so it's in scope
-            const allowAge = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : MAX_MINT_AGE_SECS;
+              // If caller provided maxAgeSec, enforce it; otherwise do not enforce a global age cutoff
+              const allowAge = (maxAgeSec !== undefined && maxAgeSec !== null) ? Number(maxAgeSec) : null;
             if(kind === 'initialize'){
               // treat initialize as a creation indicator but still require freshness and not previously seen
               try{
-                const first = await getFirstSignatureCached(m);
-                const ft = first && first.blockTime ? first.blockTime : null;
-                const ageSecInit = getCanonicalAgeSeconds(ft, txBlock);
-        if(ageSecInit !== null && ageSecInit <= allowAge){
-                  const prevInit = await mintPreviouslySeen(m, txBlock, sig);
-                  if(prevInit === false) accept = true;
-                  else console.error(`REJECT_PREVIOUS_SEEN init mint=${m} prevSeen=true sig=${sig}`);
-                } else {
-                  console.error(`REJECT_AGE init mint=${m} age=${ageSecInit} sig=${sig}`);
-                }
+                  const first = await getFirstSignatureCached(m);
+                  const ft = first && first.blockTime ? first.blockTime : null;
+                  const ageSecInit = getCanonicalAgeSeconds(ft, txBlock);
+                  // If caller requested an explicit maxAgeSec, enforce it; otherwise defer age decision to per-user strategies
+                  if(allowAge !== null) {
+                        if(ageSecInit !== null && ageSecInit <= allowAge){
+                      const prevInit = await mintPreviouslySeen(m, txBlock, sig);
+                      if(prevInit === false) accept = true;
+                      else console.error(`REJECT_PREVIOUS_SEEN init mint=${m} prevSeen=true sig=${sig}`);
+                        } else {
+                          // age exceeded global threshold — decide behavior based on COLLECTOR_STRICT_AGE
+                          // prefer per-call override if provided, otherwise read env toggle
+                          const strict = (strictOverride !== undefined && strictOverride !== null) ? Boolean(strictOverride) : (String(process.env.COLLECTOR_STRICT_AGE ?? 'true').toLowerCase() !== 'false');
+                          if (strict) {
+                            try { console.error(`REJECT_AGE init mint=${m} age=${ageSecInit} sig=${sig} allowAge=${allowAge}`); } catch(e){}
+                            accept = false;
+                          } else {
+                            try { console.error(`DEFER_AGE_DECISION init mint=${m} age=${ageSecInit} sig=${sig} allowAge=${allowAge}`); } catch(e){}
+                            accept = true;
+                          }
+                        }
+                  } else {
+                    // no global age cutoff: accept candidate if not previously seen (delegate strict checks to user strategies)
+                    const prevInit = await mintPreviouslySeen(m, txBlock, sig);
+                    if(prevInit === false) accept = true;
+                  }
               }catch(e){}
             }
             else if(kind === 'swap'){
@@ -726,36 +766,86 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                   const ft = first.blockTime || null;
                   if(ft && txBlock){
                     const delta = Math.abs(Number(ft) - Number(txBlock));
-                    if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
-                      const ageSec = getCanonicalAgeSeconds(ft, txBlock);
-            if(ageSec !== null && ageSec <= allowAge) accept = true;
-                    }
+                      if(delta <= FIRST_SIG_MATCH_WINDOW_SECS){
+                        const ageSec = getCanonicalAgeSeconds(ft, txBlock);
+                        // Enforce only if caller provided maxAgeSec; however we choose NOT to reject here.
+                        // If allowAge provided, still include candidate but mark for downstream decision.
+                        if(allowAge !== null){
+                              const strict = (strictOverride !== undefined && strictOverride !== null) ? Boolean(strictOverride) : (String(process.env.COLLECTOR_STRICT_AGE ?? 'true').toLowerCase() !== 'false');
+                              if (strict) {
+                                try { console.error(`REJECT_AGE swap mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
+                                if(ageSec !== null && ageSec <= allowAge) accept = true; else accept = false;
+                              } else {
+                                try { console.error(`DEFER_AGE_DECISION swap mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
+                                accept = true;
+                              }
+                            } else {
+                              accept = true;
+                            }
+                      }
                   }
                 }
               }catch(e){}
             } else {
               try{
                 const createdHere = isMintCreatedInThisTx(tx, m);
-                if(createdHere){
+                  if(createdHere){
                   const first = await getFirstSignatureCached(m);
                   let ageSec = null;
                   if(first && first.blockTime) ageSec = getCanonicalAgeSeconds(first.blockTime, txBlock);
                   else if(txBlock) ageSec = getCanonicalAgeSeconds(null, txBlock);
-          if(ageSec !== null && ageSec <= allowAge){
-                    const prev = await mintPreviouslySeen(m, txBlock, sig);
-                    if(prev === false) accept = true;
+            try {
+              const prev = await mintPreviouslySeen(m, txBlock, sig);
+                if(prev === false) {
+                // If caller provided a global max age, enforce it at collector time unless configured otherwise.
+                if(allowAge !== null) {
+                  const strict = (strictOverride !== undefined && strictOverride !== null) ? Boolean(strictOverride) : (String(process.env.COLLECTOR_STRICT_AGE ?? 'true').toLowerCase() !== 'false');
+                  if (strict) {
+                    if(ageSec !== null && ageSec <= allowAge) {
+                      accept = true;
+                    } else {
+                      try { console.error(`REJECT_AGE created mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
+                      accept = false;
+                    }
+                  } else {
+                    try { console.error(`DEFER_AGE_DECISION created mint=${m} age=${ageSec} sig=${sig} allowAge=${allowAge}`); } catch(e){}
+                    accept = true;
                   }
+                } else {
+                  try { console.error(`DEFER_AGE_DECISION created mint=${m} age=${ageSec} sig=${sig}`); } catch(e){}
+                  accept = true;
+                }
+              }
+            } catch(e){}
                 }
               }catch(e){}
             }
             if(accept){
-              collected.push(m); seenMintsLocal.add(m);
               try{
+                // compute lightweight on-chain age fields for downstream consumers
                 const firstCached = await getFirstSignatureCached(m).catch(()=>null);
                 const ft = firstCached && firstCached.blockTime ? firstCached.blockTime : null;
                 const ageSec = getCanonicalAgeSeconds(ft, txBlock);
                 console.error(`COLLECT_DEBUG accept program=${p} kind=${kind} mint=${m} age=${ageSec} firstBlock=${ft} txBlock=${txBlock} sig=${sig}`);
-              }catch(e){}
+                const tok = {
+                  tokenAddress: m,
+                  address: m,
+                  mint: m,
+                  firstBlockTime: ft ? Number(ft) * 1000 : null, // ms epoch when available
+                  _canonicalAgeSeconds: ageSec,
+                  sourceProgram: p,
+                  sourceSignature: sig,
+                  kind: kind,
+                  txBlock: txBlock,
+                  sampleLogs: (tx.meta && tx.meta.logMessages || []).slice(0,6),
+                  __listenerCollected: true,
+                };
+                collected.push(tok);
+                seenMintsLocal.add(m);
+              }catch(e){
+                // fallback: still push a simple string if object creation fails
+                try{ collected.push(m); seenMintsLocal.add(m); }catch(_){}
+              }
             }
           }
           if(collected.length >= maxCollect) break;

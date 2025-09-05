@@ -1698,6 +1698,10 @@ function buildExtraFields(token) {
     }
     return msg;
 }
+// Small runtime helper: mirror source `nice` helper so buildTokenMessage can use it
+function nice(v) {
+    return (v === undefined || v === null || v === 'Not available') ? '—' : v;
+}
 function buildTokenMessage(token, botUsername, pairAddress, userId) {
     const { name, symbol, address, dexUrl, logo } = getTokenCoreFields(token);
     const { price, marketCap, liquidity, volume, holders, ageDisplay } = getTokenStats(token);

@@ -313,9 +313,8 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
       if (ma !== undefined && ma !== null) {
         if (typeof ma === 'number' || !isNaN(Number(ma))) {
           const num = Number(ma);
-          // 0/1/2 are treated as seconds and do NOT count as constraints; larger
-          // numbers count as minutes and are considered constraints when > 2.
-          if (num > 2) minAgeIsConstraint = true;
+          // Any numeric minAge > 0 counts as a constraint (interpreted as seconds).
+          if (num > 0) minAgeIsConstraint = true;
         } else {
           // string value (eg. '30s', '2m') - treat as constraint conservatively
           minAgeIsConstraint = true;
@@ -332,6 +331,58 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
         return (typeof maxTrades === 'number') ? tokens.slice(0, maxTrades) : tokens.slice();
       }
     }
+
+    // If caller requested to preserve sources but the only numeric constraint is minAge,
+    // we can do a fast per-mint age check to avoid a full enrichment pass. This keeps
+    // listener speed while honoring per-user second-level minAge requirements.
+    try {
+      if ((opts && opts.preserveSources) && !hasOtherNumericConstraint) {
+        const maRaw = (strategy as any)?.minAge;
+        const minAgeSeconds = maRaw !== undefined && maRaw !== null ? Number(maRaw) : undefined;
+        if (!isNaN(minAgeSeconds) && minAgeSeconds > 0) {
+          // Attempt to accept tokens quickly if they already have on-chain age fields
+          const fastAccepted: any[] = [];
+          const fastRejected: any[] = [];
+          // prepare fast probe helper (prefer local fastTokenFetcher if available)
+          let ff: any = null;
+          try { ff = await import('../fastTokenFetcher'); } catch (e) { try { ff = require('../dist/src/fastTokenFetcher'); } catch(_) { ff = null; } }
+          for (const tkn of tokens) {
+            try {
+              // prefer canonical/computed fields
+              const ageKnown = (tkn && (tkn._canonicalAgeSeconds || tkn.ageSeconds || tkn.firstBlockTime || tkn.poolOpenTimeMs));
+              if (ageKnown) {
+                let ageSec = Number(tkn._canonicalAgeSeconds || tkn.ageSeconds || 0);
+                if (!ageSec && tkn.firstBlockTime) ageSec = (Date.now() - (Number(tkn.firstBlockTime) * 1000)) / 1000;
+                if (!ageSec && tkn.poolOpenTimeMs) ageSec = (Date.now() - Number(tkn.poolOpenTimeMs)) / 1000;
+                if (!isNaN(ageSec) && ageSec >= minAgeSeconds) {
+                  fastAccepted.push(tkn);
+                  continue;
+                }
+              }
+              // if we have a fast fetcher, probe for first signature/blockTime
+              if (ff && typeof ff.fetchFirstSignatureForMint === 'function') {
+                const probe = await ff.fetchFirstSignatureForMint(tkn.tokenAddress || tkn.mint || tkn.address).catch(() => null);
+                if (probe && probe.firstBlockTime) {
+                  const ageSec = (Date.now() - (Number(probe.firstBlockTime) * 1000)) / 1000;
+                  if (ageSec >= minAgeSeconds) { fastAccepted.push({...tkn, firstBlockTime: probe.firstBlockTime, _canonicalAgeSeconds: ageSec}); continue; }
+                  else { fastRejected.push(tkn); continue; }
+                }
+              }
+              // fallback: keep token for full path (don't accept immediately)
+              fastRejected.push(tkn);
+            } catch (e) { fastRejected.push(tkn); }
+          }
+          // return accepted up to maxTrades. Per strict policy (Option B) we must
+          // reject tokens that do not have a known on-chain age when minAgeSeconds > 0.
+          const maxTrades = strategy && (strategy as any).maxTrades ? Math.max(1, Number((strategy as any).maxTrades)) : undefined;
+          const res = (typeof maxTrades === 'number') ? fastAccepted.slice(0, maxTrades) : fastAccepted.slice();
+          // Strict policy: always return the fastAccepted set (possibly empty) and do not
+          // defer tokens lacking age info to full enrichment. This enforces minAge > 0
+          // as a hard on-chain requirement.
+          return res;
+        }
+      }
+    } catch (e) {}
   } catch (e) {}
   // Integrated enrichment: attempt to enrich tokens with on-chain timestamps and freshness
   // using Helius (RPC/parse/websocket), Solscan and RPC fallbacks. This improves age
@@ -505,15 +556,15 @@ export async function filterTokensByStrategy(tokens: any[], strategy: Strategy, 
 
     // If age is unknown and the strategy requires a minimum age, reject tokens
     // that don't have a known on-chain age when the required min age is >= 60s
-    // (treat numeric strategy.minAge as minutes for backward compatibility).
+    // Normalize strategy.minAge: numbers are seconds, strings parsed by parseDuration (returns seconds)
     const minAgeSeconds = strategy.minAge !== undefined
       ? parseDuration(strategy.minAge as any)
       : undefined;
     if (minAgeSeconds !== undefined) {
       if (ageSeconds === undefined || isNaN(ageSeconds)) {
-        // Require a known on-chain age for any minAge >= 60 seconds (1 minute).
-        if (minAgeSeconds >= 60) return false;
-        // For very small minAge (< 60s) remain permissive when age unknown.
+        // Require a known on-chain age for any minAge > 0 seconds.
+        // (minAge === 0 remains permissive when age is unknown)
+        if (minAgeSeconds > 0) return false;
       } else {
         if (ageSeconds < minAgeSeconds) return false;
       }

@@ -23,7 +23,7 @@ const { filterTokensByStrategy } = require('../dist/src/bot/strategy');
     } catch(e){ console.warn('failed to parse',f,e && e.message); }
   }
   console.log('loaded', tokens.length, 'tokens from capture_queue');
-  const user = users['5766632997'];
+  const user = users['7948630771'];
   if (!user) { console.error('user not found'); process.exit(1); }
   const filtered = await filterTokensByStrategy(tokens, user.strategy, { preserveSources: true });
   console.log('filtered tokens count:', filtered.length);

@@ -204,6 +204,12 @@ function extractNumeric(val: any, fallback?: number): number | undefined {
   return fallback;
 }
 
+// Small helper used by message formatting. Make it a top-level function so compiled
+// builds always include it (prevents "nice is not defined" runtime errors).
+export function nice(v: any) {
+  return (v === undefined || v === null || v === 'Not available') ? '—' : v;
+}
+
 // Parse duration input (supports numbers and strings like '30s','5m','2h')
 export function parseDuration(v: string | number | undefined | null): number | undefined {
   if (v === undefined || v === null || v === '') return undefined;
@@ -311,7 +317,7 @@ export let STRATEGY_FIELDS: StrategyField[] = [
   { key: 'minMarketCap', label: 'Minimum Market Cap (USD)', type: 'number', optional: false, tokenField: 'marketCap' },
   { key: 'minLiquidity', label: 'Minimum Liquidity (USD)', type: 'number', optional: false, tokenField: 'liquidity' },
   { key: 'minVolume', label: 'Minimum Volume (24h USD)', type: 'number', optional: false, tokenField: 'volume' },
-  { key: 'minAge', label: 'Minimum Age (minutes)', type: 'number', optional: false, tokenField: 'age' }
+  { key: 'minAge', label: 'Minimum Age (use suffix e.g. "30s", "2m" or plain number = seconds)', type: 'string', optional: false, tokenField: 'age' }
 ];
 
 
@@ -350,9 +356,25 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
     const maxCollect = Number(extraParams?.limit ? Math.max(1, Number(extraParams.limit)) : 50);
     const timeoutMs = 20000;
     const maxAgeSec = undefined;
-    const addrs: string[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec }).catch(() => []);
-    if (!Array.isArray(addrs) || addrs.length === 0) return [];
-    return addrs.map((a: any) => ({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
+    // support per-call collector strictness from extraParams.collectorStrict
+    let strictOverride: boolean | undefined = undefined;
+    try {
+      if (extraParams && Object.prototype.hasOwnProperty.call(extraParams, 'collectorStrict')) {
+        const v = (extraParams as any).collectorStrict;
+        if (v === 'true' || v === '1' || v === 1 || v === true) strictOverride = true;
+        else if (v === 'false' || v === '0' || v === 0 || v === false) strictOverride = false;
+      }
+    } catch (e) {}
+    const items: any[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec, strictOverride }).catch(() => []);
+    if (!Array.isArray(items) || items.length === 0) return [];
+    return items.map((it: any) => {
+      // listener may return either simple mint strings or enriched token objects
+      if (!it) return null;
+      if (typeof it === 'string') return { tokenAddress: it, address: it, mint: it, sourceCandidates: true, __listenerCollected: true };
+      // merge and normalize fields
+      const addr = it.tokenAddress || it.address || it.mint || null;
+      return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
+    }).filter(Boolean);
   } catch (e) {
     console.error('[fetchDexScreenerTokens] listener fetch failed:', e?.message || e);
     return [];

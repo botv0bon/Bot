@@ -2,6 +2,8 @@
  * Normalize strategy object: map synonyms, set defaults, and ensure consistent field names
  * Returns a new object and does not mutate the original.
  */
+import { parseDuration } from './tokenUtils';
+
 export function normalizeStrategy(orig: any) {
   const s = Object.assign({}, orig || {});
   // map synonyms
@@ -25,6 +27,14 @@ export function normalizeStrategy(orig: any) {
   s.minMarketCap = s.minMarketCap !== undefined ? Number(s.minMarketCap) : undefined;
   s.minLiquidity = s.minLiquidity !== undefined ? Number(s.minLiquidity) : undefined;
   s.minVolume = s.minVolume !== undefined ? Number(s.minVolume) : undefined;
-  s.minAge = s.minAge !== undefined ? Number(s.minAge) : undefined;
+  // Normalize minAge: accept numbers (seconds) or duration strings like '30s','2m'
+  if (s.minAge !== undefined && s.minAge !== null) {
+    try {
+      const parsed = typeof s.minAge === 'string' ? parseDuration(s.minAge) : Number(s.minAge);
+      s.minAge = (parsed === undefined || isNaN(Number(parsed))) ? undefined : Number(parsed);
+    } catch (e) { s.minAge = undefined; }
+  } else {
+    s.minAge = undefined;
+  }
   return s;
 }
