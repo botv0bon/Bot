@@ -119,6 +119,10 @@ import { getSolscanApiKey, getJupiterApiKey } from '../config';
 // Mirror listener-only guard used elsewhere: when true, avoid making outbound HTTP/RPC calls
 const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
 
+// If true, only `scripts/sequential_10s_per_program.js` should perform on-chain signature
+// and transaction fetching. This prevents duplicate fetchers from other modules.
+const SEQUENTIAL_COLLECTOR_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || '').toLowerCase() === 'true';
+
 
 // ========== General Constants ==========
 const EMPTY_VALUES = [undefined, null, '-', '', 'N/A', 'null', 'undefined'];

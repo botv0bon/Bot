@@ -15,8 +15,20 @@ const HELIUS_RPC_URLS = (process.env.HELIUS_RPC_URLS || process.env.HELIUS_RPC_U
 if(_HELIUS_KEYS.length===0){ const k = process.env.HELIUS_API_KEY || ''; if(k) _HELIUS_KEYS.push(k); }
 if(HELIUS_RPC_URLS.length===0){ HELIUS_RPC_URLS.push('https://mainnet.helius-rpc.com/'); }
 let heliusCallCounter = 0;
+// Collector guard: only allow active enrichment/RPCs when FORCE_ENRICH=true
+const ALLOW_ENRICH = String(process.env.FORCE_ENRICH || '').toLowerCase() === 'true';
+// If the user has requested the sequential collector to be the only active fetcher
+// then disable other enrichment workers and fast fetchers by honoring SEQUENTIAL_COLLECTOR_ONLY
+const SEQ_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || '').toLowerCase() === 'true';
+if (SEQ_ONLY) {
+  console.error('[COLLECTOR-GUARD] enrich_worker: disabled because SEQUENTIAL_COLLECTOR_ONLY=true');
+  process.exit(0);
+}
+if(!ALLOW_ENRICH){ console.error('[COLLECTOR-GUARD] enrich_worker: Helius RPCs disabled (FORCE_ENRICH not set). To enable set FORCE_ENRICH=true in the environment.'); }
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 async function heliusRpc(method, params){
+  // Respect collector-only policy: if enrichment is not allowed, return a sentinel error
+  if(!ALLOW_ENRICH){ return { __error: 'collector-guard-disabled' }; }
   try{
     const keyIdx = heliusCallCounter % Math.max(1, _HELIUS_KEYS.length);
     const urlIdx = heliusCallCounter % Math.max(1, HELIUS_RPC_URLS.length);
@@ -35,7 +47,7 @@ async function processOne(file){
     const obj = JSON.parse(raw);
     const { mints, signature, program, kind, sampleLogs } = obj;
     const enriched = [];
-    for(const m of (mints||[])){
+  for(const m of (mints||[])){
       try{
         // fetch first signature for mint and include blockTime
         const sigs = await heliusRpc('getSignaturesForAddress', [m, { limit: 1 }]);
@@ -43,6 +55,22 @@ async function processOne(file){
         else enriched.push({ mint: m, firstSig: null, blockTime: null });
       }catch(e){ enriched.push({ mint: m, firstSig: null, blockTime: null }); }
     }
+    // Normalize blockTime values in the enriched output to milliseconds epoch when possible
+    try{
+      for(const ent of enriched){
+        try{
+          const bt = ent && (ent.blockTime || ent.block_time || ent.blocktime || null);
+          if(bt === null || bt === undefined) { ent.blockTime = null; continue; }
+          const n = Number(bt);
+          if(!n || Number.isNaN(n)) { ent.blockTime = null; continue; }
+          // if value looks like ms epoch (> 1e12) keep, if looks like seconds (>1e9) convert to ms
+          if(n > 1e12) ent.blockTime = Math.floor(n);
+          else if(n > 1e9) ent.blockTime = Math.floor(n * 1000);
+          else ent.blockTime = null;
+        }catch(e){}
+      }
+    }catch(e){}
+
     const notif = { time: new Date().toISOString(), program, signature, kind, enriched, sampleLogs };
     const outFile = path.join(NOTIF_DIR, Date.now() + '-' + Math.random().toString(36).slice(2,8) + '.json');
     fs.writeFileSync(outFile, JSON.stringify(notif, null, 2), 'utf8');

@@ -826,7 +826,21 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                 const firstCached = await getFirstSignatureCached(m).catch(()=>null);
                 const ft = firstCached && firstCached.blockTime ? firstCached.blockTime : null;
                 const ageSec = getCanonicalAgeSeconds(ft, txBlock);
-                console.error(`COLLECT_DEBUG accept program=${p} kind=${kind} mint=${m} age=${ageSec} firstBlock=${ft} txBlock=${txBlock} sig=${sig}`);
+                // Emit structured collector event instead of freeform debug line so consumers
+                // can easily parse initialize events and fresh mints.
+                // Previous debug line: COLLECT_DEBUG accept program=... kind=... mint=...
+                const collectorEvent = {
+                  time: new Date().toISOString(),
+                  program: p,
+                  signature: sig,
+                  kind: 'initialize',
+                  freshMints: [m],
+                  ageSeconds: ageSec,
+                  firstBlock: ft,
+                  txBlock: txBlock,
+                };
+                try{ console.log(JSON.stringify(collectorEvent)); }catch(e){}
+
                 const tok = {
                   tokenAddress: m,
                   address: m,

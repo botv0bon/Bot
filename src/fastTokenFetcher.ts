@@ -190,6 +190,15 @@ export async function appendSentHash(userId: string, hash: string) {
  * Prioritized users: user.strategy.priority === true or user.strategy.priorityRank > 0
  */
 export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: { intervalMs?: number }) {
+  // If SEQUENTIAL_COLLECTOR_ONLY=true then disable other fetchers to ensure
+  // `scripts/sequential_10s_per_program.js` is the sole source of on-chain fetches
+  const SEQ_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || '').toLowerCase() === 'true';
+  if (SEQ_ONLY) {
+    try { console.error('[FAST_FETCHER] disabled due to SEQUENTIAL_COLLECTOR_ONLY=true'); } catch (e) {}
+    return {
+      stop: () => {},
+    } as any;
+  }
   const intervalMs = options?.intervalMs || 1000;
   const perUserLimit = (options as any)?.perUserLimit || 1; // max messages per interval
   const batchLimit = (options as any)?.batchLimit || 20; // tokens per user per interval

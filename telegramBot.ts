@@ -25,6 +25,10 @@ console.warn = (...args: any[]) => {
   try {
     const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
     if (_filterRegex.test(s)) return; // drop noisy retry/429 lines
+    // If canonical-only mode is enabled, route logs to stderr (verbose) instead of stdout
+    if (CANONICAL_ONLY) {
+      try { _origError('[VERBOSE]', s); return; } catch (e) {}
+    }
   } catch (e) {}
   _origWarn(...args);
 };
@@ -32,6 +36,7 @@ console.error = (...args: any[]) => {
   try {
     const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
     if (_filterRegex.test(s)) return;
+    // Always write errors to stderr; in canonical-only mode we prefer stderr so leave as-is
   } catch (e) {}
   _origError(...args);
 };
@@ -39,6 +44,9 @@ console.log = (...args: any[]) => {
   try {
     const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
     if (_filterRegex.test(s)) return;
+    if (CANONICAL_ONLY) {
+      try { _origError('[VERBOSE]', s); return; } catch (e) {}
+    }
   } catch (e) {}
   _origLog(...args);
 };
@@ -54,9 +62,48 @@ const HELIUS_ENRICH_LIMIT = Number(process.env.HELIUS_ENRICH_LIMIT ?? 25);
 const ONCHAIN_FRESHNESS_TIMEOUT_MS = Number(process.env.ONCHAIN_FRESHNESS_TIMEOUT_MS ?? 5000);
 console.log('--- dotenv loaded ---');
 // Enforce listener-only safe mode: when true, avoid making disk-based reads/writes in active user paths.
-// Controlled via env LISTENER_ONLY_MODE or LISTENER_ONLY. Default to true.
-const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'true').toLowerCase() === 'true';
+// Controlled via env LISTENER_ONLY_MODE or LISTENER_ONLY. Default to false (production-enabled).
+// Set LISTENER_ONLY_MODE=true in the environment to opt back into safe listener-only behavior.
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'false').toLowerCase() === 'true';
+// Allow skipping the actual Telegram launch for local dry-runs/tests. When SKIP_TELEGRAM_LAUNCH=true
+// the script will still load users, register handlers and start the in-process listener, but will
+// not call `bot.launch()` (avoids 409 conflicts). Additionally, when DRY_RUN_NO_TELEGRAM=true the
+// notification handler will log messages it would send instead of calling Telegram APIs.
+const SKIP_TELEGRAM_LAUNCH = String(process.env.SKIP_TELEGRAM_LAUNCH || 'false').toLowerCase() === 'true';
+const DRY_RUN_NO_TELEGRAM = String(process.env.DRY_RUN_NO_TELEGRAM || 'false').toLowerCase() === 'true';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// When true, the process MUST only print canonical outputs to stdout (array line + metadata line).
+// Use `DETAILED_LOGS=true` to enable verbose logs to stderr for monitoring.
+const CANONICAL_ONLY = String(process.env.CANONICAL_ONLY ?? 'true').toLowerCase() === 'true';
+const DETAILED_LOGS = String(process.env.DETAILED_LOGS ?? 'true').toLowerCase() === 'true';
+// By default the bot should not emit canonical JSON lines for UI preview actions.
+// Set BOT_EMIT_CANONICAL=true in environment to allow the bot to emit canonical
+// two-line JSON outputs (array + metadata) from UI flows such as Show Tokens.
+const BOT_EMIT_CANONICAL = String(process.env.BOT_EMIT_CANONICAL || 'false').toLowerCase() === 'true';
+// Developer monitor: when true, force verbose diagnostic mode and print every event
+// emitted by the listener and notification pump to the developer terminal via _origLog.
+const DEV_MONITOR = String(process.env.DEV_MONITOR || 'false').toLowerCase() === 'true';
+if (DEV_MONITOR) {
+  try{ _origLog('[DEV_MONITOR] enabled - forcing verbose diagnostics and BOT_EMIT_CANONICAL'); }catch(e){}
+}
+// Effective canonical emit flag: DEV_MONITOR implies bot-level canonical emits
+const EFFECTIVE_BOT_EMIT_CANONICAL = BOT_EMIT_CANONICAL || DEV_MONITOR;
+
+function emitCanonicalLines(arr: any[], meta: Record<string, any>) {
+  try {
+    // Always write canonical lines to stdout so other tools can parse them.
+    process.stdout.write(JSON.stringify(arr) + '\n');
+    process.stdout.write(JSON.stringify(meta) + '\n');
+  } catch (e) {
+    // Fallback: log to stderr
+    try { console.error('[emitCanonicalLines] failed', e); } catch (e) {}
+  }
+}
+
+function verboseLog(...args: any[]) {
+  if (!DETAILED_LOGS && !DEV_MONITOR) return;
+  try { _origError('[VERBOSE]', ...args); } catch (e) {}
+}
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN);
 if (!TELEGRAM_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN not found in .env file. Please add TELEGRAM_BOT_TOKEN=YOUR_TOKEN to .env');
@@ -66,6 +113,7 @@ const bot = new Telegraf(TELEGRAM_TOKEN);
 console.log('--- Telegraf instance created ---');
 let users: Record<string, any> = {};
 console.log('--- Users placeholder created ---');
+// console suppression is handled by the top-level console wrappers when CANONICAL_ONLY is set
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
 
@@ -83,31 +131,14 @@ function userIsListenerOnly(user: any) {
 async function getTokensForUser(userId: string, strategy: Record<string, any> | undefined) {
   // Listener-only token source: always use the program-listener collector
   try {
-    // Convert strategy.maxTrades -> maxCollect
-    const maxCollect = Math.max(1, Number(strategy?.maxTrades || 3));
-    // Convert minAge field to seconds if present
-    let maxAgeSec: number | undefined = undefined;
-    try {
-      const ma = strategy && (strategy as any).minAge;
-      if (ma !== undefined && ma !== null) {
-        const s = String(ma).trim().toLowerCase();
-        const secMatch = s.match(/^([0-9]+)s$/);
-        const minMatch = s.match(/^([0-9]+)m$/);
-        if (secMatch) maxAgeSec = Number(secMatch[1]);
-        else if (minMatch) maxAgeSec = Number(minMatch[1]) * 60;
-        else if (!isNaN(Number(s))) {
-          // Plain numeric values are seconds
-          maxAgeSec = Number(s);
-        }
-      }
-    } catch (e) {}
-    // Require the sequential listener collector and use it as the sole source
-    // of tokens. This avoids any external API or cache usage.
+    // Only use strategy.maxTrades to determine how many tokens to collect for the user.
+    const maxCollect = Math.max(1, Number(strategy?.maxTrades || 1));
+    // Require the sequential listener collector as the sole source of tokens.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const seq = require('./scripts/sequential_10s_per_program.js');
     if (!seq || typeof seq.collectFreshMints !== 'function') return [];
-  const strictOverride = (strategy && (strategy as any).collectorStrict !== undefined) ? Boolean((strategy as any).collectorStrict) : undefined;
-  const items = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(() => []);
+    const strictOverride = (strategy && (strategy as any).collectorStrict !== undefined) ? Boolean((strategy as any).collectorStrict) : undefined;
+    const items = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, strictOverride }).catch(() => []);
     if (!Array.isArray(items) || items.length === 0) return [];
     const tokens = (items || []).map((it: any) => {
       if (!it) return null;
@@ -115,29 +146,28 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
       const addr = it.tokenAddress || it.address || it.mint || null;
       return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
     }).filter(Boolean);
-    // If user specified a minAge, enforce it strictly here (same semantics as listener)
-    try{
-      const parseDuration = require('./src/utils/tokenUtils').parseDuration;
-      const ma = strategy && (strategy as any).minAge;
-      const minAgeSeconds = ma !== undefined && ma !== null ? parseDuration(ma) : undefined;
-      if (!isNaN(Number(minAgeSeconds)) && minAgeSeconds !== undefined && minAgeSeconds !== null && Number(minAgeSeconds) > 0) {
-        const accepted = tokens.filter((t: any) => {
-          try{
-            // prefer _canonicalAgeSeconds (seconds)
-            let ageSec: number | undefined = undefined;
-            if (t && t._canonicalAgeSeconds !== undefined && t._canonicalAgeSeconds !== null) ageSec = Number(t._canonicalAgeSeconds);
-            else if (t && t.ageSeconds !== undefined && t.ageSeconds !== null) ageSec = Number(t.ageSeconds);
-            else if (t && t.firstBlockTime) {
-              const ftMs = Number(t.firstBlockTime);
-              if (!isNaN(ftMs) && ftMs > 0) ageSec = (Date.now() - ftMs) / 1000;
-            }
-            if (ageSec === undefined || isNaN(ageSec)) return false; // strict: require known on-chain age
-            return ageSec >= Number(minAgeSeconds);
-          }catch(e){ return false; }
-        });
-        return accepted;
-      }
-    }catch(e){}
+    // Ensure we only present explicit-created tokens, preserve order (newest first),
+    // deduplicate by mint/address, and limit to the user's configured maxTrades.
+    const beforeCount = tokens.length;
+    const onlyExplicit = tokens.filter((t:any) => t && (t.createdHere === true));
+    // deduplicate by canonical mint/address preserving the first occurrence
+    const seen = new Set<string>();
+    const unique: any[] = [];
+    for (const t of onlyExplicit) {
+      try{
+        const addr = (t && (t.mint || t.tokenAddress || t.address)) || null;
+        if (!addr) continue;
+        if (seen.has(addr)) continue;
+        seen.add(addr);
+        unique.push(t);
+      }catch(e){}
+    }
+    const afterCount = unique.length;
+    verboseLog('[getTokensForUser] explicit-unique filtered', { requested: maxCollect, beforeCount, afterCount });
+    // return up to the user's requested number of trades
+    return unique.slice(0, maxCollect);
+    // Do NOT apply any minMarketCap/minLiquidity/minVolume/minAge filtering here — per user request
+    // we only use the per-user `maxTrades` to limit results.
     return tokens;
   } catch (e) {
     console.error('[getTokensForUser] listener fetch failed:', e?.message || e);
@@ -204,17 +234,32 @@ bot.hears('💼 Wallet', async (ctx) => {
     try {
       balance = await getSolBalance(user.wallet);
     } catch {}
-    await ctx.reply(
-    `💼 Your Wallet:\nAddress: <code>${user.wallet}</code>\nBalance: <b>${balance}</b> SOL`,
-      ({
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [ { text: '👁️ Show Private Key', callback_data: 'show_secret' } ]
-          ]
-        }
-      } as any)
-    );
+    // reuse getTokensForUser to fetch listener candidates. Only limit by maxTrades.
+    const strategyRef = (user && user.strategy) ? user.strategy : {};
+    const tokens = await getTokensForUser(userId, strategyRef).catch(()=>[]);
+    if (!tokens || tokens.length === 0) {
+      await ctx.reply('No live tokens found right now. Try again in a few seconds.');
+      return;
+    }
+    // build a richer per-token preview using buildPreviewMessage
+    const maxTrades = Math.max(1, Number(strategyRef?.maxTrades || 1));
+    const showTokens = tokens.slice(0, maxTrades);
+    let text = `🔔 <b>Live tokens (preview)</b>\nFound ${tokens.length} candidates (showing up to ${maxTrades}):\n`;
+    for (const t of showTokens) {
+      try {
+        const preview = buildPreviewMessage(t);
+        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
+        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
+      } catch (e) {
+        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
+        text += `\n<code>${addr}</code>\n`;
+      }
+    }
+    try {
+      await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true } as any);
+    } catch (e) {
+      try { await ctx.reply('✅ Found live tokens.'); } catch (_) {}
+    }
   } else {
     await ctx.reply('❌ No wallet found for this user.', walletKeyboard());
   }
@@ -270,9 +315,61 @@ bot.hears('📊 Show Tokens', async (ctx) => {
         text += `• <code>${addr}</code>\n`;
       }
     }
-    await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any));
+    // Cache preview so the user can choose to send it live via an inline button
+    try {
+      // Build HTML version for later send
+      const html = text;
+      // store in-memory cache for this user
+      try { previewCache[String(ctx.from?.id)] = { html, addrs: (tokens || []).map((t:any)=> t && (t.tokenAddress||t.address||t.mint)).filter(Boolean) }; } catch(e){}
+      const inline = Markup.inlineKeyboard([[Markup.button.callback('✅ Send Now', 'send_show_preview')]]);
+      await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: inline.reply_markup } as any));
+    } catch (e) {
+      try { await ctx.reply('Error preparing preview.'); } catch(_){ }
+    }
+    // Emit canonical lines for external consumers: array of addresses + metadata
+    try{
+      const addrs = (tokens || []).map((t:any)=> t && (t.tokenAddress||t.address||t.mint)).filter(Boolean);
+      const meta = { time: new Date().toISOString(), kind: 'show_preview', requestedBy: String(ctx.from?.id), count: addrs.length } as any;
+  if (EFFECTIVE_BOT_EMIT_CANONICAL) {
+        emitCanonicalLines(addrs, meta);
+        verboseLog('[show_tokens] emitted canonical', meta);
+      } else {
+        verboseLog('[show_tokens] canonical suppressed by BOT_EMIT_CANONICAL=false', meta);
+      }
+    }catch(e){ verboseLog('[show_tokens] emit failed', e); }
   } catch (e) {
     try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
+  }
+});
+
+// In-memory cache for show-token previews per user
+const previewCache: Record<string, { html: string, addrs: string[] }> = {};
+
+// Handler for the inline 'Send Now' button. This will send the real Telegram message
+// to the requesting user, bypassing DRY_RUN for explicit manual tests.
+bot.action('send_show_preview', async (ctx) => {
+  try {
+    const userId = String(ctx.from?.id);
+    verboseLog('[send_show_preview] clicked by', userId);
+    const cache = previewCache[userId];
+    if (!cache) {
+      try { await ctx.answerCbQuery('Preview expired or not found. Please press Show Tokens again.'); } catch(_){}
+      return;
+    }
+    // Acknowledge the button press immediately
+    try { await ctx.answerCbQuery('Sending preview now...'); } catch(_){}
+
+    // Send the cached HTML message using the real Telegram API regardless of DRY_RUN flag
+    try {
+      await bot.telegram.sendMessage(userId, cache.html, { parse_mode: 'HTML', disable_web_page_preview: true } as any);
+      verboseLog('[send_show_preview] real send complete for', userId);
+      try { await ctx.reply('✅ Message sent.'); } catch(_){}
+    } catch (e:any) {
+      console.error('[send_show_preview] failed to send message:', e?.message || e);
+      try { await ctx.reply('❌ Failed to send message: ' + (e?.message || String(e))); } catch(_){}
+    }
+  } catch (e:any) {
+    console.error('[send_show_preview] handler error:', e?.message || e);
   }
 });
 
@@ -595,33 +692,45 @@ console.log('--- About to launch bot ---');
       // immediately to users (no central caches or disk reads).
       try {
   // in-memory suppression map (userId -> Map(addr -> lastSentTs))
+  // Do not use suppression; always allow sending up to user.strategy.maxTrades
   const sentNotifications: Record<string, Map<string, number>> = {};
-        const suppressionMinutes = Number(process.env.NOTIF_SUPPRESSION_MINUTES ?? 1);
-        const suppressionMs = Math.max(0, suppressionMinutes) * 60 * 1000;
+  const suppressionMs = 0;
         // require the exported notifier from the listener script (if it's loaded in-process)
         let listenerNotifier: any = null;
         try{ const seqMod = require('./scripts/sequential_10s_per_program.js'); listenerNotifier = seqMod && seqMod.notifier ? seqMod.notifier : null; }catch(e){}
-        // register handler on the exported notifier if present
-        if(listenerNotifier && typeof listenerNotifier.on === 'function'){
-          listenerNotifier.on('notification', async (userEvent:any) => {
+        // Extract notification handling to a shared function so stdin and notifier both use same logic
+        async function handleNotification(userEvent: any) {
+          try{
+            const uid = String(userEvent && userEvent.user);
+            verboseLog('[handleNotification] incoming for uid', uid);
+            if(!uid) return;
+            const user = users[uid];
+            verboseLog('[handleNotification] userLoaded', Boolean(user), 'strategyLoaded', Boolean(user && user.strategy), 'enabled', user && user.strategy && user.strategy.enabled);
+            if(!user || !user.strategy || user.strategy.enabled === false) return;
+            if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
+            // derive addresses to check suppression from matched or tokens
+            // Prefer explicit freshMints when present (especially for initialize events)
+            const matchAddrs = (Array.isArray(userEvent.freshMints) && userEvent.freshMints.length) ? userEvent.freshMints : (Array.isArray(userEvent.matched) && userEvent.matched.length ? userEvent.matched : (Array.isArray(userEvent.tokens) ? (userEvent.tokens.map((t:any)=>t.tokenAddress||t.address||t.mint).filter(Boolean)) : []));
+            const maxTrades = Number(user.strategy?.maxTrades || 3);
+            verboseLog('[handleNotification] matchAddrs', matchAddrs, 'maxTrades', maxTrades);
+            const toSend = (matchAddrs || []).slice(0, maxTrades).map(a => a);
+            verboseLog('[handleNotification] toSend', toSend);
+            if(!toSend || toSend.length===0) return;
+            // prefer pre-built HTML payload if present
             try{
-              const uid = String(userEvent && userEvent.user);
-              if(!uid) return;
-              const user = users[uid]; if(!user || !user.strategy || user.strategy.enabled === false) return;
-              if(!sentNotifications[uid]) sentNotifications[uid] = new Map();
-              // derive addresses to check suppression from matched or tokens
-              const matchAddrs = Array.isArray(userEvent.matched) && userEvent.matched.length ? userEvent.matched : (Array.isArray(userEvent.tokens) ? (userEvent.tokens.map((t:any)=>t.tokenAddress||t.address||t.mint).filter(Boolean)) : []);
-              const maxTrades = Number(user.strategy?.maxTrades || 3);
-              const toSend = [] as string[];
-              for(const a of (matchAddrs || []).slice(0, maxTrades)){
-                const last = sentNotifications[uid].get(a) || 0;
-                if(suppressionMs>0 && (Date.now()-last) < suppressionMs) continue;
-                toSend.push(a);
-              }
-              if(toSend.length===0) return;
-              // prefer pre-built HTML payload if present
-              try{
-                const chatId = uid;
+              const chatId = uid;
+              if(DRY_RUN_NO_TELEGRAM){
+                // In dry-run mode, log the payload that would be sent instead of calling Telegram
+                if(!CANONICAL_ONLY){
+                  if(userEvent.html && typeof userEvent.html === 'string'){
+                    try{ _origError(`[DRY_SEND] chatId=${chatId} html=${userEvent.html.slice(0,200)}`); }catch(e){}
+                  } else {
+                    let text = `🔔 Matched tokens for your strategy\nProgram: ${userEvent.program}\nSignature: ${userEvent.signature}\n`;
+                    text += `Matched (${toSend.length}): ${toSend.slice(0,10).join(', ')}`;
+                    try{ _origError(`[DRY_SEND] chatId=${chatId} text=${text}`); }catch(e){}
+                  }
+                }
+              } else {
                 if(userEvent.html && typeof userEvent.html === 'string'){
                   const options: any = ({ parse_mode: 'HTML', disable_web_page_preview: false } as any);
                   if(userEvent.inlineKeyboard) options.reply_markup = { inline_keyboard: userEvent.inlineKeyboard };
@@ -634,11 +743,74 @@ console.log('--- About to launch bot ---');
                   text += `\nTime: ${new Date().toISOString()}`;
                   await (bot.telegram as any).sendMessage(chatId, text, ({ parse_mode: 'HTML', disable_web_page_preview: true } as any)).catch(()=>{});
                 }
-                for(const a of toSend) sentNotifications[uid].set(a, Date.now());
-              }catch(e){ /* swallow */ }
-            }catch(e){ /* swallow per-event errors */ }
-          });
+              }
+              for(const a of toSend) sentNotifications[uid].set(a, Date.now());
+            }catch(e){ /* swallow */ }
+          }catch(e){ /* swallow per-event errors */ }
         }
+        // register handler on the exported notifier if present
+        if(listenerNotifier && typeof listenerNotifier.on === 'function'){
+          listenerNotifier.on('notification', handleNotification);
+          // Developer monitor: also log every notification payload to the developer terminal
+          if (DEV_MONITOR) {
+            try{ listenerNotifier.on('notification', (p:any) => { try{ _origLog('[DEV_MONITOR][notification]', JSON.stringify(p)); }catch(e){} }); }catch(e){}
+            try{ listenerNotifier.on('programEvent', (e:any) => { try{ _origLog('[DEV_MONITOR][programEvent]', JSON.stringify(e)); }catch(e){} }); }catch(e){}
+          }
+        }
+        // Also support reading JSON notifications directly from stdin (one JSON object per line)
+        try{
+          try{
+            const rl = require('readline').createInterface({ input: process.stdin, terminal: false });
+            rl.on('line', (line: string) => {
+              try{
+                if(!line || !line.trim()) return;
+                const payload = JSON.parse(line.trim());
+                verboseLog('[stdin-notif] parsed payload', payload && payload.user, payload && payload.freshMints);
+                try{ listenerNotifier && listenerNotifier.emit && listenerNotifier.emit('notification', payload); }catch(e){}
+              }catch(e){ verboseLog('[stdin-notif] failed to parse line', e && e.message); }
+            });
+            rl.on('close', () => {
+              verboseLog('[stdin-notif] stdin closed');
+              try{
+                if(String(process.env.EXIT_ON_STDIN_DONE || '').toLowerCase() === 'true'){
+                  // give a short grace period for handlers to finish then exit
+                  setTimeout(() => {
+                    verboseLog('[stdin-notif] EXIT_ON_STDIN_DONE triggered - exiting');
+                    try{ process.exit(0); }catch(e){}
+                  }, 800);
+                }
+              }catch(e){}
+            });
+          }catch(e){ verboseLog('[stdin-notif] readline setup failed', e && e.message); }
+        }catch(e){}
+        // Optional: test notification directory. When set via TEST_NOTIFICATION_DIR env var,
+        // watch that directory for new JSON files and emit their contents as 'notification' events
+        // into the listenerNotifier. This is a local testing hook and only activates when the
+        // TEST_NOTIFICATION_DIR environment variable is provided.
+        try{
+          const TEST_NOTIFICATION_DIR = process.env.TEST_NOTIFICATION_DIR || null;
+          if(TEST_NOTIFICATION_DIR && listenerNotifier){
+            try{ fs.mkdirSync(TEST_NOTIFICATION_DIR, { recursive: true }); }catch(e){}
+            try{
+              fs.watch(TEST_NOTIFICATION_DIR, { persistent: false }, (ev, fname) => {
+                if(!fname) return;
+                // only on new files (rename event) attempt to read then emit
+                if(ev !== 'rename') return;
+                const full = path.join(TEST_NOTIFICATION_DIR, fname as string);
+                // delay slightly to allow write to finish
+                setTimeout(() => {
+                  try{
+                    const raw = fs.readFileSync(full, 'utf8');
+                    const payload = JSON.parse(raw);
+                    try{ listenerNotifier.emit('notification', payload); }catch(e){}
+                    try{ fs.unlinkSync(full); }catch(e){}
+                  }catch(e){ /* ignore read/parse errors */ }
+                }, 150);
+              });
+              verboseLog('[test-notif] watching', TEST_NOTIFICATION_DIR);
+            }catch(e){ verboseLog('[test-notif] watch failed', e); }
+          }
+        }catch(e){}
         // also drain in-memory queues (if listener and bot are same process) at startup
         try{
           const q = (global as any).__inMemoryNotifQueues;
@@ -647,7 +819,10 @@ console.log('--- About to launch bot ---');
               try{
                 const items = Array.isArray(arr) ? arr.slice(0) : [];
                 for(const it of items.reverse()){
-                  try{ listenerNotifier && listenerNotifier.emit && listenerNotifier.emit('notification', it); }catch(e){}
+                  try{
+                    if (DEV_MONITOR) try{ _origLog('[DEV_MONITOR][inMemoryDrain] emitting', JSON.stringify(it)); }catch(e){}
+                    listenerNotifier && listenerNotifier.emit && listenerNotifier.emit('notification', it);
+                  }catch(e){}
                 }
                 // clear after drain
                 q.set(k, []);
@@ -691,8 +866,12 @@ console.log('--- About to launch bot ---');
     // Register centralized buy/sell handlers now that users are loaded
     try { registerBuySellHandlers(bot, users, boughtTokens); } catch (e) { console.error('Failed to register buy/sell handlers:', e); }
 
-    await bot.launch();
-    console.log('✅ Bot launched successfully (polling)');
+    if(!SKIP_TELEGRAM_LAUNCH){
+      await bot.launch();
+      console.log('✅ Bot launched successfully (polling)');
+    } else {
+      console.log('⚠️ SKIP_TELEGRAM_LAUNCH=true - skipping actual bot.launch() (dry-run)');
+    }
       try {
         // Start fast token fetcher to prioritize some users (1s polling)
   // Do NOT start fast token fetcher or enrich queue - listener is the single source of truth per requirement.
@@ -798,7 +977,7 @@ bot.command('show_token', async (ctx) => {
       console.log('[show_token] fast-path tokens:', (tokens || []).length);
       // If these tokens are live candidates (from listener/fastFetcher), present immediately
       if (Array.isArray(tokens) && tokens.length && tokens.every(t => (t as any).sourceCandidates || (t as any).matched || (t as any).tokenAddress)) {
-        console.log('[show_token] presenting live/sourceCandidates without heavy filter');
+        if(!CANONICAL_ONLY) console.log('[show_token] presenting live/sourceCandidates without heavy filter');
         // debug: print token provenance & freshness hints
         try{
           for(const t of tokens){
@@ -830,6 +1009,17 @@ bot.command('show_token', async (ctx) => {
         }
       }
       try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found live matching tokens.'); } catch {} }
+      // Emit canonical lines for these fast-path tokens
+      try{
+        const addrs = (tokens || []).map((t:any)=> t && (t.tokenAddress||t.address||t.mint)).filter(Boolean);
+        const meta = { time: new Date().toISOString(), kind: 'show_preview_fast', user: userId, count: addrs.length } as any;
+  if (EFFECTIVE_BOT_EMIT_CANONICAL) {
+          emitCanonicalLines(addrs, meta);
+        } else {
+          verboseLog('[show_preview_fast] canonical suppressed by BOT_EMIT_CANONICAL=false', meta);
+        }
+        verboseLog('[show_token] emitted canonical fast-path', meta);
+      }catch(e){ verboseLog('[show_token] emit failed', e); }
       return;
     }
 
@@ -858,6 +1048,17 @@ bot.command('show_token', async (ctx) => {
           const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
           const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
           if(Array.isArray(addrs) && addrs.length > 0){ try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} } return; }
+            if(Array.isArray(addrs) && addrs.length > 0){
+              try{
+                const meta = { time: new Date().toISOString(), kind: 'collector_raw', user: userId, count: addrs.length } as any;
+                if (EFFECTIVE_BOT_EMIT_CANONICAL) {
+                  emitCanonicalLines(addrs, meta);
+                } else {
+                  verboseLog('[live_show_tokens] canonical suppressed by BOT_EMIT_CANONICAL=false', meta);
+                }
+                verboseLog('[show_token] emitted canonical collector raw', meta);
+              }catch(e){ verboseLog('[show_token] emit failed', e); }
+            }
         }
       }catch(e){}
       await ctx.reply('🔔 No live listener results available at the moment; please wait.');
