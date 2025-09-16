@@ -1,16 +1,18 @@
+import './src/disableEverything';
 import 'dotenv/config';
 const ff = require('./src/fastTokenFetcher');
 const utils = require('./src/utils/tokenUtils');
-
-console.log('Monitor script started. Polling every 5s. Stop with Ctrl+C.');
 const intervalMs = Number(process.env.MONITOR_INTERVAL_MS || 5000);
+const MONITOR_ENABLED = String(process.env.MONITOR_ENABLED || '').toLowerCase() === 'true';
+const SEQUENTIAL_COLLECTOR_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || 'false').toLowerCase() === 'true';
 let running = true;
 
-process.on('SIGINT', () => {
-  console.log('\nMonitor stopping (SIGINT)');
-  running = false;
+if (!MONITOR_ENABLED && !SEQUENTIAL_COLLECTOR_ONLY) {
+  console.log('[monitor] MONITOR_ENABLED not set and SEQUENTIAL_COLLECTOR_ONLY=false - exiting without starting monitor loop.');
   process.exit(0);
-});
+}
+
+process.on('SIGINT', () => { running = false; process.exit(0); });
 
 async function toTsFromValue(v: any) {
   if (v == null) return null;
@@ -29,39 +31,19 @@ async function toTsFromValue(v: any) {
 (async function main() {
   while (running) {
     try {
-      const latest = await ff.fetchLatest5FromAllSources(200);
-      const candidates = Array.from(new Set([...(latest.heliusEvents || []), ...(latest.dexTop || []), ...(latest.heliusHistory || [])]));
-      const allTokens = await utils.fetchDexScreenerTokens('solana', { limit: '500' }).catch(() => []);
-      const now = Date.now();
-      const found: any[] = [];
-      for (const mint of candidates.slice(0, 200)) {
-        const t = (allTokens || []).find((x: any) => String(x.tokenAddress || x.address || x.mint || '') === String(mint));
-        if (!t) continue;
-        let ageMin: number | undefined = undefined;
-        if (typeof t.ageMinutes === 'number') ageMin = Math.floor(t.ageMinutes);
-        if (typeof ageMin === 'undefined') {
-          const cs = ['createdAt','created_at','listedAt','published_at','time','timestamp','first_trade_time','poolOpenTimeMs','poolOpenTime'];
-          for (const k of cs) {
-            const v = t[k] || (t.freshnessDetails && t.freshnessDetails[k]);
-            const ts = await toTsFromValue(v);
-            if (ts) { ageMin = Math.floor((now - ts) / 60000); t._ageSource = k; t._ageTs = ts; break; }
+      // Use only the sequential collector to produce canonical fresh-mints output
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const seq = require('./scripts/sequential_10s_per_program.js');
+        if (seq && typeof seq.collectFreshMints === 'function') {
+          const items = await seq.collectFreshMints({ maxCollect: 10, timeoutMs: 20000 }).catch(() => []);
+          const addrs = (Array.isArray(items) ? items.map((it: any) => (typeof it === 'string' ? it : (it && (it.mint || it.tokenAddress || it.address)))).filter(Boolean) : []);
+          if (addrs.length) {
+            const meta = { time: new Date().toISOString(), program: 'sequential-collector', signature: null, kind: 'initialize', freshMints: addrs, sampleLogs: [] };
+            try { if (typeof seq.emitCanonicalStream === 'function') seq.emitCanonicalStream(addrs, meta); else { process.stdout.write(JSON.stringify(addrs)+'\n'); process.stdout.write(JSON.stringify(meta)+'\n'); } } catch (e) {}
           }
         }
-        if (typeof ageMin === 'undefined' && t.freshnessDetails) {
-          const ts = t.freshnessDetails.firstTxMs || t.freshnessDetails.onChainTs || t.freshnessDetails.first_tx_time;
-          const ts2 = await toTsFromValue(ts);
-          if (ts2) { ageMin = Math.floor((now - ts2) / 60000); t._ageSource = 'freshnessDetails'; t._ageTs = ts2; }
-        }
-        if (typeof ageMin === 'undefined' && typeof t.ageSeconds === 'number') {
-          ageMin = Math.floor(t.ageSeconds / 60);
-          t._ageSource = 'ageSeconds';
-        }
-        t._computedAgeMinutes = typeof ageMin === 'number' ? ageMin : undefined;
-        if (typeof t._computedAgeMinutes === 'number' && t._computedAgeMinutes >= 0 && t._computedAgeMinutes <= 5) {
-          found.push({ address: t.tokenAddress || t.address || t.mint, name: t.name || t.symbol || '', computedAgeMinutes: t._computedAgeMinutes, ageSource: t._ageSource, liquidity: t.liquidity || t.liquidityUsd || t.marketCap, volume: t.volume || t.volumeUsd });
-        }
-      }
-      if (found.length) console.log(new Date().toISOString(), 'matches:', found.length, JSON.stringify(found.slice(0,10)));
+      } catch (e) {}
     } catch (e: any) {
       console.error('monitor error:', e && (e.message || e));
     }

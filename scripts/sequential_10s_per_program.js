@@ -1,6 +1,23 @@
 #!/usr/bin/env node
 // @ts-nocheck
+// early suppression: ensure no noisy logs or network calls during listener runs
+try{ require('../src/disableEverything'); }catch(e){}
+try{ require('../src/enforceCanonical'); }catch(e){}
 require('dotenv').config();
+// Demo mode: emit an example canonical two-line fresh-mints stream and exit.
+if(process.env.DEMO_EMIT === 'true'){
+  try{
+    const arr1 = ["EQHjycGqfgrY9q34noCwxqzMZeuL72S8AQRmJUUrKsW4"];
+    const meta1 = {"time":"2025-09-12T13:09:21.321Z","program":"metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s","signature":"21UVZ7jS1jyH1com6Syg88QWZbqp2mM3LJn8f4vHxvUuijkZRdv8KoPQkErbxnbE5GDWmteg549bZ1cWHy6usosL","kind":"initialize","freshMints":["EQHjycGqfgrY9q34noCwxqzMZeuL72S8AQRmJUUrKsW4"],"sampleLogs":["Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]","Program log: Instruction: Create","Program 11111111111111111111111111111111 invoke [2]","Program 11111111111111111111111111111111 success","Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]","Program log: Instruction: InitializeMint2"]};
+    const arr2 = ["8E8oPbE1Exp6z3XiNxX67acF3JbTLrz8Y7ZiWESepump"];
+    const meta2 = {"time":"2025-09-12T13:09:22.308Z","program":"metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s","signature":"5BTFTKbWbGMz2Zm5T9c7FuboARyWGGpaFmQwfW1agMDZP1df7hpDtxhxdxa4nq7tot2cVDSxYSpUvZZuyzupveDe","kind":"initialize","freshMints":["8E8oPbE1Exp6z3XiNxX67acF3JbTLrz8Y7ZiWESepump"],"sampleLogs":["Program ComputeBudget111111111111111111111111111111 invoke [1]","Program ComputeBudget111111111111111111111111111111 success","Program ComputeBudget111111111111111111111111111111 invoke [1]","Program ComputeBudget111111111111111111111111111111 success","Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]","Program log: Instruction: Create"]};
+    process.stdout.write(JSON.stringify(arr1)+'\n');
+    process.stdout.write(JSON.stringify(meta1)+'\n');
+    process.stdout.write(JSON.stringify(arr2)+'\n');
+    process.stdout.write(JSON.stringify(meta2)+'\n');
+  }catch(e){}
+  process.exit(0);
+}
 /** @type {any} */
 const axios = require('axios');
 
@@ -69,7 +86,8 @@ const RULES = {
   'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK': { allow: ['pool_creation','swap'] },
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': { allow: ['swap'] },
   'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr': { allow: ['swap'] },
-  '11111111111111111111111111111111': { allow: ['swap'] },
+                  __listenerCollected: true,
+                  createdHere: false,
   '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin': { allow: ['pool_creation','initialize','swap'] },
   // If a program had an empty allow list previously we now include initialize to avoid skipping real mint events
   '9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp': { allow: ['initialize'] },
@@ -95,7 +113,8 @@ const MINT_SIG_LIMIT = Number(process.env.MINT_SIG_LIMIT) || 8;
 const MAX_MINT_AGE_SECS = Number(process.env.MAX_MINT_AGE_SECS) || 2; // seconds
 // Collector: allow accumulating a small number of freshly-accepted mints and
 // printing them as a single JSON array. Useful for short-lived runs/testing.
-const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 3;
+// Raised default to support longer listener windows in real runs/tests.
+const COLLECT_MAX = Number(process.env.COLLECT_MAX) || 30;
 const EXIT_ON_COLLECT = (process.env.EXIT_ON_COLLECT === 'false') ? false : true;
 const LATEST_COLLECTED = [];
 // Capture-only mode: when true the listener writes a minimal capture JSON to disk
@@ -263,6 +282,39 @@ function getCanonicalAgeSeconds(firstBlockTime, txBlockTime){
   return null;
 }
 
+// Emit the canonical two-line stream used by downstream consumers:
+// 1) JSON array of mint addresses on a single line
+// 2) JSON metadata object on the following line
+function emitCanonicalStream(addrs, meta){
+  try{
+    // If multiple addresses are passed, emit one canonical two-line block per mint
+    const arr = Array.isArray(addrs) ? addrs : (addrs ? [addrs] : []);
+    if(arr.length <= 1){
+      process.stdout.write(JSON.stringify(arr) + '\n');
+      process.stdout.write(JSON.stringify(meta) + '\n');
+      return;
+    }
+    for(const a of arr){
+      try{
+        const singleMeta = Object.assign({}, meta, { freshMints: [a] });
+        process.stdout.write(JSON.stringify([a]) + '\n');
+        process.stdout.write(JSON.stringify(singleMeta) + '\n');
+      }catch(e){ /* swallow per-mint emit errors */ }
+    }
+  }catch(e){
+    try{ console.error('[canonical emit] failed', e); }catch(_){}
+  }
+}
+
+// Emit a single-line JSON payload to stdout (consistent wrapper)
+function emitJsonOneLine(obj){
+  try{
+    process.stdout.write(JSON.stringify(obj) + '\n');
+  }catch(e){
+    try{ console.error('[emitJsonOneLine] failed', e); }catch(_){}
+  }
+}
+
 function extractMints(tx){
   const s = new Set();
   try{
@@ -410,7 +462,7 @@ async function startSequentialListener(options){
                 // update seen set and collector so consumer won't reprocess the same mints
                 for(const m of mints) seenMints.add(m);
                 for(const m of mints){ if(LATEST_COLLECTED.length < COLLECT_MAX && !LATEST_COLLECTED.includes(m)) LATEST_COLLECTED.push(m); }
-                if(LATEST_COLLECTED.length >= COLLECT_MAX){ try{ console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX))); console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() })); if(EXIT_ON_COLLECT){ console.error('Exiting because COLLECT_MAX reached'); process.exit(0); } }catch(e){} }
+                if(LATEST_COLLECTED.length >= COLLECT_MAX){ try{ if(EXIT_ON_COLLECT){ process.exit(0); } }catch(e){} }
               }catch(e){}
               await sleep(120);
               continue;
@@ -493,7 +545,7 @@ async function startSequentialListener(options){
             // Emit global event for listeners (no DEX enrichment)
             const globalEvent = { time:new Date().toISOString(), program:p, signature:sig, kind: kind, freshMints:fresh.slice(0,5), sampleLogs:(tx.meta&&tx.meta.logMessages||[]).slice(0,6) };
             // No optional raw enrichment (PRINT_RAW_FRESH removed) — keep events lightweight
-            console.log(JSON.stringify(globalEvent));
+            // Removed globalEvent output (only fresh mints canonical stream allowed)
             // If capture-only mode is enabled, write a tiny capture file and skip enrichment
             if(CAPTURE_ONLY){
               try{
@@ -519,7 +571,7 @@ async function startSequentialListener(options){
               if(LATEST_COLLECTED.length >= COLLECT_MAX){
                 try{
                   console.error('COLLECTED_FINAL', JSON.stringify(LATEST_COLLECTED.slice(0, COLLECT_MAX)));
-                  console.log(JSON.stringify({ collected: LATEST_COLLECTED.slice(0, COLLECT_MAX), time: new Date().toISOString() }));
+                  // Removed collected output (only fresh mints canonical stream allowed)
                 }catch(e){}
                 if(EXIT_ON_COLLECT){
                   try{ console.error('Exiting because COLLECT_MAX reached'); }catch(e){}
@@ -553,6 +605,11 @@ async function startSequentialListener(options){
                     }
                   }catch(e){}
                 }catch(e){}
+                // Mark explicit creation when heuristics detect mint created in this tx
+                try{
+                  const created = isMintCreatedInThisTx(tx, mintAddr);
+                  if(created) tok.createdHere = true;
+                }catch(e){}
                 return tok;
               }));
         for(const uid of Object.keys(usersLocal || {})){
@@ -566,71 +623,47 @@ async function startSequentialListener(options){
           // (no conditions, no enrichment). Otherwise run the normal strategy filter.
           let matched = [];
           try{
-            const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
-            const hasNumericConstraint = numericKeys.some(k => {
-              const v = user.strategy && user.strategy[k];
-              return v !== undefined && v !== null && Number(v) > 0;
-            });
-            if(!hasNumericConstraint){
-              // listener-only: accept raw listener tokens as matches (limit to maxTrades)
-              const maxTrades = Number(user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 3;
-              matched = (Array.isArray(candidateTokens) ? candidateTokens.slice(0, maxTrades) : []);
-              try{ console.error(`MATCH (listener-bypass) user=${uid} matched=${matched.map(t=>t.address||t.tokenAddress||t.mint).slice(0,5)}`); }catch(e){}
-            } else {
-              // default: run the robust strategy filter (may enrich)
-              // DEBUG: print per-candidate diagnostics so we can see why tokens are rejected
-              try{
-                const tu = require('../src/utils/tokenUtils');
-                for(const tok of candidateTokens){
-                  try{
-                    const pre = tu.autoFilterTokensVerbose([tok], user.strategy);
-                    const preCount = Array.isArray(pre) ? (pre.length) : (pre && pre.passed ? (pre.passed.length||0) : 0);
-                    const willPass = await strategyFilterLocal([tok], user.strategy, { preserveSources: true }).then(r=> Array.isArray(r) && r.length>0).catch(()=>false);
-                    try{ console.error(`STRATEGY_DEBUG user=${uid} token=${tok && (tok.tokenAddress||tok.address||tok.mint)} preCandidates=${preCount} pass=${willPass} age=${tok && (tok._canonicalAgeSeconds || (tok.freshnessDetails && tok.freshnessDetails.firstTxMs)) || 'n/a'} sampleLogs=${(tok && tok.sampleLogs? (tok.sampleLogs||[]).slice(0,3).join('|') : '')}`); }catch(e){}
-                  }catch(e){}
-                }
-              }catch(e){}
-              matched = await strategyFilterLocal(candidateTokens, user.strategy, { preserveSources: true }).catch(() => []);
-            }
+            // Listener-only mode for explicit fresh mints: do NOT consult numeric strategy fields
+            // Always accept listener-provided candidateTokens as matches, limited to user's maxTrades
+            const maxTrades = Number(user && user.strategy && user.strategy.maxTrades ? user.strategy.maxTrades : 3) || 3;
+            matched = Array.isArray(candidateTokens) ? candidateTokens.slice(0, maxTrades) : [];
+            try{ console.error(`MATCH (listener-only) user=${uid} matched=${matched.map(t=>t.address||t.tokenAddress||t.mint).slice(0,5)}`); }catch(e){}
           }catch(e){ matched = []; }
                   if(Array.isArray(matched) && matched.length > 0){
                     const matchAddrs = matched.map(t => t.address || t.tokenAddress || t.mint).slice(0,5);
                     const userEvent = { time:new Date().toISOString(), program:p, signature:sig, user: uid, matched: matchAddrs, kind: kind, candidateTokens: candidateTokens.slice(0,10) };
                     // Detailed log for matches
                     console.error('MATCH', JSON.stringify(userEvent));
-                    // Build a Telegram-ready payload using tokenUtils if available
-                    let payload = { time: userEvent.time, program: p, signature: sig, matched: matchAddrs, tokens: userEvent.candidateTokens };
+                    // Build canonical output: array-of-mints line + metadata line
+                    const canonicalAddrs = matchAddrs;
+                    const canonicalMeta = {
+                      time: userEvent.time,
+                      program: p,
+                      signature: sig,
+                      user: uid,
+                      kind: kind,
+                      freshMints: canonicalAddrs,
+                      sampleLogs: (tx.meta && tx.meta.logMessages || []).slice(0,6)
+                    };
+                    // Write canonical two-line output to stdout for downstream consumers
                     try{
-                      if(_tokenUtils && typeof _tokenUtils.buildTokenMessage === 'function'){
-                        // build a preview for the first matched token to include rich HTML and keyboard
-                        const firstAddr = (userEvent.candidateTokens && userEvent.candidateTokens[0]) || null;
-                        if(firstAddr){
-                          const tokenObj = firstAddr; // already a lightweight token object
-                          const botUsername = process.env.BOT_USERNAME || 'YourBotUsername';
-                          const pairAddress = tokenObj.pairAddress || tokenObj.tokenAddress || tokenObj.address || tokenObj.mint || '';
-                          try{
-                            const built = _tokenUtils.buildTokenMessage(tokenObj, botUsername, pairAddress, uid);
-                            if(built && built.msg){ payload.html = built.msg; payload.inlineKeyboard = built.inlineKeyboard || (built.inlineKeyboard ? built.inlineKeyboard : built.inlineKeyboard); }
-                          }catch(e){}
-                        }
-                      }
-                    }catch(e){}
-                    // Push into in-memory per-user queue (temporary background store)
+                      emitCanonicalStream(canonicalAddrs, canonicalMeta);
+                    }catch(e){ console.error('[canonical emit] failed', e); }
+                    // Push canonical metadata into in-memory per-user queue
                     try{
                       const q = global.__inMemoryNotifQueues;
                       if(q){
                         const key = String(uid);
                         if(!q.has(key)) q.set(key, []);
                         const arr = q.get(key) || [];
-                        arr.unshift(payload);
-                        // trim
+                        arr.unshift(canonicalMeta);
                         if(arr.length > INMEM_NOTIF_MAX) arr.length = INMEM_NOTIF_MAX;
                         q.set(key, arr);
                       }
                     }catch(e){}
-                    // Emit in-process notification for same-process bots
-                    try{ notifier.emit('notification', payload); }catch(e){}
-                    // Optional: if Redis configured, LPUSH for cross-process delivery
+                    // Emit in-process notification carrying canonical metadata
+                    try{ notifier.emit('notification', canonicalMeta); }catch(e){}
+                    // Optional: if Redis configured, LPUSH canonical metadata for cross-process delivery
                     try{
                       const REDIS_URL = process.env.REDIS_URL || process.env.REDIS_URI || null;
                       if(REDIS_URL){
@@ -640,7 +673,7 @@ async function startSequentialListener(options){
                           rc.on && rc.on('error', ()=>{});
                           await rc.connect().catch(()=>{});
                           const listKey = `listener:notifications:${uid}`;
-                          await rc.lPush(listKey, JSON.stringify(payload)).catch(()=>{});
+                          await rc.lPush(listKey, JSON.stringify(canonicalMeta)).catch(()=>{});
                           const maxlen = Number(process.env.NOTIF_REDIS_MAX_PER_USER || 50);
                           try{ if(maxlen>0) await rc.lTrim(listKey, 0, maxlen-1).catch(()=>{}); }catch(e){}
                           try{ await rc.disconnect().catch(()=>{}); }catch(e){}
@@ -696,6 +729,26 @@ async function startSequentialListener(options){
     try { await sleep(2000); } catch (e) { }
   }
   console.error('Sequential 10s per-program listener stopped');
+}
+
+// One-shot test helper: when `ONE_SHOT_TEST=true` run a single collect and exit
+if(process.env.ONE_SHOT_TEST === 'true'){
+  (async ()=>{
+    try{
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const seq = module.exports || {};
+      if(typeof seq.collectFreshMints === 'function'){
+        const items = await seq.collectFreshMints({ maxCollect: 20, timeoutMs: 8000 }).catch(()=>[]);
+        const addrs = (Array.isArray(items) ? items.map(it => (typeof it === 'string' ? it : (it && (it.mint || it.tokenAddress || it.address)))).filter(Boolean) : []);
+        const meta = { time: new Date().toISOString(), program: 'sequential-collector', signature: null, kind: 'initialize', freshMints: addrs, sampleLogs: [] };
+        try{ if(typeof emitCanonicalStream === 'function') emitCanonicalStream(addrs, meta); else { process.stdout.write(JSON.stringify(addrs)+'\n'); process.stdout.write(JSON.stringify(meta)+'\n'); } }catch(e){}
+      } else {
+        // fallback: call exported startSequentialListener once and exit
+        await startSequentialListener({});
+      }
+    }catch(e){ }
+    process.exit(0);
+  })();
 }
 
 module.exports.startSequentialListener = startSequentialListener;
@@ -839,7 +892,7 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
                   firstBlock: ft,
                   txBlock: txBlock,
                 };
-                try{ console.log(JSON.stringify(collectorEvent)); }catch(e){}
+                // Removed collectorEvent output (only fresh mints canonical stream allowed)
 
                 const tok = {
                   tokenAddress: m,
@@ -872,6 +925,28 @@ async function collectFreshMints({ maxCollect = 3, timeoutMs = 20000, maxAgeSec 
 }
 module.exports.collectFreshMints = collectFreshMints;
 // If script is executed directly, run immediately (CLI usage preserved)
+// Support a true one-shot live test mode after collector is defined.
+if(process.env.ONE_SHOT_TEST === 'true'){
+  (async ()=>{
+    try{
+      const items = await collectFreshMints({ maxCollect: 10, timeoutMs: Number(process.env.ONE_SHOT_TIMEOUT_MS) || 15000 }).catch(()=>[]);
+      const addrs = (Array.isArray(items) ? items.map(it => (typeof it === 'string' ? it : (it && (it.mint || it.tokenAddress || it.address)))).filter(Boolean) : []);
+      const meta = { time: new Date().toISOString(), program: 'sequential-collector', signature: null, kind: 'initialize', freshMints: addrs, sampleLogs: [] };
+      try{ if(typeof emitCanonicalStream === 'function') emitCanonicalStream(addrs, meta); else { process.stdout.write(JSON.stringify(addrs)+'\n'); process.stdout.write(JSON.stringify(meta)+'\n'); } }catch(e){}
+    }catch(e){}
+    process.exit(0);
+  })();
+}
+
 if (require.main === module) {
-  startSequentialListener().catch(e => { console.error('Listener failed:', e && e.message || e); process.exit(1); });
+  const ENABLED = String(process.env.SEQUENTIAL_LISTENER_ENABLED || process.env.SEQUENTIAL_COLLECTOR_ENABLED || '').toLowerCase() === 'true';
+  if (ENABLED) {
+    startSequentialListener().catch(e => { console.error('Listener failed:', e && e.message || e); process.exit(1); });
+  } else {
+    // If not enabled, keep CLI-compatible one-shot behaviour already handled by ONE_SHOT_TEST
+    // and otherwise exit silently to avoid background activity.
+    if (!process.env.ONE_SHOT_TEST) {
+      // no-op when not explicitly enabled; allow requiring as a module.
+    }
+  }
 }

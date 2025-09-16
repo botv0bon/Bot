@@ -1,4 +1,5 @@
 // Dynamic, visual, English-only token filter demo for DexScreener Boosts API
+try{ require('./src/disableEverything.js'); }catch(e){}
 let fetchFn = null;
 if (typeof globalThis.fetch === 'function') {
   fetchFn = globalThis.fetch;

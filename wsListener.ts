@@ -2,6 +2,7 @@
 
 
 
+import './src/disableEverything';
 import { fetchDexScreenerTokens } from './src/utils/tokenUtils';
 import { saveUsers } from './src/bot/helpers';
 import { unifiedBuy, unifiedSell } from './src/tradeSources';
@@ -10,6 +11,12 @@ import { unifiedBuy, unifiedSell } from './src/tradeSources';
  * Entry point for market monitoring and user notifications
  */
 function registerWsNotifications(bot: any, users: Record<string, any>) {
+  const SEQUENTIAL_COLLECTOR_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || 'false').toLowerCase() === 'true';
+  if (SEQUENTIAL_COLLECTOR_ONLY) {
+    console.error('[COLLECTOR-GUARD] wsListener: disabled because SEQUENTIAL_COLLECTOR_ONLY=true');
+    return; // no-op registerer when collector-only
+  }
+
   async function pollAndNotify() {
     try {
       // Fetch only Solana tokens, limit to 100, and filter by min liquidity at API level if supported

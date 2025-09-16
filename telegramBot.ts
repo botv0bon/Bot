@@ -1,3 +1,14 @@
+// Silence global console outputs early
+import './src/disableEverything';
+import './src/enforceCanonical';
+
+// Minimal preserved bindings used throughout the file. These are no-ops because
+// `src/silenceLogs` silenced console methods; bindings prevent TS compile errors
+const _origWarn = console.warn.bind(console);
+const _origError = console.error.bind(console);
+const _origLog = console.log.bind(console);
+function verboseLog(..._args: any[]) { /* intentionally noop unless DETAILED_LOGS/DEV_MONITOR enabled */ }
+
 // =================== Imports ===================
 import dotenv from 'dotenv';
 import fs from 'fs';
@@ -16,42 +27,7 @@ import { normalizeStrategy } from './src/utils/strategyNormalizer';
 // fast token fetcher disabled: listener-only operation
 import { generateKeypair, exportSecretKey, parseKey } from './src/wallet';
 
-// Install a small console filter to suppress noisy 429/retry messages coming from HTTP libs
-const _origWarn = console.warn.bind(console);
-const _origError = console.error.bind(console);
-const _origLog = console.log.bind(console);
-const _filterRegex = /(Server responded with 429 Too Many Requests|Retrying after|Too Many Requests|entering cooldown)/i;
-console.warn = (...args: any[]) => {
-  try {
-    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    if (_filterRegex.test(s)) return; // drop noisy retry/429 lines
-    // If canonical-only mode is enabled, route logs to stderr (verbose) instead of stdout
-    if (CANONICAL_ONLY) {
-      try { _origError('[VERBOSE]', s); return; } catch (e) {}
-    }
-  } catch (e) {}
-  _origWarn(...args);
-};
-console.error = (...args: any[]) => {
-  try {
-    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    if (_filterRegex.test(s)) return;
-    // Always write errors to stderr; in canonical-only mode we prefer stderr so leave as-is
-  } catch (e) {}
-  _origError(...args);
-};
-console.log = (...args: any[]) => {
-  try {
-    const s = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    if (_filterRegex.test(s)) return;
-    if (CANONICAL_ONLY) {
-      try { _origError('[VERBOSE]', s); return; } catch (e) {}
-    }
-  } catch (e) {}
-  _origLog(...args);
-};
-
-console.log('--- Bot starting: Imports loaded ---');
+// Console output is silenced by `src/silenceLogs.ts`.
 
 dotenv.config();
 
@@ -89,22 +65,7 @@ if (DEV_MONITOR) {
 // Effective canonical emit flag: DEV_MONITOR implies bot-level canonical emits
 const EFFECTIVE_BOT_EMIT_CANONICAL = BOT_EMIT_CANONICAL || DEV_MONITOR;
 
-function emitCanonicalLines(arr: any[], meta: Record<string, any>) {
-  try {
-    // Always write canonical lines to stdout so other tools can parse them.
-    process.stdout.write(JSON.stringify(arr) + '\n');
-    process.stdout.write(JSON.stringify(meta) + '\n');
-  } catch (e) {
-    // Fallback: log to stderr
-    try { console.error('[emitCanonicalLines] failed', e); } catch (e) {}
-  }
-}
-
-function verboseLog(...args: any[]) {
-  if (!DETAILED_LOGS && !DEV_MONITOR) return;
-  try { _origError('[VERBOSE]', ...args); } catch (e) {}
-}
-console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN);
+// canonical emits from UI flows are disabled to preserve only fresh-mints stream
 if (!TELEGRAM_TOKEN) {
   console.error('TELEGRAM_BOT_TOKEN not found in .env file. Please add TELEGRAM_BOT_TOKEN=YOUR_TOKEN to .env');
   process.exit(1);
@@ -116,6 +77,7 @@ console.log('--- Users placeholder created ---');
 // console suppression is handled by the top-level console wrappers when CANONICAL_ONLY is set
 let boughtTokens: Record<string, Set<string>> = {};
 const restoreStates: Record<string, boolean> = {};
+const userStrategyStates: Record<string, any> = {};
 
 // Helper: decide if a given user should operate in listener-only (no enrichment) mode.
 function userIsListenerOnly(user: any) {
@@ -149,7 +111,7 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     // Ensure we only present explicit-created tokens, preserve order (newest first),
     // deduplicate by mint/address, and limit to the user's configured maxTrades.
     const beforeCount = tokens.length;
-    const onlyExplicit = tokens.filter((t:any) => t && (t.createdHere === true));
+  const onlyExplicit = tokens.filter((t:any) => t && (t.createdHere === true || t.__listenerCollected === true || t.__normalized === true));
     // deduplicate by canonical mint/address preserving the first occurrence
     const seen = new Set<string>();
     const unique: any[] = [];
@@ -166,278 +128,11 @@ async function getTokensForUser(userId: string, strategy: Record<string, any> | 
     verboseLog('[getTokensForUser] explicit-unique filtered', { requested: maxCollect, beforeCount, afterCount });
     // return up to the user's requested number of trades
     return unique.slice(0, maxCollect);
-    // Do NOT apply any minMarketCap/minLiquidity/minVolume/minAge filtering here — per user request
-    // we only use the per-user `maxTrades` to limit results.
-    return tokens;
   } catch (e) {
     console.error('[getTokensForUser] listener fetch failed:', e?.message || e);
     return [];
   }
 }
-
-// Strategy state machine for interactive setup (single declaration)
-const userStrategyStates: Record<string, { step: number, values: Record<string, any>, phase?: string, tradeSettings?: Record<string, any> }> = {};
-
-// buy/sell handlers will be registered after users are loaded in startup sequence
-
-bot.command('auto_execute', async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  console.log(`[auto_execute] User: ${userId}`);
-  if (!user || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('You must set a strategy first using /strategy');
-    return;
-  }
-  const now = Date.now();
-  const tokens = await getTokensForUser(userId, user.strategy);
-  await ctx.reply('Executing your strategy on matching tokens...');
-  try {
-    await autoExecuteStrategyForUser(user, tokens, 'buy');
-    await ctx.reply('Strategy executed successfully!');
-  } catch (e: any) {
-    await ctx.reply('Error during auto execution: ' + getErrorMessage(e));
-  }
-});
-
-const mainReplyKeyboard = Markup.keyboard([
-  ['💼 Wallet', '⚙️ Strategy'],
-  ['📊 Show Tokens', '🤝 Invite Friends']
-]).resize();
-
-// Add a quick toggle button for collector strictness to main keyboard if desired
-function collectorToggleKeyboard(user: any) {
-  try{
-    const cur = user && user.strategy && (user.strategy as any).collectorStrict;
-    const label = cur === false ? 'Collector: Defer' : (cur === true ? 'Collector: Strict' : 'Collector: Default');
-    return Markup.keyboard([
-      ['💼 Wallet', '⚙️ Strategy'],
-      ['📊 Show Tokens', '🤝 Invite Friends'],
-      [label]
-    ]).resize();
-  }catch(e){ return mainReplyKeyboard; }
-}
-
-bot.start(async (ctx) => {
-  await ctx.reply(
-    '👋 Welcome to the Trading Bot!\nPlease choose an option:',
-    mainReplyKeyboard
-  );
-});
-
-bot.hears('💼 Wallet', async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  console.log(`[💼 Wallet] User: ${userId}`);
-  if (user && hasWallet(user)) {
-    const { getSolBalance } = await import('./src/getSolBalance');
-    let balance = 0;
-    try {
-      balance = await getSolBalance(user.wallet);
-    } catch {}
-    // reuse getTokensForUser to fetch listener candidates. Only limit by maxTrades.
-    const strategyRef = (user && user.strategy) ? user.strategy : {};
-    const tokens = await getTokensForUser(userId, strategyRef).catch(()=>[]);
-    if (!tokens || tokens.length === 0) {
-      await ctx.reply('No live tokens found right now. Try again in a few seconds.');
-      return;
-    }
-    // build a richer per-token preview using buildPreviewMessage
-    const maxTrades = Math.max(1, Number(strategyRef?.maxTrades || 1));
-    const showTokens = tokens.slice(0, maxTrades);
-    let text = `🔔 <b>Live tokens (preview)</b>\nFound ${tokens.length} candidates (showing up to ${maxTrades}):\n`;
-    for (const t of showTokens) {
-      try {
-        const preview = buildPreviewMessage(t);
-        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
-        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
-      } catch (e) {
-        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
-        text += `\n<code>${addr}</code>\n`;
-      }
-    }
-    try {
-      await ctx.reply(text, { parse_mode: 'HTML', disable_web_page_preview: true } as any);
-    } catch (e) {
-      try { await ctx.reply('✅ Found live tokens.'); } catch (_) {}
-    }
-  } else {
-    await ctx.reply('❌ No wallet found for this user.', walletKeyboard());
-  }
-});
-
-bot.action('show_secret', async (ctx) => {
-  console.log(`[show_secret] User: ${String(ctx.from?.id)}`);
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  if (user && hasWallet(user)) {
-    // For security, do not send the private key in chat. Prompt the user to restore or view locally.
-    await ctx.reply('🔒 For your safety the private key is not shown in chat. Use /restore_wallet to restore from your key or manage your wallet locally.');
-  } else {
-    await ctx.reply('❌ No wallet found for this user.');
-  }
-});
-
-bot.hears('⚙️ Strategy', async (ctx) => {
-  console.log(`[⚙️ Strategy] User: ${String(ctx.from?.id)}`);
-  const userId = String(ctx.from?.id);
-  userStrategyStates[userId] = { step: 0, values: {} };
-  await ctx.reply('🚦 Strategy Setup:\nPlease enter the required value for each field. Send "skip" to skip any optional field.');
-  const field = STRATEGY_FIELDS[0];
-  await ctx.reply(`📝 ${field.label}${field.optional ? ' (optional)' : ''}`);
-});
-
-bot.hears('📊 Show Tokens', async (ctx) => {
-  console.log(`[📊 Show Tokens] User: ${String(ctx.from?.id)}`);
-  // Invoke same behavior as /show_token for a fast preview
-  try {
-    // Delegate to the existing command handler by calling the logic inline
-    const userId = String(ctx.from?.id);
-    const user = users[userId];
-    if (!user || !user.strategy || user.strategy.enabled === false) {
-      try { await ctx.reply('🔎 Showing latest live mints (you have no strategy set). Use /strategy to configure filters.'); } catch(e){}
-    }
-    // reuse getTokensForUser to fetch listener candidates
-    const strategyRef = (user && user.strategy) ? user.strategy : {};
-    const tokens = await getTokensForUser(userId, strategyRef).catch(()=>[]);
-    if (!tokens || tokens.length === 0) {
-      await ctx.reply('No live tokens found right now. Try again in a few seconds.');
-      return;
-    }
-    // build a richer per-token preview using buildPreviewMessage
-    let text = `🔔 <b>Live tokens (preview)</b>\nFound ${tokens.length} candidates:\n`;
-    for (const t of tokens.slice(0, Math.max(1, Number(strategyRef?.maxTrades || 3)))) {
-      try {
-        const preview = buildPreviewMessage(t);
-        const addr = t && (t.tokenAddress || t.address || t.mint) || '<unknown>';
-        text += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
-      } catch (e) {
-        const addr = t && (t.tokenAddress || t.address || t.mint) || 'unknown';
-        text += `• <code>${addr}</code>\n`;
-      }
-    }
-    // Cache preview so the user can choose to send it live via an inline button
-    try {
-      // Build HTML version for later send
-      const html = text;
-      // store in-memory cache for this user
-      try { previewCache[String(ctx.from?.id)] = { html, addrs: (tokens || []).map((t:any)=> t && (t.tokenAddress||t.address||t.mint)).filter(Boolean) }; } catch(e){}
-      const inline = Markup.inlineKeyboard([[Markup.button.callback('✅ Send Now', 'send_show_preview')]]);
-      await ctx.reply(text, ({ parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: inline.reply_markup } as any));
-    } catch (e) {
-      try { await ctx.reply('Error preparing preview.'); } catch(_){ }
-    }
-    // Emit canonical lines for external consumers: array of addresses + metadata
-    try{
-      const addrs = (tokens || []).map((t:any)=> t && (t.tokenAddress||t.address||t.mint)).filter(Boolean);
-      const meta = { time: new Date().toISOString(), kind: 'show_preview', requestedBy: String(ctx.from?.id), count: addrs.length } as any;
-  if (EFFECTIVE_BOT_EMIT_CANONICAL) {
-        emitCanonicalLines(addrs, meta);
-        verboseLog('[show_tokens] emitted canonical', meta);
-      } else {
-        verboseLog('[show_tokens] canonical suppressed by BOT_EMIT_CANONICAL=false', meta);
-      }
-    }catch(e){ verboseLog('[show_tokens] emit failed', e); }
-  } catch (e) {
-    try { await ctx.reply('Error fetching live tokens.'); } catch(_){}
-  }
-});
-
-// In-memory cache for show-token previews per user
-const previewCache: Record<string, { html: string, addrs: string[] }> = {};
-
-// Handler for the inline 'Send Now' button. This will send the real Telegram message
-// to the requesting user, bypassing DRY_RUN for explicit manual tests.
-bot.action('send_show_preview', async (ctx) => {
-  try {
-    const userId = String(ctx.from?.id);
-    verboseLog('[send_show_preview] clicked by', userId);
-    const cache = previewCache[userId];
-    if (!cache) {
-      try { await ctx.answerCbQuery('Preview expired or not found. Please press Show Tokens again.'); } catch(_){}
-      return;
-    }
-    // Acknowledge the button press immediately
-    try { await ctx.answerCbQuery('Sending preview now...'); } catch(_){}
-
-    // Send the cached HTML message using the real Telegram API regardless of DRY_RUN flag
-    try {
-      await bot.telegram.sendMessage(userId, cache.html, { parse_mode: 'HTML', disable_web_page_preview: true } as any);
-      verboseLog('[send_show_preview] real send complete for', userId);
-      try { await ctx.reply('✅ Message sent.'); } catch(_){}
-    } catch (e:any) {
-      console.error('[send_show_preview] failed to send message:', e?.message || e);
-      try { await ctx.reply('❌ Failed to send message: ' + (e?.message || String(e))); } catch(_){}
-    }
-  } catch (e:any) {
-    console.error('[send_show_preview] handler error:', e?.message || e);
-  }
-});
-
-bot.hears('🤝 Invite Friends', async (ctx) => {
-  console.log(`[🤝 Invite Friends] User: ${String(ctx.from?.id)}`);
-  const userId = String(ctx.from?.id);
-  const inviteLink = `https://t.me/${ctx.me}?start=${userId}`;
-  await ctx.reply(`🤝 Share this link to invite your friends:\n${inviteLink}`);
-});
-
-bot.hears(/Collector:\s*(Strict|Defer|Default)/i, async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId] || {};
-  const cur = user.strategy && (user.strategy as any).collectorStrict;
-  // cycle: undefined -> false -> true -> undefined
-  let next: any = undefined;
-  if (cur === undefined) next = false;
-  else if (cur === false) next = true;
-  else next = undefined;
-  if (!user.strategy) user.strategy = {};
-  (user.strategy as any).collectorStrict = next;
-  users[userId] = user;
-  try { saveUsers(users); } catch (e) {}
-  const label = next === false ? 'Collector: Defer' : (next === true ? 'Collector: Strict' : 'Collector: Default');
-  await ctx.reply(`Collector strictness set to: ${label}`);
-  try { await ctx.reply('Keyboard updated', collectorToggleKeyboard(user)); } catch (e) {}
-});
-
-bot.command('toggle_collector_strict', async (ctx) => {
-  const userId = String(ctx.from?.id);
-  const user = users[userId] || {};
-  const cur = user.strategy && (user.strategy as any).collectorStrict;
-  let next: any = undefined;
-  if (cur === undefined) next = false;
-  else if (cur === false) next = true;
-  else next = undefined;
-  if (!user.strategy) user.strategy = {};
-  (user.strategy as any).collectorStrict = next;
-  users[userId] = user;
-  try { saveUsers(users); } catch (e) {}
-  const label = next === false ? 'Defer' : (next === true ? 'Strict' : 'Default');
-  await ctx.reply(`collectorStrict toggled to: ${label}`);
-});
-
-bot.command('notify_tokens', async (ctx) => {
-  console.log(`[notify_tokens] User: ${String(ctx.from?.id)}`);
-  const userId = String(ctx.from?.id);
-  const user = users[userId];
-  if (!user || !user.strategy || !user.strategy.enabled) {
-    await ctx.reply('❌ You must set a strategy first using /strategy');
-    return;
-  }
-  const now = Date.now();
-  const tokens = await getTokensForUser(userId, user.strategy);
-  let filteredTokens = [] as any[];
-  if (userIsListenerOnly(user)) {
-    // Preserve the listener-provided candidates without background enrichment
-    filteredTokens = tokens.slice(0, Math.max(1, Number(user.strategy?.maxTrades || 3)));
-  } else {
-    filteredTokens = await (require('./src/bot/strategy').filterTokensByStrategy(tokens, user.strategy, { preserveSources: true }));
-  }
-  if (!filteredTokens.length) {
-    await ctx.reply('No tokens currently match your strategy.');
-    return;
-  }
-  await notifyUsers(ctx.telegram, { [userId]: user }, filteredTokens);
-  await ctx.reply('✅ Notification sent for tokens matching your strategy.');
-});
 
 
 
@@ -671,6 +366,35 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
+  // Handle UI "Show Tokens" button which sends a plain text message "📊 Show Tokens".
+  // Some Telegram clients send the label as a text message rather than a callback.
+  try {
+    const incomingText = (ctx.message && ctx.message.text) ? String(ctx.message.text).trim() : '';
+    if (incomingText === '📊 Show Tokens' || incomingText.toLowerCase() === '/show_token') {
+      try {
+        const uid = String(ctx.from?.id);
+        const user = users[uid] || {};
+        const tokens = await getTokensForUser(uid, user.strategy).catch(() => []);
+        const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
+        const addrs: string[] = Array.isArray(tokens) ? tokens.map((t: any) => (t && (t.mint || t.tokenAddress || t.address)) || null).filter(Boolean) : [];
+        const chosen = Array.from(new Set(addrs)).slice(0, maxTrades);
+        const meta = { time: new Date().toISOString(), kind: 'show_token', user: uid, freshMints: chosen, sampleLogs: [] } as any;
+        // Emit into the in-process notifier so notification handlers treat it like a live event
+        try {
+          const seq = require('./scripts/sequential_10s_per_program.js');
+          if (seq && seq.notifier && typeof seq.notifier.emit === 'function') {
+            try { seq.notifier.emit('notification', meta); } catch (e) { /* ignore notifier errors */ }
+          }
+        } catch (e) { /* ignore require errors */ }
+        try { await ctx.reply(`✅ Sent ${chosen.length} canonical token(s) to stream.`); } catch (e) { /* ignore reply errors */ }
+      } catch (e) {
+        try { console.error('[show_token_button] handler failed', e); } catch (e) {}
+        try { await ctx.reply('❗ Failed to produce tokens for stream.'); } catch (e) {}
+      }
+      return;
+    }
+  } catch (e) { /* non-fatal */ }
+
   if (typeof next === 'function') return next();
 });
 
@@ -877,12 +601,13 @@ console.log('--- About to launch bot ---');
   // Do NOT start fast token fetcher or enrich queue - listener is the single source of truth per requirement.
       // Start the sequential listener in-process so users receive live pushes from the listener
       try{
+        try{ _origError('[listener] about to require sequential_10s_per_program module'); }catch(e){}
         const seq = require('./scripts/sequential_10s_per_program.js');
-        if(seq && typeof seq.startSequentialListener === 'function'){
-          // run listener without blocking (it manages its own loop)
-          (async ()=>{ try{ await seq.startSequentialListener(); }catch(e){ try{ console.error('[listener] failed to start:', e && e.message || e); }catch(_){} } })();
-          console.log('[listener] startSequentialListener invoked in-process');
-        }
+        try{ _origError('[listener] require result keys:', Object.keys(seq || {})); }catch(e){}
+        // Do not invoke collectFreshMints in-process here to avoid duplicate flows.
+        // The bot will rely on `listenerNotifier` events for live notifications and
+        // `getTokensForUser` for on-demand collection. This prevents starting extra
+        // collectors or creating noisy outputs.
       }catch(e){ console.warn('Failed to start listener in-process:', e); }
       } catch (e) {
         console.warn('Failed to start fast token fetcher:', e);
@@ -907,227 +632,43 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
+// Export core pieces for internal scripts/tests
+export { bot, users, getTokensForUser };
+
 // Lightweight show_token handler: enqueue background job and return immediately
 bot.command('show_token', async (ctx) => {
-  console.log(`[show_token] User: ${String(ctx.from?.id)}`);
+  console.log(`[show_token] User: ${String(ctx.from?.id)} (canonical-only)`);
   const userId = String(ctx.from?.id);
-  const user = users[userId];
-  // Allow preview even if the user has not configured a strategy yet.
-  // For users without a strategy we'll show live listener candidates (fast preview)
-  // and invite them to configure a strategy for filtered results.
-  if (!user || !user.strategy || user.strategy.enabled === false) {
-    try { await ctx.reply('🔎 Showing latest live mints (you have no strategy set). Use /strategy to configure filters.'); } catch(e){}
-  }
+  const user = users[userId] || {};
   try {
-    // If user's numeric strategy fields are all zero/undefined, present listener/live candidates immediately
-    const strategyRef = (user && user.strategy) ? user.strategy : {};
-    const numericKeys = ['minMarketCap','minLiquidity','minVolume','minAge'];
-    const hasNumericConstraint = numericKeys.some(k => {
-      const v = strategyRef && (strategyRef as any)[k];
-      return v !== undefined && v !== null && Number(v) > 0;
-    });
-    if (!hasNumericConstraint) {
-      // Fast path: return listener-produced candidates (or fastFetcher) without heavy enrichment
-      try { await ctx.reply('🔎 Fetching latest live mints from listener — fast preview...'); } catch(e){}
-      // Try to use the sequential listener's one-shot collector when available.
-      // If the listener module exists but returns no fresh mints, DO NOT fallback to DexScreener
-      // to avoid showing older tokens — queue a background enrich instead and inform the user.
-      let tokens: any[] = [];
-      let listenerAvailable = false;
-      try{
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const seq = require('./scripts/sequential_10s_per_program.js');
-        if(seq && typeof seq.collectFreshMints === 'function'){
-          listenerAvailable = true;
-          // convert user's strategy.minAge to seconds when present
-          let maxAgeSec: number | undefined = undefined;
-          try{
-            const ma = strategyRef && (strategyRef as any).minAge;
-            if(ma !== undefined && ma !== null){
-              // allow strings like '10s', '5m', or plain numbers
-              const s = String(ma).trim().toLowerCase();
-              const secMatch = s.match(/^([0-9]+)s$/);
-              const minMatch = s.match(/^([0-9]+)m$/);
-              if(secMatch) maxAgeSec = Number(secMatch[1]);
-              else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60;
-              else if(!isNaN(Number(s))){
-                const n = Number(s);
-                // treat small values (0,1,2) as seconds per prior convention
-                if(n <= 2) maxAgeSec = n;
-                else maxAgeSec = n * 60;
-              }
-            }
-          }catch(e){}
-          const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect: Math.max(1, Number(user.strategy?.maxTrades || 3)), timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
-          tokens = (addrs || []).map((a:any)=>({ tokenAddress: a, address: a, mint: a, sourceCandidates: true, __listenerCollected: true }));
-        }
-      }catch(e){ listenerAvailable = false; }
-      if(listenerAvailable){
-        if(!tokens || tokens.length===0){
-          // Per listener-only mode, do not enqueue external enrich jobs. Inform the user to wait for listener events.
-          await ctx.reply('🔔 لا توجد نتائج مستمع حديثة الآن؛ يرجى الانتظار بينما يستمر مصدر الاستماع بجمع النتائج.');
-          return;
-        }
-      } else {
-        // Listener not available: per requirement do NOT fallback to external fetchers or caches.
-        await ctx.reply('⚠️ مستمع البرامج غير متاح حالياً؛ لا يمكن جلب البيانات من مصادر خارجية وفق سياسة التشغيل. برجاء التأكد من تشغيل مصدر الاستماع أو حاول لاحقاً.');
-        return;
-      }
-      console.log('[show_token] fast-path tokens:', (tokens || []).length);
-      // If these tokens are live candidates (from listener/fastFetcher), present immediately
-      if (Array.isArray(tokens) && tokens.length && tokens.every(t => (t as any).sourceCandidates || (t as any).matched || (t as any).tokenAddress)) {
-        if(!CANONICAL_ONLY) console.log('[show_token] presenting live/sourceCandidates without heavy filter');
-        // debug: print token provenance & freshness hints
-        try{
-          for(const t of tokens){
-            try{
-              console.error('[show_token-debug] token', { addr: t.tokenAddress||t.address||t.mint, listenerCollected: !!t.__listenerCollected, freshness: t._canonicalAgeSeconds || t.ageSeconds || t.ageMinutes || null });
-            }catch(e){}
-          }
-        }catch(e){}
-        // proceed to render below as live results
-      } else {
-        // no tokens to show
-      }
-      if (!tokens || tokens.length === 0) {
-        // Listener-only: no background enrichment queued. Inform the user to wait for fresh listener events.
-        await ctx.reply('🔔 No recent listener results found; please wait for the listener to collect fresh mints.');
-        return;
-      }
-      const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
-      const maxShow = Math.min(maxTrades, 10, tokens.length);
-      let msg = `✅ Live results: <b>${tokens.length}</b> token(s) available (showing up to ${maxShow}):\n`;
-      for (const t of tokens.slice(0, maxShow)) {
-        try {
-          const preview = buildPreviewMessage(t);
-          const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
-          msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
-        } catch (e) {
-          const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
-          msg += `\n<code>${addr}</code>\n`;
-        }
-      }
-      try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found live matching tokens.'); } catch {} }
-      // Emit canonical lines for these fast-path tokens
-      try{
-        const addrs = (tokens || []).map((t:any)=> t && (t.tokenAddress||t.address||t.mint)).filter(Boolean);
-        const meta = { time: new Date().toISOString(), kind: 'show_preview_fast', user: userId, count: addrs.length } as any;
-  if (EFFECTIVE_BOT_EMIT_CANONICAL) {
-          emitCanonicalLines(addrs, meta);
-        } else {
-          verboseLog('[show_preview_fast] canonical suppressed by BOT_EMIT_CANONICAL=false', meta);
-        }
-        verboseLog('[show_token] emitted canonical fast-path', meta);
-      }catch(e){ verboseLog('[show_token] emit failed', e); }
-      return;
-    }
-
-    // Deep, accurate check path: fetch user-tailored tokens (may include on-chain enrichment) and apply strategy filter
-    // If the user prefers listener-only/no-enrich, skip heavy enrichment and present listener candidates
-    if (userIsListenerOnly(user)) {
-      try { await ctx.reply('🔎 You are in listener-only mode (no enrichment). Presenting live listener candidates...'); } catch(e){}
-      const tokens = await getTokensForUser(userId, user.strategy);
-      if (tokens && tokens.length) {
-        const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
-        const maxShow = Math.min(maxTrades, 10, tokens.length);
-        let msg = `✅ Live listener-only results: <b>${tokens.length}</b> token(s) available (showing up to ${maxShow}):\n`;
-        for (const t of tokens.slice(0, maxShow)) {
-          try { const preview = buildPreviewMessage(t); const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`; } catch (e) { const addr = t.tokenAddress || t.address || t.mint || '<unknown>'; msg += `\n<code>${addr}</code>\n`; }
-        }
-        try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch(e) { try { await ctx.reply('✅ Found live listener-only tokens.'); } catch(_){} }
-        return;
-      }
-      // If no tokens from getTokensForUser, try collector one-shot raw addresses as a last resort
-      try{
-        const seq = require('./scripts/sequential_10s_per_program.js');
-        if(seq && typeof seq.collectFreshMints === 'function'){
-          const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
-          let maxAgeSec: number | undefined = undefined;
-          try{ const ma = user.strategy && (user.strategy as any).minAge; if(ma !== undefined && ma !== null){ const s = String(ma).trim().toLowerCase(); const secMatch = s.match(/^([0-9]+)s$/); const minMatch = s.match(/^([0-9]+)m$/); if(secMatch) maxAgeSec = Number(secMatch[1]); else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60; else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; } } }catch(e){}
-          const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
-          if(Array.isArray(addrs) && addrs.length > 0){ try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} } return; }
-            if(Array.isArray(addrs) && addrs.length > 0){
-              try{
-                const meta = { time: new Date().toISOString(), kind: 'collector_raw', user: userId, count: addrs.length } as any;
-                if (EFFECTIVE_BOT_EMIT_CANONICAL) {
-                  emitCanonicalLines(addrs, meta);
-                } else {
-                  verboseLog('[live_show_tokens] canonical suppressed by BOT_EMIT_CANONICAL=false', meta);
-                }
-                verboseLog('[show_token] emitted canonical collector raw', meta);
-              }catch(e){ verboseLog('[show_token] emit failed', e); }
-            }
-        }
-      }catch(e){}
-      await ctx.reply('🔔 No live listener results available at the moment; please wait.');
-      return;
-    }
-
-    // perform accurate filtering for non-listener-only users
-    await ctx.reply('🔎 Performing an accurate strategy check — this may take a few seconds. Please wait...');
-    const tokens = await getTokensForUser(userId, user.strategy);
-    let accurate: any[] = [];
-    try {
-      accurate = await withTimeout(filterTokensByStrategy(tokens, user.strategy, { fastOnly: false }), 7000, 'show_token-filter');
-    } catch (e) {
-      console.error('[show_token] accurate filter failed or timed out', e?.message || e);
-      accurate = [];
-    }
-
-    if (!accurate || accurate.length === 0) {
-      // Nothing matched after the deeper check — as a last-resort try the listener one-shot collector
-      try{
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const seq = require('./scripts/sequential_10s_per_program.js');
-        if(seq && typeof seq.collectFreshMints === 'function'){
-          const maxCollect = Math.max(1, Number(user.strategy?.maxTrades || 3));
-          // derive maxAgeSec from user's minAge
-          let maxAgeSec: number | undefined = undefined;
-          try{
-            const ma = user.strategy && (user.strategy as any).minAge;
-            if(ma !== undefined && ma !== null){
-              const s = String(ma).trim().toLowerCase();
-              const secMatch = s.match(/^([0-9]+)s$/);
-              const minMatch = s.match(/^([0-9]+)m$/);
-              if(secMatch) maxAgeSec = Number(secMatch[1]);
-              else if(minMatch) maxAgeSec = Number(minMatch[1]) * 60;
-              else if(!isNaN(Number(s))){ const n = Number(s); maxAgeSec = n <= 2 ? n : n * 60; }
-            }
-          }catch(e){}
-          const strictOverride = (user && user.strategy && (user.strategy as any).collectorStrict !== undefined) ? Boolean((user.strategy as any).collectorStrict) : undefined;
-          const addrs = await seq.collectFreshMints({ maxCollect, timeoutMs: 20000, maxAgeSec, strictOverride }).catch(()=>[]);
-          if(Array.isArray(addrs) && addrs.length > 0){
-            // Return raw payload so user sees actual live mints discovered
-            try{ await ctx.reply('🔔 Live listener results (raw):\n' + JSON.stringify(addrs.slice(0, Math.max(10, addrs.length)), null, 2)); }catch(e){ try{ await ctx.reply('🔔 Live listener results: ' + addrs.join(', ')); }catch(e){} }
-            return;
-          }
-        }
-      }catch(e){ /* ignore collector errors */ }
-      // Listener-only: no background enrich queued. Inform the user to wait for listener events.
-      await ctx.reply('🔔 No matches found after a deeper check; please wait for the listener to produce fresh results.');
-      return;
-    }
-
-    // Respect user's maxTrades and present a professional list
+    // Always prefer explicit listener-collected tokens for the user
+    const tokens = await getTokensForUser(userId, user.strategy).catch(() => []);
     const maxTrades = Math.max(1, Number(user.strategy?.maxTrades || 3));
-    const maxShow = Math.min(maxTrades, 10, accurate.length);
-    let msg = `✅ Accurate results: <b>${accurate.length}</b> token(s) match your strategy (showing up to ${maxShow}):\n`;
-    for (const t of accurate.slice(0, maxShow)) {
+    const addrs: string[] = Array.isArray(tokens) ? tokens.map((t:any) => (t && (t.mint || t.tokenAddress || t.address)) || null).filter(Boolean) : [];
+    const chosen = Array.from(new Set(addrs)).slice(0, maxTrades);
+    const meta = { time: new Date().toISOString(), kind: 'show_token', user: userId, freshMints: chosen, sampleLogs: [] } as any;
+    // Emit canonical stream if bot-level canonical emits are enabled (developer opt-in)
+    if (EFFECTIVE_BOT_EMIT_CANONICAL) {
       try {
-        const preview = buildPreviewMessage(t);
-        const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
-        msg += `\n<b>${preview.title || addr}</b> (<code>${addr}</code>)\n${preview.shortMsg}\n`;
-      } catch (e) {
-        const addr = t.tokenAddress || t.address || t.mint || '<unknown>';
-        msg += `\n<code>${addr}</code>\n`;
-      }
+        // attempt to use the listener module's emitter when available
+        try {
+          const seq = require('./scripts/sequential_10s_per_program.js');
+          if (seq && typeof seq.emitCanonicalStream === 'function') {
+            try { seq.emitCanonicalStream(chosen, meta); } catch (e) { /* ignore emitter errors */ }
+          } else {
+            try { process.stdout.write(JSON.stringify(chosen) + '\n'); process.stdout.write(JSON.stringify(meta) + '\n'); } catch (e) {}
+          }
+          // also notify in-process listener notifier so regular handlers receive the event
+          try { if (seq && seq.notifier && typeof seq.notifier.emit === 'function') seq.notifier.emit('notification', meta); } catch (e) {}
+        } catch (e) {
+          // last-resort: write canonical lines directly
+          try { process.stdout.write(JSON.stringify(chosen) + '\n'); process.stdout.write(JSON.stringify(meta) + '\n'); } catch (e) {}
+        }
+      } catch (e) { try { console.error('[show_token] emit failed', e); } catch (e) {} }
     }
-    try { await ctx.reply(msg, { parse_mode: 'HTML' }); } catch (e) { try { await ctx.reply('✅ Found matching tokens (accurate results).'); } catch {} }
-    return;
+    try { await ctx.reply(`✅ Sent ${chosen.length} canonical token(s) to stream.`); } catch (e) { /* ignore reply errors */ }
   } catch (e) {
-    console.error('[show_token] fast-preview error:', e?.stack || e);
-  await ctx.reply('❗ Internal error while producing a fast preview; please try again later or wait for listener events.');
+    console.error('[show_token] canonical handler failed', e);
+    try { await ctx.reply('❗ Failed to produce canonical output.'); } catch (e) {}
   }
 });

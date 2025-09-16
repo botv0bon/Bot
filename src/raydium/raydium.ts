@@ -62,9 +62,15 @@ try {
 }
 import { syncAmmPoolKeys, syncClmmPoolKeys } from "./raydium.service";
 
-const solanaConnection = new Connection(PRIVATE_RPC_ENDPOINT, {
-  wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
-});
+let __solanaConnection: any = null;
+function getSolanaConnection() {
+  if (!__solanaConnection) {
+    __solanaConnection = new Connection(PRIVATE_RPC_ENDPOINT, {
+      wsEndpoint: RPC_WEBSOCKET_ENDPOINT,
+    });
+  }
+  return __solanaConnection;
+}
 
 export interface MinimalTokenAccountData {
   mint: PublicKey;
@@ -191,7 +197,7 @@ export async function checkMintable(
   vault: PublicKey
 ): Promise<boolean | undefined> {
   try {
-  let { data } = (await solanaConnection.getAccountInfo(vault)) || {};
+  let { data } = (await getSolanaConnection().getAccountInfo(vault)) || {};
     if (!data) {
       return;
     }
@@ -253,7 +259,7 @@ export const runListener = async () => {
   // initDB();
   const runTimestamp = Math.floor(new Date().getTime() / 1000);
 
-  const ammSubscriptionId = solanaConnection.onLogs(
+  const ammSubscriptionId = getSolanaConnection().onLogs(
     RAYDIUM_LIQUIDITY_PROGRAM_ID_V4,
     async ({ logs, err, signature }) => {
       if (err) return;
@@ -269,7 +275,7 @@ export const runListener = async () => {
     COMMITMENT_LEVEL
   );
 
-  const clmmSubscriptionId = solanaConnection.onLogs(
+  const clmmSubscriptionId = getSolanaConnection().onLogs(
     RAYDIUM_LIQUIDITY_PROGRAM_ID_CLMM,
     async ({ logs, err, signature }) => {
       if (err) return;
@@ -356,7 +362,7 @@ export const runListener = async () => {
     }
   }
 
-  // const openBookSubscriptionId = solanaConnection.onProgramAccountChange(
+  // const openBookSubscriptionId = getSolanaConnection().onProgramAccountChange(
   //   OPENBOOK_PROGRAM_ID,
   //   async (updatedAccountInfo) => {
   //     const key = updatedAccountInfo.accountId.toString();

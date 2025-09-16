@@ -1,5 +1,6 @@
 // Minimal safe Helius WebSocket listener.
 // Uses centralized config from `src/config.ts` so env parsing is in one place.
+import './silenceLogs';
 import { HELIUS_USE_WEBSOCKET, getHeliusWebsocketUrl, HELIUS_SUBSCRIBE_METADATA, HELIUS_SUBSCRIBE_SPLTOKEN } from './config';
 // optional blockTime lookup helpers from fastTokenFetcher
 let _getBlockTimeForSlotCached: ((slot: number) => Promise<number | null>) | null = null;
@@ -55,6 +56,9 @@ const HELIUS_WS_URL = getHeliusWebsocketUrl();
 const USE_WS = HELIUS_USE_WEBSOCKET;
 const SUBSCRIBE_METADATA = HELIUS_SUBSCRIBE_METADATA;
 const SUBSCRIBE_SPLTOKEN = HELIUS_SUBSCRIBE_SPLTOKEN;
+
+// Global guard: when true, only allow the canonical sequential collector to run.
+const SEQUENTIAL_COLLECTOR_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || 'false').toLowerCase() === 'true';
 
 // Enforce listener-only safe mode: when true, avoid making outbound HTTP calls
 // or quick external checks (DexScreener/CoinGecko/etc). Controlled via env
@@ -335,8 +339,10 @@ export function resetHeliusListenerStats() { try { _heliusListenerStats.processe
 
 // Lazy import so project can run without ws installed when not used
 async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) => void; onOpen?: () => void; onClose?: () => void; onError?: (err: any) => void; }) {
-  if (!USE_WS) {
-    console.log('HELIUS WebSocket disabled via HELIUS_USE_WEBSOCKET=false');
+  // Only enable websocket listener when explicitly opted-in via HELIUS_WS_ENABLED=true
+  const ENABLE_WS = String(process.env.HELIUS_WS_ENABLED || 'false').toLowerCase() === 'true';
+  if (!USE_WS || !ENABLE_WS) {
+    console.log('HELIUS WebSocket disabled (USE_WS=' + String(USE_WS) + ', ENABLE_WS=' + String(ENABLE_WS) + ')');
     return { stop: () => Promise.resolve() };
   }
 
@@ -362,7 +368,23 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
   const _backgroundMintEnrichInFlight: Set<string> = new Set();
   function pushEvent(ev: any) {
     try {
-  recentEvents.unshift(ev);
+      // Ensure the event is normalized before storing so consumers always see canonical shape
+      try {
+        if (ev && !(ev as any).__event) {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { normalizeListenerItem } = require('./utils/fetchNormalization');
+          try {
+            const n = normalizeListenerItem(ev);
+            if (n) {
+              try { if (!ev.mint && n.mint) (ev as any).mint = n.mint; } catch (e) {}
+              (ev as any).__event = { time: n.time, program: n.program, signature: n.signature, kind: n.kind, freshMints: n.freshMints, sampleLogs: n.sampleLogs };
+              (ev as any).__normalized = true;
+              (ev as any).__normalizedRaw = n.raw || ev;
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      recentEvents.unshift(ev);
       if (recentEvents.length > 200) recentEvents.length = 200;
     } catch {}
   }
@@ -459,6 +481,23 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
             return;
           }
         }
+        // Normalize the event to canonical shape when possible so consumers get a
+        // consistent `{ mint }` + `__event` structure (time, program, signature, kind, freshMints, sampleLogs).
+        try {
+          const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'false').toLowerCase() === 'true';
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { normalizeListenerItem } = require('./utils/fetchNormalization');
+          try {
+            const n = normalizeListenerItem(evt);
+            if (n) {
+              // prefer explicit mint from normalizer when available
+              try { if (!evt.mint && n.mint) (evt as any).mint = n.mint; } catch (e) {}
+              (evt as any).__event = { time: n.time, program: n.program, signature: n.signature, kind: n.kind, freshMints: n.freshMints, sampleLogs: n.sampleLogs };
+              (evt as any).__normalized = true;
+              (evt as any).__normalizedRaw = n.raw || evt;
+            }
+          } catch (e) {}
+        } catch (e) {}
         pushEvent(evt);
         try { if ((options as any)?.onNewMint) (options as any).onNewMint(evt); } catch (e) {}
 
@@ -501,6 +540,10 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
               }
               // If cache hints liquidity/volume, schedule a non-blocking quick officialEnrich for this mint
               try {
+                if (LISTENER_ONLY_MODE) {
+                  _heliusListenerStats.bgMintSkippedDueToListenerOnly = (_heliusListenerStats.bgMintSkippedDueToListenerOnly || 0) + 1;
+                  return;
+                }
                 const tuMod = require('./utils/tokenUtils');
                 const ff = require('./fastTokenFetcher');
                 const tokenAddr = evt.mint;
@@ -792,14 +835,20 @@ async function startHeliusWebsocketListener(options?: { onMessage?: (msg: any) =
         } catch (e) {}
 
         // proceed with enrichment
-        try {
+              try {
           const ff = require('./fastTokenFetcher');
           const hf = ff && (ff.handleNewMintEvent || ff.default && ff.default.handleNewMintEvent);
           if (typeof hf === 'function') {
             try {
-              const mgrMod = require('./heliusEnrichmentQueue');
-              const mgr = (mgrMod && mgrMod._manager) || (mgrMod && mgrMod.createEnrichmentManager && (mgrMod._manager = mgrMod.createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 })));
-              const p = mgr.enqueue(evt, hf);
+              let p: any = null;
+              if (LISTENER_ONLY_MODE) {
+                // Skip enqueuing heavy enrichment when running in listener-only mode
+                try { _heliusListenerStats.enrichSkippedByListenerOnly = (_heliusListenerStats.enrichSkippedByListenerOnly || 0) + 1; } catch(e){}
+              } else {
+                const mgrMod = require('./heliusEnrichmentQueue');
+                const mgr = (mgrMod && mgrMod._manager) || (mgrMod && mgrMod.createEnrichmentManager && (mgrMod._manager = mgrMod.createEnrichmentManager({ ttlSeconds: 300, maxConcurrent: 3 })));
+                p = mgr.enqueue(evt, hf);
+              }
               // best-effort background stats update: update mint snapshot volumes/eventCount (non-blocking)
               try {
                 const ftf = require('./fastTokenFetcher');

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+try{ require('../src/disableEverything'); }catch(e){}
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');

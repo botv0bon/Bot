@@ -152,6 +152,24 @@ export function getHeliusWebsocketUrl(): string {
 	}
 }
 
-// Shared connection exported for reuse
-export const private_connection = new Connection(MAINNET_RPC);
-export const connection = private_connection;
+// Shared connection exported for reuse (lazy): avoid creating a Connection at import time
+let __lazy_connection: Connection | null = null;
+export function getConnection(): Connection {
+	if (!__lazy_connection) {
+		__lazy_connection = new Connection(MAINNET_RPC);
+	}
+	return __lazy_connection;
+}
+// Maintain a live `connection` export for compatibility. Accessing this will
+// lazily initialize the underlying Connection instance.
+Object.defineProperty(exports, 'connection', {
+	enumerable: true,
+	configurable: true,
+	get: getConnection as any,
+});
+// Also export the private connection accessor name for callers that referenced it
+Object.defineProperty(exports, 'private_connection', {
+	enumerable: true,
+	configurable: true,
+	get: getConnection as any,
+});

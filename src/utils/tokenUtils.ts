@@ -371,14 +371,42 @@ export async function fetchDexScreenerTokens(chainId: string = 'solana', extraPa
     } catch (e) {}
     const items: any[] = await seq.collectFreshMints({ maxCollect, timeoutMs, maxAgeSec, strictOverride }).catch(() => []);
     if (!Array.isArray(items) || items.length === 0) return [];
-    return items.map((it: any) => {
-      // listener may return either simple mint strings or enriched token objects
-      if (!it) return null;
-      if (typeof it === 'string') return { tokenAddress: it, address: it, mint: it, sourceCandidates: true, __listenerCollected: true };
-      // merge and normalize fields
-      const addr = it.tokenAddress || it.address || it.mint || null;
-      return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
-    }).filter(Boolean);
+    // Normalize using shared helper so all consumers receive canonical events
+    try {
+      const { normalizeListenerItem } = require('./fetchNormalization');
+      return items.map((it: any) => {
+        try {
+          const n = normalizeListenerItem(it);
+          if (!n || !n.mint) return null;
+          return {
+            tokenAddress: n.mint,
+            address: n.mint,
+            mint: n.mint,
+            sourceCandidates: true,
+            __listenerCollected: true,
+            __normalized: true,
+            __normalizedRaw: n.raw || it,
+            // keep event metadata as provenance
+            __event: {
+              time: n.time,
+              program: n.program,
+              signature: n.signature,
+              kind: n.kind,
+              freshMints: n.freshMints,
+              sampleLogs: n.sampleLogs
+            }
+          };
+        } catch (e) { return null; }
+      }).filter(Boolean);
+    } catch (e) {
+      // If normalization helper fails, fall back to conservative mapping
+      return items.map((it: any) => {
+        if (!it) return null;
+        if (typeof it === 'string') return { tokenAddress: it, address: it, mint: it, sourceCandidates: true, __listenerCollected: true };
+        const addr = it.tokenAddress || it.address || it.mint || null;
+        return Object.assign({ tokenAddress: addr, address: addr, mint: addr, sourceCandidates: true, __listenerCollected: true }, it);
+      }).filter(Boolean);
+    }
   } catch (e) {
     console.error('[fetchDexScreenerTokens] listener fetch failed:', e?.message || e);
     return [];

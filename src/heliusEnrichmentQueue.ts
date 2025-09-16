@@ -1,3 +1,4 @@
+import './silenceLogs';
 // Enrichment manager with optional Redis-backed dedupe and in-memory fallback
 // - If `REDIS_URL` is set, the manager will attempt to use Redis SET NX + EX
 //   to dedupe mint attempts across processes.

@@ -1,5 +1,8 @@
 import { HELIUS_ENRICH_LIMIT } from '../config';
 
+// Respect global listener-only mode (no background enrichment)
+const LISTENER_ONLY_MODE = String(process.env.LISTENER_ONLY_MODE ?? process.env.LISTENER_ONLY ?? 'false').toLowerCase() === 'true';
+
 // Lightweight in-memory background queue for expensive token enrichment requested by users.
 // Jobs are stored in-process only to avoid any disk-based central cache files.
 
@@ -13,6 +16,10 @@ let workerOpts = { concurrency: 1, intervalMs: 2000 };
 
 export async function enqueueEnrichJob(job: EnrichJob) {
   try {
+    if (LISTENER_ONLY_MODE) {
+      console.warn('[enrichQueue] enqueue requested but LISTENER_ONLY_MODE=true - dropping job', job && job.userId);
+      return false;
+    }
     QUEUE_IN_MEMORY.push(job);
     return true;
   } catch (e) {
@@ -22,6 +29,10 @@ export async function enqueueEnrichJob(job: EnrichJob) {
 }
 
 export async function startEnrichQueue(telegram: any, users: Record<string, any>, opts?: Partial<typeof workerOpts>) {
+  if (LISTENER_ONLY_MODE) {
+    console.warn('[enrichQueue] start requested but LISTENER_ONLY_MODE=true - not starting background enrichment.');
+    return;
+  }
   telegramRef = telegram;
   usersRef = users;
   workerOpts = { ...workerOpts, ...(opts || {}) };

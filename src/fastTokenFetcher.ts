@@ -93,6 +93,25 @@ async function markProcessedGlobal(key: string, ttlSec = 60) {
 
 const DEXBOOSTS = process.env.DEXSCREENER_API_ENDPOINT || 'https://api.dexscreener.com/token-boosts/latest/v1';
 
+// Global guard: when true, only allow the canonical sequential collector to run.
+const SEQUENTIAL_COLLECTOR_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || 'false').toLowerCase() === 'true';
+
+if (SEQUENTIAL_COLLECTOR_ONLY) {
+  // Provide minimal stubs so callers won't crash if they require this module.
+  const _captureHeliusAndVerify = async function captureHeliusAndVerify(durationMs = 60000) {
+    return null;
+  };
+  const _startFastTokenFetcher = function startFastTokenFetcher(_users: UsersMap, _telegram: any, _options?: { intervalMs?: number }) {
+    // no-op in sequential-only mode
+    return { stop: async () => {} };
+  };
+  const _fetchAndFilterTokensForUsers = async function fetchAndFilterTokensForUsers(_users: UsersMap, _opts?: any) {
+    return {};
+  };
+  // export the stubs
+  export { _captureHeliusAndVerify as captureHeliusAndVerify, _startFastTokenFetcher as startFastTokenFetcher, _fetchAndFilterTokensForUsers as fetchAndFilterTokensForUsers };
+}
+
 export function hashTokenAddress(addr: string) {
   return String(addr || '').toLowerCase().trim();
 }
@@ -190,123 +209,42 @@ export async function appendSentHash(userId: string, hash: string) {
  * Prioritized users: user.strategy.priority === true or user.strategy.priorityRank > 0
  */
 export function startFastTokenFetcher(users: UsersMap, telegram: any, options?: { intervalMs?: number }) {
-  // If SEQUENTIAL_COLLECTOR_ONLY=true then disable other fetchers to ensure
-  // `scripts/sequential_10s_per_program.js` is the sole source of on-chain fetches
-  const SEQ_ONLY = String(process.env.SEQUENTIAL_COLLECTOR_ONLY || '').toLowerCase() === 'true';
-  if (SEQ_ONLY) {
-    try { console.error('[FAST_FETCHER] disabled due to SEQUENTIAL_COLLECTOR_ONLY=true'); } catch (e) {}
-    return {
-      stop: () => {},
-    } as any;
+  if (SEQUENTIAL_COLLECTOR_ONLY) {
+    // no-op when sequential-collector-only mode is enabled
+    return { stop: async () => {} };
   }
+  // Provide a safe, minimal implementation that avoids network calls and
+  // delegates only to the canonical sequential collector to emit fresh-mint events.
   const intervalMs = options?.intervalMs || 1000;
-  const perUserLimit = (options as any)?.perUserLimit || 1; // max messages per interval
-  const batchLimit = (options as any)?.batchLimit || 20; // tokens per user per interval
-  let running = true;
+  let stopped = false;
 
-  const lastSent: Map<string, number> = new Map();
-
-  async function loop() {
-    while (running) {
+  async function pollOnce() {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const seq = require('../scripts/sequential_10s_per_program.js');
+      if (!seq || typeof seq.collectFreshMints !== 'function') return;
+      const items: any[] = await seq.collectFreshMints({ maxCollect: 10, timeoutMs: 20000 }).catch(() => []);
+      if (!Array.isArray(items) || items.length === 0) return;
+      const addrs = items.map((it: any) => (typeof it === 'string' ? it : (it && (it.mint || it.tokenAddress || it.address)))).filter(Boolean);
+      if (!addrs.length) return;
+      const meta = { time: new Date().toISOString(), program: 'sequential-collector', signature: null, kind: 'initialize', freshMints: addrs, sampleLogs: [] };
       try {
-        // Fetch & filter tokens for all users using shared cache
-        const perUserTokens = await fetchAndFilterTokensForUsers(users, { limit: 200, force: false });
-
-        // Build prioritized list ordered by priorityRank desc then priority boolean
-        const priorityUsers = Object.keys(users)
-          .filter(uid => {
-            const u = users[uid];
-            return u && u.strategy && (u.strategy.priority === true || (u.strategy.priorityRank && u.strategy.priorityRank > 0));
-          })
-          .sort((a, b) => ( (users[b].strategy?.priorityRank || 0) - (users[a].strategy?.priorityRank || 0) ));
-
-        // First process priority users, then regular users
-        const processOrder = [...priorityUsers, ...Object.keys(users).filter(u => !priorityUsers.includes(u))];
-
-        for (const uid of processOrder) {
-          try {
-            const u = users[uid];
-            if (!u || !u.strategy || u.strategy.enabled === false) continue;
-            const matches = perUserTokens[uid] || [];
-            if (!matches.length) continue;
-
-            // rate limiting: allow perUserLimit messages per interval
-            const last = lastSent.get(uid) || 0;
-            if (Date.now() - last < intervalMs * (perUserLimit)) {
-              // skip this user this iteration
-              continue;
-            }
-
-            // limit tokens per user per interval
-            const tokensToSend = matches.slice(0, batchLimit);
-
-            // Filter out tokens already sent (sent hashes)
-            const sent = await readSentHashes(uid);
-            const filtered = tokensToSend.filter(t => {
-              const addr = t.tokenAddress || t.address || t.mint || t.pairAddress || '';
-              const h = hashTokenAddress(addr);
-              return addr && !sent.has(h);
-            });
-            if (!filtered.length) continue;
-
-            // Send notifications in a batch (one message with multiple tokens or multiple messages)
-            for (const token of filtered) {
-              const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
-              const h = hashTokenAddress(addr);
-              try {
-                const msg = `🚀 Token matched: ${token.description || token.name || addr}\nAddress: ${addr}`;
-                await telegram.sendMessage(uid, msg);
-                await appendSentHash(uid, h);
-              } catch (e) {
-                // ignore send errors per token
-              }
-            }
-
-            // Optionally auto-buy for users with autoBuy enabled
-            if (u.strategy.autoBuy !== false && Number(u.strategy.buyAmount) > 0) {
-                    for (const token of filtered) {
-                const addr = token.tokenAddress || token.address || token.mint || token.pairAddress || '';
-                try {
-                  const finalStrategy = normalizeStrategy(u.strategy);
-                  const finalOk = await (require('./bot/strategy').filterTokensByStrategy([token], finalStrategy, { preserveSources: true }));
-                  if (!finalOk || finalOk.length === 0) continue;
-                  const amount = Number(u.strategy.buyAmount);
-                  const result = await unifiedBuy(addr, amount, u.secret);
-                  if (result && ((result as any).tx || (result as any).success)) {
-                    try { await registerBuyWithTarget(u, { address: addr, price: token.price || token.priceUsd }, result, u.strategy.targetPercent || 10); } catch {}
-                    const { fee, slippage } = extractTradeMeta(result, 'buy');
-                    u.history = u.history || [];
-                    const resTx = (result as any)?.tx ?? '';
-                    u.history.push(`AutoBuy: ${addr} | ${amount} SOL | Tx: ${resTx} | Fee: ${fee ?? 'N/A'} | Slippage: ${slippage ?? 'N/A'}`);
-                    try { saveUsers(users); } catch {}
-                    // notify user about executed buy
-                    try { await telegram.sendMessage(uid, `✅ AutoBuy executed for ${addr}\nTx: ${resTx}`); } catch {}
-                    }
-                } catch (e) {
-                  // ignore per-token buy errors
-                }
-              }
-            }
-
-            lastSent.set(uid, Date.now());
-          } catch (e) {
-            // per-user loop error: continue
-            continue;
-          }
-        }
-
-      } catch (err) {
-        // ignore fetch loop errors
-      }
-      await sleep(intervalMs);
-    }
+        if (typeof seq.emitCanonicalStream === 'function') seq.emitCanonicalStream(addrs, meta);
+        else { process.stdout.write(JSON.stringify(addrs) + '\n'); process.stdout.write(JSON.stringify(meta) + '\n'); }
+      } catch (e) {}
+    } catch (e) {}
   }
 
-  loop();
+  (async function loop() {
+    while (!stopped) {
+      await pollOnce().catch(() => {});
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+  })();
 
   return {
-    stop: () => { running = false; }
-  };
+    stop: () => { stopped = true; }
+  } as any;
 }
 
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
@@ -578,6 +516,9 @@ export async function fetchLatestWithSources(limit = 50) {
  * Returns a map: { [userId]: tokens[] }
  */
 export async function fetchAndFilterTokensForUsers(users: UsersMap, opts?: { limit?: number, force?: boolean, detail?: boolean, warmupHeliusMs?: number }): Promise<Record<string, any[]>> {
+  if (SEQUENTIAL_COLLECTOR_ONLY) {
+    return {};
+  }
   const now = Date.now();
   if (!opts?.force && __global_fetch_cache.length && (now - __global_fetch_ts) < __GLOBAL_FETCH_TTL) {
     // cache is fresh; skip refetch but continue to per-user filtering using the existing __global_fetch_cache
@@ -1002,11 +943,27 @@ export async function runDeepCacheCheck(opts?: { windowMin?: number; limit?: num
 
 // Start Helius WS listener for durationMs milliseconds, then run getAccountInfo/helius signatures for captured events
 export async function captureHeliusAndVerify(durationMs = 60000) {
+  if (SEQUENTIAL_COLLECTOR_ONLY) return null;
   try {
     const wsMod = require('./heliusWsListener');
     console.log('Starting Helius WS listener for', durationMs, 'ms...');
-    const inst = await (wsMod.startHeliusWebsocketListener ? wsMod.startHeliusWebsocketListener({ onOpen: () => console.log('WS open'), onMessage: () => {}, onClose: () => console.log('WS closed'), onError: (e: any) => console.warn('WS error', e && e.message) }) : null);
-    await new Promise((r) => setTimeout(r, durationMs));
+    let inst: any = null;
+    if (LISTENER_ONLY_MODE) {
+      // In listener-only mode avoid starting a new websocket; rely on any in-process cached events
+      inst = null;
+      await new Promise((r) => setTimeout(r, durationMs));
+    } else {
+      // Only start the Helius websocket listener if explicitly enabled via env var.
+      // This prevents accidental background websocket starts in environments
+      // that should remain canonical-only.
+      if (String(process.env.HELIUS_WS_ENABLED || '').toLowerCase() !== 'true') {
+        inst = null;
+        await new Promise((r) => setTimeout(r, durationMs));
+      } else {
+        inst = await (wsMod.startHeliusWebsocketListener ? wsMod.startHeliusWebsocketListener({ onOpen: () => console.log('WS open'), onMessage: () => {}, onClose: () => console.log('WS closed'), onError: (e: any) => console.warn('WS error', e && e.message) }) : null);
+        await new Promise((r) => setTimeout(r, durationMs));
+      }
+    }
     const ev = wsMod.getRecentHeliusEvents ? wsMod.getRecentHeliusEvents() : [];
     console.log('captured events count:', Array.isArray(ev) ? ev.length : 0);
     const limit = Math.min(20, Array.isArray(ev) ? ev.length : 0);

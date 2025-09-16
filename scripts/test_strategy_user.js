@@ -1,4 +1,5 @@
 // Simple test runner: load captures from out/capture_queue and run filterTokensByStrategy
+try{ require('../src/disableEverything'); }catch(e){}
 const fs = require('fs');
 const path = require('path');
 const users = require('../users.json');
